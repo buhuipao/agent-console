@@ -356,4 +356,6 @@ launched and owns.
 matches the version in `Cargo.toml`, runs formatting/lint/tests, builds all five
 native packages, generates `SHA256SUMS`, and creates the GitHub Release. The
 workflow can also be started manually with publishing disabled to exercise the
-entire packaging matrix without creating a release.
+entire packaging matrix without creating a release. A push to an explicitly
+named `packaging-test/**` branch performs the same non-publishing dry run for
+environments where GitHub API dispatch is unavailable.

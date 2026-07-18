@@ -2,6 +2,8 @@ name: Package release
 
 on:
   push:
+    branches:
+      - "packaging-test/**"
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
   workflow_dispatch:
@@ -42,7 +44,7 @@ jobs:
           version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
           test -n "$version"
 
-          if [[ "${{ github.event_name }}" == "push" ]]; then
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref_type }}" == "tag" ]]; then
             tag="${GITHUB_REF_NAME}"
             source_ref="${GITHUB_REF}"
             publish=true
