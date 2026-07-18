@@ -1,0 +1,3 @@
+{"type":"session_meta","payload":{"id":"c0000004-0000-4000-8000-000000000004","cwd":"/tmp/agent-console-demo/infrastructure","branch":"perf/build-cache"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"Reduce CI build time by improving cache reuse"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"Cache keys are stable; measuring cold and warm builds"}}

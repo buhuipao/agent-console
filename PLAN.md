@@ -31,8 +31,8 @@ relevant PTY E2E tests passed.
 - [x] Switch sessions from the Workspace sidebar without visiting Dashboard.
 - [x] Named shells, direct numeric selection, maximize/restore, pane resizing,
   process exit status, and command-block capture instead of only a raw tail.
-- [x] Named provider launch profiles, selected per session and remembered for
-  resume and summaries.
+- [x] One configurable launch command per provider, shared by resume, new
+  sessions, summaries, and doctor checks.
 - [x] Configurable key bindings plus an in-product effective-bindings panel.
 - [x] SQLite state and indexed event offsets/rotation.
 - [x] `doctor` capability checks for resume, hooks, summary invocation,
@@ -46,7 +46,7 @@ relevant PTY E2E tests passed.
 - [x] Persist managed transcript fingerprints; restart stale idle/failed
   provider clients on activation while preserving working/waiting clients.
 - [x] Adaptive Dashboard session-card grid with linked selection styling and
-  compact status, workspace, profile, task, and shell information.
+  compact status, workspace, task, and shell information.
 - [x] Provider-TUI mouse scrolling for both explicit mouse reporting (Codex)
   and alternate-screen cursor scrolling (Claude Code).
 

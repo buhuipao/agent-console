@@ -1,0 +1,4 @@
+{"type":"session_meta","payload":{"id":"c0000003-0000-4000-8000-000000000003","cwd":"/tmp/agent-console-demo/platform","branch":"feat/oidc"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"Upgrade the authentication middleware"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"Migration is blocked by an incompatible token claim"}}
+{"type":"event_msg","payload":{"type":"stream_error"}}

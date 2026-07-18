@@ -13,13 +13,12 @@ use crate::model::AgentKind;
 const CONFIG_ENV: &str = "AGENT_CONSOLE_CONFIG";
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentConsoleConfig {
     #[serde(default)]
     providers: ProviderConfig,
     #[serde(default)]
     pub(crate) summary: SummaryConfig,
-    #[serde(default)]
-    profiles: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
     keys: KeyConfig,
 }
@@ -47,7 +46,6 @@ const DASHBOARD_ACTIONS: &[&str] = &[
     "search",
     "alias",
     "archive",
-    "profile",
     "help",
 ];
 
@@ -149,33 +147,14 @@ impl AgentConsoleConfig {
         I: IntoIterator<Item = T>,
         T: Into<OsString>,
     {
-        self.provider_command_for_profile(provider, None, dynamic_args)
-    }
-
-    pub fn provider_command_for_profile<I, T>(
-        &self,
-        provider: AgentKind,
-        profile: Option<&str>,
-        dynamic_args: I,
-    ) -> ProviderCommand
-    where
-        I: IntoIterator<Item = T>,
-        T: Into<OsString>,
-    {
         let dynamic_args = dynamic_args
             .into_iter()
             .map(Into::into)
             .collect::<Vec<OsString>>();
-        let from_profile = profile
-            .and_then(|name| self.profiles.get(name))
-            .and_then(|profile| match provider {
-                AgentKind::Codex => profile.codex.as_deref(),
-                AgentKind::Claude => profile.claude.as_deref(),
-            });
-        let configured = from_profile.or(match provider {
+        let configured = match provider {
             AgentKind::Codex => self.providers.codex.as_deref(),
             AgentKind::Claude => self.providers.claude.as_deref(),
-        });
+        };
         if let Some([name]) = configured
             && is_shell_name(name)
             && !executable_on_path(name)
@@ -206,17 +185,6 @@ impl AgentConsoleConfig {
             .chain(dynamic_args)
             .collect();
         ProviderCommand { program, args }
-    }
-
-    pub fn profile_names(&self, provider: AgentKind) -> Vec<String> {
-        self.profiles
-            .iter()
-            .filter(|(_, profile)| match provider {
-                AgentKind::Codex => profile.codex.is_some(),
-                AgentKind::Claude => profile.claude.is_some(),
-            })
-            .map(|(name, _)| name.clone())
-            .collect()
     }
 
     pub fn dashboard_action(&self, key: &str) -> Option<&'static str> {
@@ -331,25 +299,6 @@ impl AgentConsoleConfig {
                     io::ErrorKind::InvalidData,
                     format!("providers.{name} must contain at least one command element"),
                 ));
-            }
-        }
-        for (profile_name, profile) in &config.profiles {
-            if profile_name.trim().is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "profile names cannot be empty",
-                ));
-            }
-            for (provider, command) in [
-                ("codex", profile.codex.as_ref()),
-                ("claude", profile.claude.as_ref()),
-            ] {
-                if command.is_some_and(Vec::is_empty) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("profiles.{profile_name}.{provider} must not be empty"),
-                    ));
-                }
             }
         }
         validate_keys("keys.dashboard", &config.keys.dashboard, DASHBOARD_ACTIONS)?;
@@ -509,7 +458,7 @@ fn default_dashboard_keys(action: &str) -> &'static [&'static str] {
         "alert" => &["a"],
         "retry_summary" => &[],
         "search" => &["/"],
-        "alias" | "profile" => &[],
+        "alias" => &[],
         "archive" => &["x"],
         "help" => &["?"],
         _ => &[],
@@ -691,45 +640,14 @@ mod tests {
     }
 
     #[test]
-    fn named_profile_overrides_only_its_provider_and_lists_compatible_profiles() {
-        let config = AgentConsoleConfig::parse(
-            r#"
-                [providers]
-                codex = ["codex-default"]
-                claude = ["/usr/bin/false"]
-
-                [profiles.work]
-                codex = ["proxychains4", "codex", "--profile", "work"]
-
-                [profiles.direct]
-                codex = ["codex-direct"]
-                claude = ["claude-direct"]
-            "#,
+    fn named_profiles_are_rejected_in_favor_of_one_command_per_provider() {
+        let error = AgentConsoleConfig::parse(
+            "[profiles.work]\ncodex = [\"codex\"]\n",
             Path::new("config.toml"),
         )
-        .unwrap();
+        .unwrap_err();
 
-        let command =
-            config.provider_command_for_profile(AgentKind::Codex, Some("work"), ["resume", "id"]);
-        assert_eq!(command.program, "proxychains4");
-        assert_eq!(
-            command.args,
-            ["codex", "--profile", "work", "resume", "id"].map(OsString::from)
-        );
-        let claude = config.provider_command_for_profile(
-            AgentKind::Claude,
-            Some("work"),
-            ["--resume", "id"],
-        );
-        assert_eq!(claude.program, "/usr/bin/false");
-        assert_eq!(
-            config.profile_names(AgentKind::Claude),
-            vec!["direct".to_owned()]
-        );
-        assert_eq!(
-            config.profile_names(AgentKind::Codex),
-            vec!["direct".to_owned(), "work".to_owned()]
-        );
+        assert!(error.to_string().contains("unknown field `profiles`"));
     }
 
     #[test]

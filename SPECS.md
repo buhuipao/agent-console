@@ -1,6 +1,6 @@
 # Agent Console implementation specification
 
-Status: implementation contract for Agent Console 0.0.2.
+Status: implementation contract for Agent Console 0.0.3.
 
 The completed hardening requirements and real-machine acceptance matrix are
 recorded in [PLAN.md](PLAN.md). Domain terms are defined in
@@ -104,16 +104,16 @@ from the path in `AGENT_CONSOLE_CONFIG` when set:
 
 ```toml
 [providers]
-codex = ["proxychains4", "codex", "--profile", "work"]
-claude = ["env", "HTTPS_PROXY=http://127.0.0.1:7890", "claude"]
-
-[profiles.direct]
-codex = ["codex"]
-claude = ["claude"]
-
-[profiles.corporate_proxy]
 codex = ["proxychains4", "codex"]
 claude = ["env", "HTTPS_PROXY=http://127.0.0.1:7890", "claude"]
+```
+
+There is one optional command per provider and no provider-profile layer.
+Wrappers, environment launchers, proxies, aliases, and fixed arguments all
+belong directly in that provider's argv array. Other runtime settings use
+independent tables in the same file:
+
+```toml
 
 [summary]
 min_interval_seconds = 30
@@ -138,13 +138,6 @@ dynamic arguments. An absent entry defaults to the provider executable on
 `PATH`. An empty array or malformed TOML is a startup error that names the
 invalid field. Use the same configured command for native sessions, isolated
 same-provider summaries, and `doctor` checks.
-
-A named profile overrides only provider commands present in that profile;
-missing provider entries fall back to `[providers]`. Store the selected
-profile with session metadata and use it for native resume/new invocations and
-the isolated same-provider summarizer. The new-session dialog exposes an
-explicit profile field; cycling a persisted session profile is an optional,
-unbound Dashboard action.
 
 Key maps replace defaults action by action. Reject unknown actions, unsupported
 key labels, empty action arrays, and duplicate effective sequences before the
@@ -526,7 +519,7 @@ session into one dimmed `Archived` group after all active workspace groups.
 Archived sessions remain selectable and `x` restores them to their workspace
 group. The alias always takes display precedence over generated summary text.
 
-Each card compactly shows task, priority detail, workspace/branch/profile, next
+Each card compactly shows task, priority detail, workspace/branch, next
 step, status, activity age, and open-shell count. Selection changes update both
 the focus panel and highlighted overview card in the same frame.
 
@@ -535,12 +528,10 @@ dark-on-dark filled rectangles.
 
 ## 13. New-session dialog
 
-The dialog has three fields in focus order:
+The dialog has two fields in focus order:
 
 1. provider: toggle with Left/Right or `h`/`l`, values `codex` and `claude`;
-2. workspace: editable text, initialized to the dashboard startup directory;
-3. profile: toggle with Left/Right or `h`/`l`, values `default` plus the configured named
-   profiles for the selected provider.
+2. workspace: editable text, initialized to the dashboard startup directory.
 
 Tab moves to the next field and Shift-Tab moves to the previous field.
 Focusing workspace selects the whole initial value. The first typed or pasted
@@ -553,12 +544,10 @@ view.
 While editing, enumerate matching filesystem directories only. Up/Down changes
 the candidate, Tab completes it with a trailing separator, and the field stays
 active for child-directory completion. Right remains a caret key. The next Tab
-advances to profile. Preserve a leading `~/` in displayed completions.
-Changing provider resets an unavailable profile to
-`default`. Enter validates that the selected profile exists and cwd is a
-directory, creates the provider session with that profile, closes the dialog,
-selects the session, and immediately enters its native terminal. Validation
-errors stay in the dialog.
+returns to provider. Preserve a leading `~/` in displayed completions. Enter
+validates that cwd is a directory, creates the provider session, closes the
+dialog, selects the session, and immediately enters its native terminal.
+Validation errors stay in the dialog.
 
 ## 14. Failure behavior
 

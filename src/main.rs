@@ -327,11 +327,6 @@ fn handle_dashboard_action(
                 app.banner = Some(error);
             }
         }
-        "profile" => {
-            if let Err(error) = app.cycle_selected_profile() {
-                app.banner = Some(error);
-            }
-        }
         "help" => app.help_open = true,
         _ => {}
     }
@@ -448,15 +443,6 @@ fn handle_dialog_key(
                     AgentKind::Claude => AgentKind::Codex,
                 };
             }
-            app.refresh_dialog_profiles();
-        }
-        KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l')
-            if app
-                .dialog
-                .as_ref()
-                .is_some_and(|dialog| dialog.field == DialogField::Profile) =>
-        {
-            app.cycle_dialog_profile(matches!(key, KeyCode::Left | KeyCode::Char('h')));
         }
         KeyCode::Up | KeyCode::Down
             if app
@@ -673,9 +659,8 @@ fn accept_workspace_completion(dialog: &mut app::NewSessionDialog) {
 
 fn cycle_dialog_field(field: DialogField, backwards: bool) -> DialogField {
     match (field, backwards) {
-        (DialogField::Provider, false) | (DialogField::Profile, true) => DialogField::Cwd,
-        (DialogField::Cwd, false) | (DialogField::Provider, true) => DialogField::Profile,
-        (DialogField::Profile, false) | (DialogField::Cwd, true) => DialogField::Provider,
+        (DialogField::Provider, false) | (DialogField::Provider, true) => DialogField::Cwd,
+        (DialogField::Cwd, false) | (DialogField::Cwd, true) => DialogField::Provider,
     }
 }
 
@@ -1005,7 +990,6 @@ fn draw_selected_session_focus(frame: &mut Frame, area: Rect, app: &App, index: 
     let session = &app.sessions[index];
     let (symbol, status_color) = status_style(session.status, app.tick_count);
     let (priority_label, priority, priority_color) = session_priority(session);
-    let profile = app.session_profile(session);
     let branch = session.branch.as_deref().unwrap_or("no branch");
     let next = (!session.summary.next_step.trim().is_empty())
         .then(|| session.summary.next_step.trim())
@@ -1037,7 +1021,7 @@ fn draw_selected_session_focus(frame: &mut Frame, area: Rect, app: &App, index: 
         Line::from(vec![
             Span::styled("WORKSPACE ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{} · {branch} · {profile}", session.cwd.display()),
+                format!("{} · {branch}", session.cwd.display()),
                 Style::default().fg(Color::Cyan),
             ),
         ]),
@@ -1079,12 +1063,7 @@ fn draw_session_cards(frame: &mut Frame, area: Rect, app: &App, order: &[usize],
             .unwrap_or("workspace");
         let (priority_label, priority, priority_color) = session_priority(session);
         let branch = session.branch.as_deref().unwrap_or("no branch");
-        let profile = app.session_profile(session);
-        let context = if profile == "default" {
-            format!("{workspace} · {branch}")
-        } else {
-            format!("{workspace} · {branch} · {profile}")
-        };
+        let context = format!("{workspace} · {branch}");
         let next = (!session.summary.next_step.trim().is_empty())
             .then(|| session.summary.next_step.trim())
             .or_else(|| session.summary.progress.last().map(String::as_str));
@@ -1405,23 +1384,13 @@ fn workspace_editor_spans(view: WorkspaceEditorView) -> Vec<Span<'static>> {
 }
 
 fn draw_new_session_dialog(frame: &mut Frame, dialog: &app::NewSessionDialog) {
-    let area = centered_rect(72, 15, frame.area());
+    let area = centered_rect(72, 12, frame.area());
     frame.render_widget(WidgetClear, area);
     let provider_style = if dialog.field == DialogField::Provider {
         Style::default().fg(Color::Black).bg(Color::Cyan)
     } else {
         Style::default().fg(Color::Cyan)
     };
-    let profile_style = if dialog.field == DialogField::Profile {
-        Style::default().fg(Color::Black).bg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::Cyan)
-    };
-    let profile = dialog
-        .profiles
-        .get(dialog.profile_index)
-        .map(String::as_str)
-        .unwrap_or("default");
     let workspace_field_width = area.width.saturating_sub(14) as usize;
     let workspace_value = if dialog.field == DialogField::Cwd && dialog.cwd_replace_on_input {
         let value = if dialog.cwd.is_empty() {
@@ -1464,7 +1433,7 @@ fn draw_new_session_dialog(frame: &mut Frame, dialog: &app::NewSessionDialog) {
         } else if dialog.cwd_cursor < dialog.cwd.chars().count() {
             "←/→ move · Home/End · Backspace/Delete edit · Tab next field · Enter start"
         } else if dialog.cwd_completion_accepted {
-            "Completed · ←/→ move · keep typing for child · Tab profile · Enter start"
+            "Completed · ←/→ move · keep typing for child · Tab provider · Enter start"
         } else if !completions.is_empty() {
             "←/→ move · ↑/↓ choose · Tab complete · Enter start"
         } else {
@@ -1519,11 +1488,6 @@ fn draw_new_session_dialog(frame: &mut Frame, dialog: &app::NewSessionDialog) {
         );
     }
     lines.extend([
-        Line::default(),
-        Line::from(vec![
-            Span::styled("profile   ", Style::default().fg(Color::DarkGray)),
-            Span::styled(format!(" < {profile} > "), profile_style),
-        ]),
         Line::default(),
         Line::from(Span::styled(
             dialog.error.as_deref().unwrap_or(guidance),
@@ -1615,15 +1579,11 @@ mod tests {
     fn shift_tab_moves_new_session_fields_backwards() {
         assert_eq!(
             cycle_dialog_field(DialogField::Provider, true),
-            DialogField::Profile
+            DialogField::Cwd
         );
         assert_eq!(
             cycle_dialog_field(DialogField::Cwd, false),
-            DialogField::Profile
-        );
-        assert_eq!(
-            cycle_dialog_field(DialogField::Profile, true),
-            DialogField::Cwd
+            DialogField::Provider
         );
         assert_eq!(
             cycle_dialog_field(DialogField::Provider, false),

@@ -1,0 +1,2 @@
+{"type":"user","sessionId":"44444444-4444-4444-8444-444444444444","cwd":"/tmp/agent-console-demo/infrastructure","gitBranch":"ops/health-checks","message":{"role":"user","content":"Add production health checks and document the rollout"}}
+{"type":"assistant","sessionId":"44444444-4444-4444-8444-444444444444","cwd":"/tmp/agent-console-demo/infrastructure","gitBranch":"ops/health-checks","message":{"role":"assistant","content":"Implemented readiness probes; verifying the deployment manifest"}}

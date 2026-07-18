@@ -24,8 +24,6 @@ pub struct CachedSession {
     #[serde(default)]
     pub archived: bool,
     #[serde(default)]
-    pub profile: Option<String>,
-    #[serde(default)]
     pub managed_transcript_fingerprint: Option<String>,
 }
 
@@ -156,7 +154,6 @@ impl StateStore {
                 (
                     cached.alias.clone(),
                     cached.archived,
-                    cached.profile.clone(),
                     cached.managed_transcript_fingerprint.clone(),
                 )
             })
@@ -170,8 +167,7 @@ impl StateStore {
                 pending_shell_injection: session.pending_shell_injection.clone(),
                 alias: metadata.0,
                 archived: metadata.1,
-                profile: metadata.2,
-                managed_transcript_fingerprint: metadata.3,
+                managed_transcript_fingerprint: metadata.2,
             },
         );
     }
@@ -206,21 +202,6 @@ impl StateStore {
         {
             self.state.sessions.entry(new_key.to_owned()).or_insert(old);
         }
-    }
-
-    pub fn profile(&self, key: &str) -> Option<&str> {
-        self.state
-            .sessions
-            .get(key)
-            .and_then(|cached| cached.profile.as_deref())
-    }
-
-    pub fn set_profile(&mut self, key: &str, profile: Option<String>) {
-        self.state
-            .sessions
-            .entry(key.to_owned())
-            .or_default()
-            .profile = profile;
     }
 
     pub fn managed_transcript_fingerprint(&self, key: &str) -> Option<&str> {
@@ -486,7 +467,6 @@ mod tests {
         store.update(&session());
         store.set_alias("claude:id", Some("release blocker".into()));
         assert!(store.toggle_archived("claude:id"));
-        store.set_profile("claude:id", Some("work".into()));
         store.set_managed_transcript_fingerprint("claude:id", Some("mtime:length".into()));
         store.save_clean_exit().unwrap();
         assert!(root.path().join("state.db").is_file());
@@ -505,7 +485,6 @@ mod tests {
         );
         assert_eq!(loaded.alias("claude:id"), Some("release blocker"));
         assert!(loaded.archived("claude:id"));
-        assert_eq!(loaded.profile("claude:id"), Some("work"));
         assert_eq!(
             loaded.managed_transcript_fingerprint("claude:id"),
             Some("mtime:length")

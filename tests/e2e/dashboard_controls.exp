@@ -110,10 +110,10 @@ send -- "\033\[D"
 send -- "\033\[3~"
 expect_text {project-complete/} new-dialog-workspace-suggestion 169
 send -- "\t"
-expect_text {Tab profile} new-dialog-workspace-completed 169
+expect_text {Tab provider} new-dialog-workspace-completed 169
 send -- "\t"
 send -- "\033\[C"
-expect_text {work >} new-dialog-profile 171
+expect_text {laude >} new-dialog-provider 171
 send -- "\r"
 expect_text $workspace_name new-dialog-workspace-applied 173
 expect_text {FOCUS AGENT} new-dialog-workspace-start 172

@@ -3495,7 +3495,6 @@ impl TerminalManager {
     pub fn ensure_agent(
         &mut self,
         session: &Session,
-        profile: Option<&str>,
         current_exe: &Path,
         new_session: bool,
         size: (u16, u16),
@@ -3509,7 +3508,7 @@ impl TerminalManager {
             .as_ref()
             .is_none_or(|value| !value.is_alive());
         if needs_spawn {
-            let spec = agent_command(&self.config, session, profile, current_exe, new_session);
+            let spec = agent_command(&self.config, session, current_exe, new_session);
             terminals.agent = Some(if let Some(socket) = daemon_socket {
                 ManagedTerminal::ensure_remote(
                     socket,
@@ -3669,7 +3668,6 @@ impl TerminalManager {
 pub fn agent_command(
     config: &AgentConsoleConfig,
     session: &Session,
-    profile: Option<&str>,
     current_exe: &Path,
     new_session: bool,
 ) -> CommandSpec {
@@ -3721,7 +3719,7 @@ pub fn agent_command(
         }
     };
     let CommandSpec { args, cwd, .. } = spec;
-    let command = config.provider_command_for_profile(session.agent, profile, args);
+    let command = config.provider_command(session.agent, args);
     CommandSpec {
         program: command.program,
         args: command.args,
@@ -3902,24 +3900,12 @@ mod tests {
         let cwd = Path::new("/tmp/repo");
         let executable = Path::new("/tmp/agent console");
         let config = AgentConsoleConfig::default();
-        let codex = agent_command(
-            &config,
-            &session(AgentKind::Codex, cwd),
-            None,
-            executable,
-            false,
-        );
+        let codex = agent_command(&config, &session(AgentKind::Codex, cwd), executable, false);
         assert_eq!(codex.program, "codex");
         assert_eq!(codex.args[0], "resume");
         assert!(codex.args.iter().any(|arg| arg == "id"));
 
-        let claude = agent_command(
-            &config,
-            &session(AgentKind::Claude, cwd),
-            None,
-            executable,
-            false,
-        );
+        let claude = agent_command(&config, &session(AgentKind::Claude, cwd), executable, false);
         assert_eq!(claude.program, "claude");
         assert!(
             claude
@@ -3939,7 +3925,6 @@ mod tests {
         let command = agent_command(
             &config,
             &session(AgentKind::Codex, Path::new("/tmp/repo")),
-            None,
             Path::new("/tmp/agent-console"),
             false,
         );
@@ -3950,27 +3935,6 @@ mod tests {
         assert_eq!(command.args[2], "work");
         assert_eq!(command.args[3], "resume");
         assert!(command.args.iter().any(|arg| arg == "id"));
-    }
-
-    #[test]
-    fn agent_command_uses_selected_named_profile() {
-        let config = AgentConsoleConfig::parse(
-            "[profiles.work]\ncodex = [\"profile-wrapper\", \"codex\", \"--profile\", \"work\"]\n",
-            Path::new("config.toml"),
-        )
-        .unwrap();
-        let command = agent_command(
-            &config,
-            &session(AgentKind::Codex, Path::new("/tmp/repo")),
-            Some("work"),
-            Path::new("/tmp/agent-console"),
-            false,
-        );
-
-        assert_eq!(command.program, "profile-wrapper");
-        assert_eq!(command.args[0], "codex");
-        assert_eq!(command.args[1], "--profile");
-        assert_eq!(command.args[2], "work");
     }
 
     #[test]

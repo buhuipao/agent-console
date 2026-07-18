@@ -1,0 +1,3 @@
+{"type":"session_meta","payload":{"id":"c0000006-0000-4000-8000-000000000006","cwd":"/tmp/agent-console-demo/developer-tools","branch":"chore/release-cli"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"Make the release command produce signed checksums"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"Archive signing works in the local release fixture"}}

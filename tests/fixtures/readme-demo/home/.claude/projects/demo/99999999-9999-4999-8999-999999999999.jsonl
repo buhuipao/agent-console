@@ -1,0 +1,3 @@
+{"type":"user","sessionId":"99999999-9999-4999-8999-999999999999","cwd":"/tmp/agent-console-demo/payments","gitBranch":"fix/webhook-retry","message":{"role":"user","content":"Repair webhook retry ordering under load"}}
+{"type":"assistant","sessionId":"99999999-9999-4999-8999-999999999999","cwd":"/tmp/agent-console-demo/payments","gitBranch":"fix/webhook-retry","message":{"role":"assistant","content":"Found an ordering bug in the retry queue"}}
+{"type":"system","subtype":"api_error","sessionId":"99999999-9999-4999-8999-999999999999","cwd":"/tmp/agent-console-demo/payments"}

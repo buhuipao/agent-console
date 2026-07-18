@@ -1,0 +1,2 @@
+{"type":"user","sessionId":"77777777-7777-4777-8777-777777777777","cwd":"/tmp/agent-console-demo/docs","gitBranch":"docs/onboarding","message":{"role":"user","content":"Rewrite the contributor onboarding guide"}}
+{"type":"assistant","sessionId":"77777777-7777-4777-8777-777777777777","cwd":"/tmp/agent-console-demo/docs","gitBranch":"docs/onboarding","message":{"role":"assistant","content":"Updated setup steps and added a troubleshooting checklist"}}

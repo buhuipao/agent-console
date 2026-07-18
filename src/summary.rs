@@ -49,7 +49,6 @@ impl SummaryBackend {
 pub struct SummaryJob {
     pub session_key: String,
     pub provider: AgentKind,
-    pub profile: Option<String>,
     pub fingerprint: String,
     pub previous: SessionSummary,
     pub records: Vec<String>,
@@ -177,20 +176,9 @@ pub fn build_prompt(previous: &SessionSummary, records: &[String]) -> String {
     format!("{prefix}{records}\n")
 }
 
-#[cfg(test)]
-pub fn command_for(
+fn command_for(
     config: &AgentConsoleConfig,
     provider: AgentKind,
-    neutral_cwd: &Path,
-    schema_path: &Path,
-) -> SummaryCommand {
-    command_for_profile(config, provider, None, neutral_cwd, schema_path)
-}
-
-fn command_for_profile(
-    config: &AgentConsoleConfig,
-    provider: AgentKind,
-    profile: Option<&str>,
     neutral_cwd: &Path,
     schema_path: &Path,
 ) -> SummaryCommand {
@@ -218,7 +206,7 @@ fn command_for_profile(
             summary_schema().to_string(),
         ],
     };
-    let command = config.provider_command_for_profile(provider, profile, args);
+    let command = config.provider_command(provider, args);
     SummaryCommand {
         program: command.program.to_string_lossy().into_owned(),
         args: command
@@ -241,13 +229,7 @@ fn run_job(
     let provider = backend
         .provider_for(job.provider)
         .ok_or_else(|| "summaries are disabled".to_owned())?;
-    let command = command_for_profile(
-        config,
-        provider,
-        job.profile.as_deref(),
-        state_dir,
-        schema_path,
-    );
+    let command = command_for(config, provider, state_dir, schema_path);
     let prompt = build_prompt(&job.previous, &job.records);
     let output = run_with_timeout(&command, prompt.as_bytes(), SUMMARY_TIMEOUT, cancel)?;
     parse_output(provider, &output)
@@ -526,28 +508,6 @@ mod tests {
         assert_eq!(command.args[0], "HTTPS_PROXY=http://127.0.0.1:7890");
         assert_eq!(command.args[1], "claude");
         assert!(command.args.contains(&"--no-session-persistence".into()));
-    }
-
-    #[test]
-    fn summary_uses_the_sessions_named_profile() {
-        let config = AgentConsoleConfig::parse(
-            "[profiles.work]\nclaude = [\"profile-wrapper\", \"claude\", \"--work-config\"]\n",
-            Path::new("config.toml"),
-        )
-        .unwrap();
-        let root = Path::new("/tmp/neutral");
-        let command = command_for_profile(
-            &config,
-            AgentKind::Claude,
-            Some("work"),
-            root,
-            &root.join("schema.json"),
-        );
-
-        assert_eq!(command.program, "profile-wrapper");
-        assert_eq!(command.args[0], "claude");
-        assert_eq!(command.args[1], "--work-config");
-        assert_eq!(command.args[2], "--safe-mode");
     }
 
     #[test]

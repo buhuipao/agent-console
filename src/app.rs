@@ -48,15 +48,12 @@ impl From<&AgentConsoleConfig> for SummaryPolicy {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DialogField {
     Provider,
-    Profile,
     Cwd,
 }
 
 #[derive(Clone, Debug)]
 pub struct NewSessionDialog {
     pub provider: AgentKind,
-    pub profiles: Vec<String>,
-    pub profile_index: usize,
     pub cwd: String,
     pub cwd_cursor: usize,
     pub cwd_replace_on_input: bool,
@@ -279,8 +276,6 @@ impl App {
         let cwd_cursor = cwd.chars().count();
         self.dialog = Some(NewSessionDialog {
             provider,
-            profiles: self.profile_labels(provider),
-            profile_index: 0,
             cwd,
             cwd_cursor,
             cwd_replace_on_input: true,
@@ -293,64 +288,6 @@ impl App {
 
     pub fn cancel_dialog(&mut self) {
         self.dialog = None;
-    }
-
-    pub fn refresh_dialog_profiles(&mut self) {
-        let Some(provider) = self.dialog.as_ref().map(|dialog| dialog.provider) else {
-            return;
-        };
-        let profiles = self.profile_labels(provider);
-        if let Some(dialog) = &mut self.dialog {
-            dialog.profiles = profiles;
-            dialog.profile_index = 0;
-        }
-    }
-
-    pub fn cycle_dialog_profile(&mut self, backwards: bool) {
-        let Some(dialog) = &mut self.dialog else {
-            return;
-        };
-        if dialog.profiles.is_empty() {
-            return;
-        }
-        dialog.profile_index = if backwards {
-            dialog
-                .profile_index
-                .checked_sub(1)
-                .unwrap_or(dialog.profiles.len() - 1)
-        } else {
-            (dialog.profile_index + 1) % dialog.profiles.len()
-        };
-    }
-
-    fn profile_labels(&self, provider: AgentKind) -> Vec<String> {
-        std::iter::once("default".to_owned())
-            .chain(self.config.profile_names(provider))
-            .collect()
-    }
-
-    pub fn cycle_selected_profile(&mut self) -> Result<Option<String>, String> {
-        let session = self
-            .selected_session()
-            .ok_or_else(|| "no selected session".to_owned())?;
-        let key = session.key.clone();
-        let labels = self.profile_labels(session.agent);
-        let current = self.runtime.store.profile(&key).unwrap_or("default");
-        let next = labels
-            .iter()
-            .position(|profile| profile == current)
-            .map_or(0, |index| (index + 1) % labels.len());
-        let profile = (labels[next] != "default").then(|| labels[next].clone());
-        self.runtime.store.set_profile(&key, profile.clone());
-        self.runtime
-            .store
-            .save_incremental()
-            .map_err(|error| error.to_string())?;
-        self.banner = Some(format!(
-            "PROFILE · {} · applies to next agent launch and all new summaries",
-            profile.as_deref().unwrap_or("default")
-        ));
-        Ok(profile)
     }
 
     pub fn dashboard_action(&self, key: &str) -> Option<&'static str> {
@@ -500,13 +437,6 @@ impl App {
         self.runtime.store.archived(&session.key)
     }
 
-    pub fn session_profile(&self, session: &Session) -> &str {
-        self.runtime
-            .store
-            .profile(&session.key)
-            .unwrap_or("default")
-    }
-
     pub fn session_shell_count(&self, session: &Session) -> usize {
         self.terminals.shell_count(&session.key)
     }
@@ -536,11 +466,6 @@ impl App {
         }
         let id = Uuid::new_v4().to_string();
         let key = Session::stable_key(dialog.provider, &id);
-        let profile = dialog
-            .profiles
-            .get(dialog.profile_index)
-            .filter(|profile| profile.as_str() != "default")
-            .cloned();
         let name = cwd
             .file_name()
             .and_then(|value| value.to_str())
@@ -572,8 +497,6 @@ impl App {
             },
         );
         self.selected = 0;
-        let created_key = self.runtime.sessions[0].key.clone();
-        self.runtime.store.set_profile(&created_key, profile);
         self.dialog = None;
         Ok(())
     }
@@ -784,14 +707,9 @@ impl App {
             ManagedAgentRefresh::Reuse => {}
         }
         let new_session = session.transcript_path.is_none();
-        let profile = self.runtime.store.profile(&session.key).map(str::to_owned);
-        let terminal = self.terminals.ensure_agent(
-            &session,
-            profile.as_deref(),
-            current_exe,
-            new_session,
-            size,
-        )?;
+        let terminal = self
+            .terminals
+            .ensure_agent(&session, current_exe, new_session, size)?;
         terminal.wait_for_first_output(Duration::from_secs(2));
         if let Some(staged) = &session.pending_shell_injection {
             terminal.write(&bracketed_paste(staged))?;
@@ -1418,7 +1336,6 @@ impl RuntimeState {
         let job = SummaryJob {
             session_key: key.clone(),
             provider: session.agent,
-            profile: self.store.profile(&key).map(str::to_owned),
             fingerprint,
             previous: session.summary.clone(),
             records,
@@ -2045,32 +1962,6 @@ mod tests {
     }
 
     #[test]
-    fn profile_selection_is_remembered_for_existing_and_new_sessions() {
-        let mut app = App::test_fixture();
-        app.config = AgentConsoleConfig::parse(
-            "[profiles.work]\ncodex = [\"profile-wrapper\", \"codex\"]\n",
-            Path::new("config.toml"),
-        )
-        .unwrap();
-
-        assert_eq!(
-            app.cycle_selected_profile().unwrap().as_deref(),
-            Some("work")
-        );
-        assert_eq!(app.runtime.store.profile("codex:test"), Some("work"));
-
-        app.open_new_dialog();
-        assert_eq!(app.dialog.as_ref().unwrap().profiles, ["default", "work"]);
-        app.cycle_dialog_profile(false);
-        app.dialog.as_mut().unwrap().cwd = "/tmp".into();
-        app.create_from_dialog().unwrap();
-        assert_eq!(
-            app.runtime.store.profile(&app.sessions[0].key),
-            Some("work")
-        );
-    }
-
-    #[test]
     fn stale_idle_agent_restarts_but_active_agent_is_preserved() {
         let mut session = fixture_session("codex:stale");
         session.transcript_path = Some("/tmp/session.jsonl".into());
@@ -2131,13 +2022,7 @@ mod tests {
         session.transcript_fingerprint = "latest".into();
         let mut terminals = TerminalManager::new_local(config.clone());
         terminals
-            .ensure_agent(
-                &session,
-                None,
-                Path::new("/tmp/agent-console"),
-                false,
-                (80, 24),
-            )
+            .ensure_agent(&session, Path::new("/tmp/agent-console"), false, (80, 24))
             .unwrap()
             .wait_for_first_output(Duration::from_secs(1));
         assert_eq!(fs::read_to_string(&launches).unwrap(), "x");

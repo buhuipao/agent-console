@@ -16,8 +16,8 @@
   Shell PTYs independently of any TUI process.
 - **Notification** — a deduplicated state transition that needs user attention,
   principally waiting or failed.
-- **Provider Profile** — a named provider command and fixed configuration used
-  consistently for launch, resume, and same-provider summary.
+- **Provider Command** — the single optional custom argv prefix for Codex or
+  Claude, used consistently for launch, resume, and same-provider summary.
 - **Command Block** — one shell command plus the output it produced and its exit
   status.
 - **Event Index** — SQLite-backed normalized hook events plus a byte cursor and

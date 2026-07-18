@@ -1,0 +1,2 @@
+{"type":"user","sessionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","cwd":"/tmp/agent-console-demo/platform","gitBranch":"chore/metrics","message":{"role":"user","content":"Consolidate request metrics without changing dashboards"}}
+{"type":"assistant","sessionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","cwd":"/tmp/agent-console-demo/platform","gitBranch":"chore/metrics","message":{"role":"assistant","content":"Metric names are migrated; checking compatibility aliases"}}

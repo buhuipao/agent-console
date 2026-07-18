@@ -30,13 +30,13 @@ suite requires `expect`; neither is required when installing a release.
 ## Install a release
 
 Each [GitHub Release](https://github.com/buhuipao/agent-console/releases)
-contains five native packages (shown here for version `0.0.2`):
+contains five native packages (shown here for version `0.0.3`):
 
-- Windows x86_64: `agent-console-v0.0.2-x86_64-pc-windows-msvc.zip`
-- Linux x86_64 and ARM64: `agent-console-v0.0.2-x86_64-unknown-linux-gnu.tar.gz`
-  and `agent-console-v0.0.2-aarch64-unknown-linux-gnu.tar.gz`
-- macOS Intel and Apple Silicon: `agent-console-v0.0.2-x86_64-apple-darwin.tar.gz`
-  and `agent-console-v0.0.2-aarch64-apple-darwin.tar.gz`
+- Windows x86_64: `agent-console-v0.0.3-x86_64-pc-windows-msvc.zip`
+- Linux x86_64 and ARM64: `agent-console-v0.0.3-x86_64-unknown-linux-gnu.tar.gz`
+  and `agent-console-v0.0.3-aarch64-unknown-linux-gnu.tar.gz`
+- macOS Intel and Apple Silicon: `agent-console-v0.0.3-x86_64-apple-darwin.tar.gz`
+  and `agent-console-v0.0.3-aarch64-apple-darwin.tar.gz`
 
 Extract the matching archive and place `agent-console` (or
 `agent-console.exe`) on `PATH`. Verify the download against the release's
@@ -61,30 +61,8 @@ command for each provider:
 
 ```toml
 [providers]
-codex = ["proxychains4", "codex", "--profile", "work"]
-claude = ["env", "HTTPS_PROXY=http://127.0.0.1:7890", "claude"]
-
-[profiles.direct]
-codex = ["codex"]
-claude = ["claude"]
-
-[profiles.corporate_proxy]
 codex = ["proxychains4", "codex"]
 claude = ["env", "HTTPS_PROXY=http://127.0.0.1:7890", "claude"]
-
-[summary]
-min_interval_seconds = 30
-failure_backoff_seconds = 30
-circuit_failures = 3
-circuit_cooldown_seconds = 300
-
-[keys.dashboard]
-search = ["/"]
-help = ["?"]
-
-[keys.workspace]
-focus = ["ctrl-o"]
-dashboard = ["ctrl-q"]
 ```
 
 The first array item is the executable and the remaining items are fixed
@@ -100,12 +78,30 @@ alias or function through `$SHELL -ic` and passes all generated arguments via
 `"$@"`. Multi-item commands always use direct argv execution without shell
 evaluation.
 
-Profiles override only the named provider command and fall back to
-`[providers]` for providers they omit. Select one in the new-session dialog.
-If cycling profiles on persisted sessions is needed, explicitly bind the
-Dashboard `profile` action in `[keys.dashboard]`; it is unbound by default.
-The choice is stored per session and is used for resume, new launches, and
-same-provider summaries.
+There is exactly one optional custom command per provider. Put wrappers,
+environment-variable launchers, proxy commands, aliases, and fixed arguments
+directly in that provider's array; Agent Console has no separate provider
+profile layer.
+
+## Optional runtime and key configuration
+
+The same file can independently override summary scheduling and key bindings:
+
+```toml
+[summary]
+min_interval_seconds = 30
+failure_backoff_seconds = 30
+circuit_failures = 3
+circuit_cooldown_seconds = 300
+
+[keys.dashboard]
+search = ["/"]
+help = ["?"]
+
+[keys.workspace]
+focus = ["ctrl-o"]
+dashboard = ["ctrl-q"]
+```
 
 `[keys.dashboard]` and `[keys.workspace]` replace the defaults one action at a
 time. Unsupported labels, unknown actions, empty bindings, and duplicate
@@ -144,16 +140,15 @@ an adaptive overview uses at most three cards per row. Every card has a short
 status title and a bright `TASK` row; its priority row is `NEEDS YOU`,
 `BLOCKER`, `NOW`, or `LAST`, with fallback text when a summary is missing.
 
-In the new-session dialog, `Tab` moves forward through provider, workspace,
-and profile; `Shift-Tab` moves backward. Left/Right or `h`/`l` changes provider
-or profile. The workspace starts as the dashboard directory, but focusing it
+In the new-session dialog, `Tab` and `Shift-Tab` move between provider and
+workspace. Left/Right or `h`/`l` changes provider. The workspace starts as the dashboard directory, but focusing it
 selects the whole value: typing or pasting immediately replaces the default.
 Left/Right moves the workspace caret, Home/End jumps to either edge,
 Backspace/Delete removes before/after the caret, and typing inserts at it.
 Long paths scroll horizontally with an ellipsis for hidden content. Directory
 matches appear live; Up/Down chooses a match and Tab completes it. Completion
-keeps the field active for a child directory; a second Tab advances to
-profile. Files are excluded.
+keeps the field active for a child directory; a second Tab returns to
+provider. Files are excluded.
 
 Inside a session workspace, the session list stays on the left, the agent is
 on the upper right, and shell panes share the lower right. The shell list
@@ -363,7 +358,7 @@ launched and owns.
 
 ## Release automation
 
-`.github/workflows/release.yml` validates that a pushed tag such as `v0.0.2`
+`.github/workflows/release.yml` validates that a pushed tag such as `v0.0.3`
 matches the version in `Cargo.toml`, runs formatting/lint/tests, builds all five
 native packages, generates `SHA256SUMS`, and creates the GitHub Release. The
 workflow can also be started manually with publishing disabled to exercise the

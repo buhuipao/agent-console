@@ -1,0 +1,3 @@
+{"type":"session_meta","payload":{"id":"c0000005-0000-4000-8000-000000000005","cwd":"/tmp/agent-console-demo/mobile-app","branch":"fix/deep-links"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"Fix deep links opened from notification actions"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"Updated route normalization and device tests"}}

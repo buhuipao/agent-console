@@ -1,0 +1,2 @@
+{"type":"user","sessionId":"55555555-5555-4555-8555-555555555555","cwd":"/tmp/agent-console-demo/mobile-app","gitBranch":"feat/offline-sync","message":{"role":"user","content":"Implement offline sync conflict resolution"}}
+{"type":"assistant","sessionId":"55555555-5555-4555-8555-555555555555","cwd":"/tmp/agent-console-demo/mobile-app","gitBranch":"feat/offline-sync","message":{"role":"assistant","content":"Added deterministic conflict handling and integration coverage"}}
