@@ -1,0 +1,97 @@
+#!/usr/bin/expect -f
+
+set timeout 45
+set root [file normalize [file join [file dirname [info script]] ../..]]
+set binary [file join $root target debug agent-console-prototype]
+set state_dir [file join /tmp "agent-console-real-sessions-[pid]"]
+set env(AGENT_CONSOLE_STATE_DIR) $state_dir
+set env(AGENT_CONSOLE_SUMMARIZER) off
+log_user 0
+
+proc cleanup {} {
+    global binary state_dir spawn_id
+    catch {exec kill -KILL [exp_pid -i $spawn_id]}
+    catch {exec $binary pty-daemon-stop [file join $state_dir pty-daemon.sock]}
+    catch {file delete -force $state_dir}
+}
+
+proc fail {label code} {
+    puts stderr "FAIL $label"
+    flush stderr
+    cleanup
+    exit $code
+}
+
+proc expect_text {pattern label code} {
+    global spawn_id
+    expect {
+        -i $spawn_id -re $pattern {
+            puts "ok $label"
+            flush stdout
+        }
+        -i $spawn_id timeout { fail $label $code }
+        -i $spawn_id eof { fail "$label (unexpected exit)" $code }
+    }
+}
+
+proc expect_workspace {provider_pattern label code} {
+    global spawn_id
+    set saw_focus 0
+    set saw_provider 0
+    while {!$saw_focus || !$saw_provider} {
+        expect {
+            -i $spawn_id -re {FOCUS AGENT} { set saw_focus 1 }
+            -i $spawn_id -re $provider_pattern { set saw_provider 1 }
+            -i $spawn_id timeout { fail $label $code }
+            -i $spawn_id eof { fail "$label (unexpected exit)" $code }
+        }
+    }
+    puts "ok $label"
+    flush stdout
+}
+
+spawn /bin/sh -c [format {cd "%s"; stty rows 34 columns 140; exec "%s"} $root $binary]
+expect_text {Agent Console} dashboard-ready 180
+
+# Start a real Codex session, refresh discovery, kill the PTY owner, and enter
+# again through the provider resume contract.
+send -- "n"
+expect_text {NEW SESSION} codex-new-dialog 181
+send -- "\r"
+expect_workspace {OpenAI Codex|Codex CLI|Hooks need review} codex-new-session 182
+after 1200
+send -- "\021"
+expect_text {Agent Console|SESSION OVERVIEW} codex-back-dashboard 183
+after 2500
+catch {exec $binary pty-daemon-stop [file join $state_dir pty-daemon.sock]}
+after 300
+send -- "\r"
+expect_workspace {OpenAI Codex|Codex CLI|Hooks need review} codex-resume 185
+send -- "\021"
+expect_text {Agent Console|SESSION OVERVIEW} codex-resume-dashboard 186
+
+# Start and resume Claude through the same lifecycle.
+send -- "n"
+expect_text {NEW SESSION} claude-new-dialog 187
+send -- "\033\[C"
+send -- "\r"
+expect_workspace {Claude Code|Welcome back} claude-new-session 188
+after 1200
+send -- "\021"
+expect_text {Agent Console|SESSION OVERVIEW} claude-back-dashboard 189
+after 2500
+catch {exec $binary pty-daemon-stop [file join $state_dir pty-daemon.sock]}
+after 300
+send -- "\r"
+expect_workspace {Claude Code|Welcome back} claude-resume 191
+send -- "\021"
+expect_text {Agent Console|SESSION OVERVIEW} claude-resume-dashboard 192
+send -- "q"
+expect {
+    -i $spawn_id eof {
+        puts "E2E passed: real Codex and Claude new-session/resume lifecycle"
+        flush stdout
+    }
+    -i $spawn_id timeout { fail real-provider-quit 193 }
+}
+cleanup

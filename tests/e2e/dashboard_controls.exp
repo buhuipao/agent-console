@@ -1,0 +1,143 @@
+#!/usr/bin/expect -f
+
+set timeout 8
+set root [file normalize [file join [file dirname [info script]] ../..]]
+set env(AGENT_CONSOLE_CONFIG) [file join $root tests fixtures e2e-config.toml]
+set env(AGENT_CONSOLE_SUMMARIZER) off
+set env(CODEX_HOME) [file join $root tests fixtures e2e-codex]
+set env(HOME) [file join $root tests fixtures e2e-home]
+set env(PATH) "[file join $root tests fixtures bin]:$env(PATH)"
+set state_dir [file join /tmp "agent-console-dashboard-e2e-[pid]"]
+set workspace_root [file join /tmp "agent-console-workspace-e2e-[pid]"]
+set workspace_target [file join $workspace_root project-complete]
+set workspace_partial [file join $workspace_root project-com]
+set workspace_name project-complete
+file mkdir $workspace_target
+set env(AGENT_CONSOLE_STATE_DIR) $state_dir
+log_user 0
+
+proc fail {label code} {
+    global spawn_id state_dir workspace_root binary
+    puts stderr "FAIL $label"
+    flush stderr
+    catch {exec kill -KILL [exp_pid -i $spawn_id]}
+    catch {exec $binary pty-daemon-stop [file join $state_dir pty-daemon.sock]}
+    catch {file delete -force $state_dir}
+    catch {file delete -force $workspace_root}
+    exit $code
+}
+
+proc expect_text {pattern label code} {
+    global spawn_id
+    expect {
+        -i $spawn_id -re $pattern {
+            puts "ok $label"
+            flush stdout
+        }
+        -i $spawn_id timeout { fail $label $code }
+        -i $spawn_id eof { fail "$label (unexpected exit)" $code }
+    }
+}
+
+set binary [file join $root target debug agent-console-prototype]
+spawn /bin/sh -c [format {stty rows 30 columns 120; exec "%s"} $binary]
+set timeout 15
+expect_text {Agent Console} dashboard-ready 140
+
+set first {}
+set second {}
+expect {
+    -i $spawn_id -re {Exercise workspace controls} {
+        set first {Exercise workspace controls}
+        set second {Verify the second dashboard session selection}
+    }
+    -i $spawn_id -re {Verify the second dashboard session selection} {
+        set first {Verify the second dashboard session selection}
+        set second {Exercise workspace controls}
+    }
+    -i $spawn_id timeout { fail initial-selection 141 }
+}
+set timeout 8
+
+send -- "j"
+after 100
+send -- "k"
+after 100
+send -- "\033\[B"
+after 100
+send -- "\033\[A"
+after 100
+send -- "\033\[<65;2;5M"
+after 100
+send -- "\033\[<64;2;5M"
+after 100
+
+send -- "/"
+expect_text {SEARCH SESSIONS} search-dialog 155
+send -- "Exercise"
+expect_text {Exercise workspace controls} search-live 156
+send -- "\r"
+expect_text {filters:} search-applied 156
+send -- "/"
+expect_text {SEARCH SESSIONS} search-clear-dialog 158
+for {set i 0} {$i < 8} {incr i} { send -- "\177" }
+send -- "\r"
+expect_text {no search} search-clear 158
+
+send -- "x"
+expect_text {SESSION ARCHIVED} archive 163
+expect_text {Archived} archived-group 164
+send -- "x"
+expect_text {RESTOR} restore 165
+
+send -- "?"
+expect_text {KEY BINDINGS} help-panel 167
+send -- "?"
+after 100
+
+send -- "n"
+expect_text {NEW SESSION} new-dialog 146
+send -- "\t"
+expect_text {type/paste} new-dialog-workspace 168
+send -- "${workspace_partial}x"
+expect_text {project-com.*x} new-dialog-cursor-seed 169
+send -- "\033\[H"
+send -- "Z"
+expect_text {Z.*tmp} new-dialog-home-insert 169
+send -- "\177"
+send -- "\033\[F"
+send -- "\033\[D"
+send -- "\033\[3~"
+expect_text {project-complete/} new-dialog-workspace-suggestion 169
+send -- "\t"
+expect_text {Tab profile} new-dialog-workspace-completed 169
+send -- "\t"
+send -- "\033\[C"
+expect_text {work >} new-dialog-profile 171
+send -- "\r"
+expect_text $workspace_name new-dialog-workspace-applied 173
+expect_text {FOCUS AGENT} new-dialog-workspace-start 172
+send -- "\021"
+expect_text {Agent Console} dashboard-after-new-session 174
+
+send -- "s"
+expect_text {FOCUS SHELL 1/1} open-shell 148
+send -- "printf 'dashboard-capture-marker\\n'\r"
+expect_text {dashboard-capture-marker} shell-command 149
+send -- "\021"
+expect_text {Agent Console} dashboard-after-shell 150
+send -- "\r"
+expect_text {FOCUS AGENT} open-agent 153
+send -- "\021"
+expect_text {Agent Console} dashboard-after-agent 170
+send -- "q"
+expect {
+    -i $spawn_id eof {
+        puts "E2E passed: dashboard navigation, archive/restore, dialog, shell, agent, quit"
+        flush stdout
+    }
+    -i $spawn_id timeout { fail quit 154 }
+}
+catch {exec $binary pty-daemon-stop [file join $state_dir pty-daemon.sock]}
+catch {file delete -force $state_dir}
+catch {file delete -force $workspace_root}

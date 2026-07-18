@@ -1,0 +1,2 @@
+{"type":"session_meta","payload":{"id":"e2e-session-second","cwd":"/tmp"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"Verify the second dashboard session selection"}}

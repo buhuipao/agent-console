@@ -1,0 +1,80 @@
+#!/usr/bin/expect -f
+
+set timeout 12
+set root [file normalize [file join [file dirname [info script]] ../..]]
+set env(AGENT_CONSOLE_CONFIG) [file join $root tests fixtures e2e-config.toml]
+set env(AGENT_CONSOLE_SUMMARIZER) off
+set env(CODEX_HOME) [file join $root tests fixtures e2e-codex]
+set env(HOME) [file join $root tests fixtures e2e-home]
+set env(PATH) "[file join $root tests fixtures bin]:$env(PATH)"
+set first_fixture [file join $root tests fixtures e2e-codex sessions 2026 07 16 rollout-e2e.jsonl]
+set second_fixture [file join $root tests fixtures e2e-codex sessions 2026 07 16 rollout-e2e-second.jsonl]
+file mtime $first_fixture [expr {[clock seconds] - 10}]
+file mtime $second_fixture [clock seconds]
+set state_dir [file join /tmp "agent-console-lease-e2e-[pid]"]
+set env(AGENT_CONSOLE_STATE_DIR) $state_dir
+set binary [file join $root target debug agent-console-prototype]
+set socket [file join $state_dir pty-daemon.sock]
+log_user 0
+
+proc cleanup {} {
+    global binary socket state_dir first_spawn second_spawn
+    if {[info exists first_spawn]} { catch {exec kill -KILL [exp_pid -i $first_spawn]} }
+    if {[info exists second_spawn]} { catch {exec kill -KILL [exp_pid -i $second_spawn]} }
+    catch {exec $binary pty-daemon-stop $socket}
+    catch {file delete -force $state_dir}
+}
+
+proc expect_on {id pattern label code} {
+    expect {
+        -i $id -re $pattern {
+            puts "ok $label"
+            flush stdout
+        }
+        -i $id timeout {
+            puts stderr "FAIL $label"
+            cleanup
+            exit $code
+        }
+        -i $id eof {
+            puts stderr "FAIL $label (unexpected exit)"
+            cleanup
+            exit $code
+        }
+    }
+}
+
+spawn /bin/sh -c [format {stty rows 30 columns 120; exec "%s"} $binary]
+set first_spawn $spawn_id
+expect_on $first_spawn {Agent Console} first-dashboard 170
+send -i $first_spawn -- "\r"
+expect_on $first_spawn {FOCUS AGENT} first-owner 171
+
+spawn /bin/sh -c [format {stty rows 30 columns 120; exec "%s"} $binary]
+set second_spawn $spawn_id
+expect_on $second_spawn {Agent Console} second-dashboard 172
+send -i $second_spawn -- "\r"
+expect_on $second_spawn {PID [0-9]+} second-refused-with-owner 173
+send -i $second_spawn -- "t"
+expect_on $second_spawn {FOCUS AGENT} forced-takeover 174
+
+exec kill -KILL [exp_pid -i $first_spawn]
+expect {
+    -i $first_spawn eof {
+        puts "ok old-owner-stopped"
+        flush stdout
+    }
+    -i $first_spawn timeout { cleanup; exit 176 }
+}
+
+send -i $second_spawn -- "\021"
+after 200
+send -i $second_spawn -- "q"
+expect {
+    -i $second_spawn eof {
+        puts "E2E passed: second TUI is refused, explicit takeover revokes first writer"
+        flush stdout
+    }
+    -i $second_spawn timeout { cleanup; exit 177 }
+}
+cleanup

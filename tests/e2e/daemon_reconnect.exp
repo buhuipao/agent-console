@@ -1,0 +1,84 @@
+#!/usr/bin/expect -f
+
+set timeout 12
+set root [file normalize [file join [file dirname [info script]] ../..]]
+set env(AGENT_CONSOLE_CONFIG) [file join $root tests fixtures e2e-config.toml]
+set env(AGENT_CONSOLE_SUMMARIZER) off
+set env(CODEX_HOME) [file join $root tests fixtures e2e-codex]
+set env(HOME) [file join $root tests fixtures e2e-home]
+set env(PATH) "[file join $root tests fixtures bin]:$env(PATH)"
+set first_fixture [file join $root tests fixtures e2e-codex sessions 2026 07 16 rollout-e2e.jsonl]
+set second_fixture [file join $root tests fixtures e2e-codex sessions 2026 07 16 rollout-e2e-second.jsonl]
+file mtime $first_fixture [expr {[clock seconds] - 10}]
+file mtime $second_fixture [clock seconds]
+set state_dir [file join /tmp "agent-console-daemon-e2e-[pid]"]
+set env(AGENT_CONSOLE_STATE_DIR) $state_dir
+set binary [file join $root target debug agent-console-prototype]
+set socket [file join $state_dir pty-daemon.sock]
+log_user 0
+
+proc cleanup {} {
+    global binary socket state_dir spawn_id
+    catch {exec kill -KILL [exp_pid -i $spawn_id]}
+    catch {exec $binary pty-daemon-stop $socket}
+    catch {file delete -force $state_dir}
+}
+
+proc fail {label code} {
+    puts stderr "FAIL $label"
+    flush stderr
+    cleanup
+    exit $code
+}
+
+proc expect_text {pattern label code} {
+    global spawn_id
+    expect {
+        -i $spawn_id -re $pattern {
+            puts "ok $label"
+            flush stdout
+        }
+        -i $spawn_id timeout { fail $label $code }
+        -i $spawn_id eof { fail "$label (unexpected exit)" $code }
+    }
+}
+
+spawn /bin/sh -c [format {stty rows 30 columns 120; exec "%s"} $binary]
+expect_text {Agent Console} first-dashboard 160
+send -- "s"
+expect_text {FOCUS SHELL 1/1} first-shell 161
+send -- "i=1; while true; do echo daemon-survives-\$i; i=\$((i+1)); sleep 0.1; done\r"
+expect_text {daemon-survives-[2-9]} shell-running 162
+
+exec kill -KILL [exp_pid -i $spawn_id]
+expect {
+    -i $spawn_id eof {
+        puts "ok TUI-killed"
+        flush stdout
+    }
+    -i $spawn_id timeout { fail TUI-killed 163 }
+}
+after 500
+
+spawn /bin/sh -c [format {stty rows 30 columns 120; exec "%s"} $binary]
+expect_text {Agent Console} second-dashboard 164
+send -- "\r"
+expect_text {FOCUS AGENT} reconnected-agent 165
+send -- "\017"
+expect_text {daemon-survives-[0-9]+} shell-output-survived 166
+expect_text {FOCUS SHELL 1/1} reconnected-shell 167
+send -- "\030"
+expect_text {again to close} confirm-close-reconnected-shell 168
+send -- "\030"
+expect_text {FOCUS AGENT} close-reconnected-shell 168
+send -- "\021"
+after 200
+send -- "q"
+expect {
+    -i $spawn_id eof {
+        puts "E2E passed: daemon survives a killed TUI and reconnects agent plus shell"
+        flush stdout
+    }
+    -i $spawn_id timeout { fail reconnect-exit 169 }
+}
+cleanup

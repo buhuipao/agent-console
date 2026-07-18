@@ -1,0 +1,7 @@
+[providers]
+codex = ["/bin/sh", "-c", "printf x >> \"$AGENT_CONSOLE_STATE_DIR/provider-launches\"; printf 'fake codex ready\\n'; exec /bin/cat"]
+claude = ["/bin/sh", "-c", "printf x >> \"$AGENT_CONSOLE_STATE_DIR/provider-launches\"; printf 'fake claude ready\\n'; exec /bin/cat"]
+
+[profiles.work]
+codex = ["/bin/sh", "-c", "printf x >> \"$AGENT_CONSOLE_STATE_DIR/provider-launches\"; printf 'fake profiled codex ready\\n'; exec /bin/cat"]
+claude = ["/bin/sh", "-c", "printf x >> \"$AGENT_CONSOLE_STATE_DIR/provider-launches\"; printf 'fake profiled claude ready\\n'; exec /bin/cat"]

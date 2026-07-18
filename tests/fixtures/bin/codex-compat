@@ -1,0 +1,24 @@
+#!/bin/sh
+case "${1-}" in
+  --version)
+    printf 'codex-cli %s\n' "${CODEX_FIXTURE_VERSION:-0.144.4}"
+    ;;
+  --help)
+    printf 'Usage: codex [--config value] <resume|exec>\n'
+    ;;
+  exec)
+    if [ "${2-}" = "--help" ]; then
+      printf 'Usage: codex exec [--ephemeral] [--output-schema FILE]\n'
+    else
+      printf '{"result":"fixture summary"}\n'
+    fi
+    ;;
+  resume)
+    printf 'fixture codex resumed %s\n' "${2-}"
+    exec /bin/cat
+    ;;
+  *)
+    printf 'fixture codex new session\n'
+    exec /bin/cat
+    ;;
+esac

@@ -1,0 +1,17 @@
+#!/bin/sh
+case "${1-}" in
+  --version)
+    printf '%s (Claude Code)\n' "${CLAUDE_FIXTURE_VERSION:-2.1.211}"
+    ;;
+  --help)
+    printf 'Usage: claude [--resume ID] [--settings JSON] [--print] [--output-format FORMAT] [--json-schema JSON]\n'
+    ;;
+  --resume)
+    printf 'fixture claude resumed %s\n' "${2-}"
+    exec /bin/cat
+    ;;
+  *)
+    printf 'fixture claude new session\n'
+    exec /bin/cat
+    ;;
+esac
