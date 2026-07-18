@@ -4,8 +4,6 @@ use std::{
     ffi::{OsStr, OsString},
     fs,
     io::{self, BufRead, BufReader, Read, Write},
-    os::unix::net::{UnixListener, UnixStream},
-    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
     sync::{
@@ -16,6 +14,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(unix)]
+use std::os::unix::{
+    net::{UnixListener, UnixStream},
+    process::CommandExt,
+};
+
+#[cfg(not(unix))]
+use crossterm::event;
+#[cfg(any(not(unix), test))]
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthChar;
@@ -760,6 +770,7 @@ fn terminal_session_key(id: &str) -> Option<String> {
         .and_then(|value| value.rsplit_once('|').map(|(key, _)| key.to_owned()))
 }
 
+#[cfg(unix)]
 fn process_is_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
@@ -769,6 +780,12 @@ fn process_is_alive(pid: u32) -> bool {
     result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+#[cfg(not(unix))]
+fn process_is_alive(_pid: u32) -> bool {
+    false
+}
+
+#[cfg(unix)]
 fn daemon_request(socket: &Path, request: &DaemonRequest) -> io::Result<DaemonResponse> {
     let mut stream = UnixStream::connect(socket)?;
     serde_json::to_writer(&mut stream, request).map_err(io::Error::other)?;
@@ -777,6 +794,14 @@ fn daemon_request(socket: &Path, request: &DaemonRequest) -> io::Result<DaemonRe
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line)?;
     serde_json::from_str(&line).map_err(io::Error::other)
+}
+
+#[cfg(not(unix))]
+fn daemon_request(_socket: &Path, _request: &DaemonRequest) -> io::Result<DaemonResponse> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "detached PTY daemon is unavailable on this platform",
+    ))
 }
 
 fn response_ok(response: DaemonResponse) -> io::Result<()> {
@@ -789,6 +814,7 @@ fn response_ok(response: DaemonResponse) -> io::Result<()> {
     }
 }
 
+#[cfg(unix)]
 pub fn run_pty_daemon(socket: &Path) -> io::Result<()> {
     if let Some(parent) = socket.parent() {
         ensure_private_dir(parent)?;
@@ -821,15 +847,38 @@ pub fn run_pty_daemon(socket: &Path) -> io::Result<()> {
     result
 }
 
+#[cfg(not(unix))]
+pub fn run_pty_daemon(_socket: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "detached PTY daemon is unavailable on this platform",
+    ))
+}
+
+#[cfg(unix)]
 pub fn stop_pty_daemon(socket: &Path) -> io::Result<()> {
     response_ok(daemon_request(socket, &DaemonRequest::Shutdown)?)
 }
 
+#[cfg(not(unix))]
+pub fn stop_pty_daemon(_socket: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "detached PTY daemon is unavailable on this platform",
+    ))
+}
+
+#[cfg(unix)]
 pub fn daemon_health(socket: &Path) -> io::Result<Option<()>> {
     if !socket.exists() {
         return Ok(None);
     }
     response_ok(daemon_request(socket, &DaemonRequest::Ping)?).map(Some)
+}
+
+#[cfg(not(unix))]
+pub fn daemon_health(_socket: &Path) -> io::Result<Option<()>> {
+    Ok(None)
 }
 
 struct RemoteTerminal {
@@ -1725,6 +1774,178 @@ enum WorkspaceInput {
     Mouse(WorkspaceMouseEvent),
 }
 
+enum PolledTerminalInput {
+    Pending,
+    EndOfFile,
+    Bytes(Vec<u8>),
+}
+
+#[cfg(unix)]
+fn poll_terminal_input(timeout: Duration) -> io::Result<PolledTerminalInput> {
+    let mut descriptor = libc::pollfd {
+        fd: libc::STDIN_FILENO,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+    // SAFETY: descriptor points to one valid pollfd for the duration of the call.
+    let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+    if ready < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            return Ok(PolledTerminalInput::Pending);
+        }
+        return Err(error);
+    }
+    if ready == 0 || descriptor.revents & libc::POLLIN == 0 {
+        return Ok(PolledTerminalInput::Pending);
+    }
+    let mut input = [0_u8; 4096];
+    let read = io::stdin().read(&mut input)?;
+    if read == 0 {
+        Ok(PolledTerminalInput::EndOfFile)
+    } else {
+        Ok(PolledTerminalInput::Bytes(input[..read].to_vec()))
+    }
+}
+
+#[cfg(not(unix))]
+fn poll_terminal_input(timeout: Duration) -> io::Result<PolledTerminalInput> {
+    if !event::poll(timeout)? {
+        return Ok(PolledTerminalInput::Pending);
+    }
+    let bytes = terminal_event_bytes(event::read()?);
+    if bytes.is_empty() {
+        Ok(PolledTerminalInput::Pending)
+    } else {
+        Ok(PolledTerminalInput::Bytes(bytes))
+    }
+}
+
+#[cfg(any(not(unix), test))]
+fn terminal_event_bytes(event: Event) -> Vec<u8> {
+    match event {
+        Event::Key(key) if key.kind != KeyEventKind::Release => terminal_key_bytes(key),
+        Event::Paste(text) => text.into_bytes(),
+        Event::Mouse(mouse) => terminal_mouse_bytes(mouse),
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(any(not(unix), test))]
+fn terminal_key_bytes(key: KeyEvent) -> Vec<u8> {
+    let modifier = 1
+        + usize::from(key.modifiers.contains(KeyModifiers::SHIFT))
+        + 2 * usize::from(key.modifiers.contains(KeyModifiers::ALT))
+        + 4 * usize::from(key.modifiers.contains(KeyModifiers::CONTROL));
+    let modified_csi = |final_byte: char| format!("\x1b[1;{modifier}{final_byte}").into_bytes();
+    let mut bytes = match key.code {
+        KeyCode::Char(character) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            control_character(character).map_or_else(Vec::new, |byte| vec![byte])
+        }
+        KeyCode::Char(character) => character.to_string().into_bytes(),
+        KeyCode::Enter => vec![b'\r'],
+        KeyCode::Tab => vec![b'\t'],
+        KeyCode::BackTab => b"\x1b[Z".to_vec(),
+        KeyCode::Backspace => vec![0x7f],
+        KeyCode::Esc => vec![0x1b],
+        KeyCode::Left if modifier == 1 => b"\x1b[D".to_vec(),
+        KeyCode::Right if modifier == 1 => b"\x1b[C".to_vec(),
+        KeyCode::Up if modifier == 1 => b"\x1b[A".to_vec(),
+        KeyCode::Down if modifier == 1 => b"\x1b[B".to_vec(),
+        KeyCode::Left => modified_csi('D'),
+        KeyCode::Right => modified_csi('C'),
+        KeyCode::Up => modified_csi('A'),
+        KeyCode::Down => modified_csi('B'),
+        KeyCode::Home if modifier == 1 => b"\x1b[H".to_vec(),
+        KeyCode::End if modifier == 1 => b"\x1b[F".to_vec(),
+        KeyCode::Home => modified_csi('H'),
+        KeyCode::End => modified_csi('F'),
+        KeyCode::Insert => format!("\x1b[2;{modifier}~").into_bytes(),
+        KeyCode::Delete => format!("\x1b[3;{modifier}~").into_bytes(),
+        KeyCode::PageUp => format!("\x1b[5;{modifier}~").into_bytes(),
+        KeyCode::PageDown => format!("\x1b[6;{modifier}~").into_bytes(),
+        KeyCode::F(number) => function_key_bytes(number, modifier),
+        KeyCode::Null => vec![0],
+        _ => Vec::new(),
+    };
+    if key.modifiers.contains(KeyModifiers::ALT)
+        && matches!(key.code, KeyCode::Char(_))
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        bytes.insert(0, 0x1b);
+    }
+    bytes
+}
+
+#[cfg(any(not(unix), test))]
+fn control_character(character: char) -> Option<u8> {
+    match character.to_ascii_uppercase() {
+        '@' | ' ' => Some(0),
+        value @ 'A'..='_' => Some(value as u8 & 0x1f),
+        '?' => Some(0x7f),
+        _ => None,
+    }
+}
+
+#[cfg(any(not(unix), test))]
+fn function_key_bytes(number: u8, modifier: usize) -> Vec<u8> {
+    let code = match number {
+        1 => "P",
+        2 => "Q",
+        3 => "R",
+        4 => "S",
+        5 => "15~",
+        6 => "17~",
+        7 => "18~",
+        8 => "19~",
+        9 => "20~",
+        10 => "21~",
+        11 => "23~",
+        12 => "24~",
+        _ => return Vec::new(),
+    };
+    if modifier == 1 && number <= 4 {
+        format!("\x1bO{code}").into_bytes()
+    } else if number <= 4 {
+        format!("\x1b[1;{modifier}{code}").into_bytes()
+    } else if modifier == 1 {
+        format!("\x1b[{code}").into_bytes()
+    } else {
+        format!("\x1b[{};{modifier}~", code.trim_end_matches('~')).into_bytes()
+    }
+}
+
+#[cfg(any(not(unix), test))]
+fn terminal_mouse_bytes(mouse: MouseEvent) -> Vec<u8> {
+    let (button, pressed) = match mouse.kind {
+        MouseEventKind::Down(button) => (mouse_button_code(button), true),
+        MouseEventKind::Up(button) => (mouse_button_code(button), false),
+        MouseEventKind::Drag(button) => (mouse_button_code(button) | 32, true),
+        MouseEventKind::Moved => (35, true),
+        MouseEventKind::ScrollUp => (64, true),
+        MouseEventKind::ScrollDown => (65, true),
+        MouseEventKind::ScrollLeft => (66, true),
+        MouseEventKind::ScrollRight => (67, true),
+    };
+    let suffix = if pressed { 'M' } else { 'm' };
+    format!(
+        "\x1b[<{button};{};{}{suffix}",
+        mouse.column.saturating_add(1),
+        mouse.row.saturating_add(1)
+    )
+    .into_bytes()
+}
+
+#[cfg(any(not(unix), test))]
+fn mouse_button_code(button: MouseButton) -> u16 {
+    match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SessionListInput {
     Previous,
@@ -1987,8 +2208,7 @@ impl SessionTerminals {
     fn spawn_shell(&self, session: &Session, size: (u16, u16)) -> io::Result<ManagedTerminal> {
         if let Some(socket) = &self.daemon_socket {
             let id = format!("shell|{}|{}", session.key, Uuid::new_v4());
-            let shell = env::var_os("SHELL").unwrap_or_else(|| OsString::from("/bin/sh"));
-            let spec = CommandSpec::new(shell, &session.cwd).arg("-l");
+            let spec = shell_command(&session.cwd);
             ManagedTerminal::ensure_remote(
                 socket.clone(),
                 id,
@@ -2122,7 +2342,6 @@ impl SessionTerminals {
         stdout.flush()?;
         let result = (|| {
             let mut exit = WorkspaceExit::Dashboard;
-            let mut input = [0_u8; 4096];
             let render_bindings = bindings.clone();
             let mut input_router = WorkspaceInputRouter {
                 pending: Vec::new(),
@@ -2212,36 +2431,22 @@ impl SessionTerminals {
                     clear_next_frame = false;
                 }
 
-                let mut descriptor = libc::pollfd {
-                    fd: libc::STDIN_FILENO,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                // SAFETY: descriptor points to one valid pollfd for the duration of the call.
-                let ready = unsafe { libc::poll(&mut descriptor, 1, 10) };
-                if ready < 0 {
-                    let error = io::Error::last_os_error();
-                    if error.kind() == io::ErrorKind::Interrupted {
+                let input = match poll_terminal_input(Duration::from_millis(10))? {
+                    PolledTerminalInput::Pending => {
+                        if let Some(bytes) = input_router.flush() {
+                            close_confirmation = None;
+                            self.write_focused(focus, &bytes)?;
+                        }
                         continue;
                     }
-                    return Err(error);
-                }
-                if ready == 0 || descriptor.revents & libc::POLLIN == 0 {
-                    if let Some(bytes) = input_router.flush() {
-                        close_confirmation = None;
-                        self.write_focused(focus, &bytes)?;
-                    }
-                    continue;
-                }
-                let read = io::stdin().read(&mut input)?;
-                if read == 0 {
-                    break;
-                }
+                    PolledTerminalInput::EndOfFile => break,
+                    PolledTerminalInput::Bytes(input) => input,
+                };
                 if let Some(mut value) = rename_input.take() {
                     close_confirmation = None;
                     let mut cancelled = false;
                     let mut committed = false;
-                    for byte in &input[..read] {
+                    for byte in &input {
                         match *byte {
                             b'\r' | b'\n' => committed = true,
                             0x1b => cancelled = true,
@@ -2278,7 +2483,7 @@ impl SessionTerminals {
                     last_signature.clear();
                     continue;
                 }
-                for routed in input_router.route(&input[..read], focus) {
+                for routed in input_router.route(&input, focus) {
                     if let WorkspaceInput::Mouse(event) = routed {
                         close_confirmation = None;
                         self.handle_mouse(&layout, event)?;
@@ -2644,8 +2849,20 @@ impl SessionTerminals {
 }
 
 fn spawn_shell(session: &Session, size: (u16, u16)) -> io::Result<ManagedTerminal> {
-    let shell = env::var_os("SHELL").unwrap_or_else(|| OsString::from("/bin/sh"));
-    ManagedTerminal::spawn(&CommandSpec::new(shell, &session.cwd).arg("-l"), size)
+    ManagedTerminal::spawn(&shell_command(&session.cwd), size)
+}
+
+fn shell_command(cwd: &Path) -> CommandSpec {
+    #[cfg(unix)]
+    {
+        let shell = env::var_os("SHELL").unwrap_or_else(|| OsString::from("/bin/sh"));
+        CommandSpec::new(shell, cwd).arg("-l")
+    }
+    #[cfg(not(unix))]
+    {
+        let shell = env::var_os("COMSPEC").unwrap_or_else(|| OsString::from("cmd.exe"));
+        CommandSpec::new(shell, cwd)
+    }
 }
 
 #[cfg(test)]
@@ -3107,7 +3324,7 @@ impl TerminalManager {
         Self {
             config,
             terminals: HashMap::new(),
-            use_daemon: env::var("AGENT_CONSOLE_PTY_MODE").as_deref() != Ok("local"),
+            use_daemon: cfg!(unix) && env::var("AGENT_CONSOLE_PTY_MODE").as_deref() != Ok("local"),
             daemon_socket: None,
             lease_owner: LeaseOwner::new(),
         }
@@ -3149,16 +3366,19 @@ impl TerminalManager {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
-            // SAFETY: this callback runs in the child after fork and calls only the
-            // async-signal-safe setsid syscall before exec.
-            unsafe {
-                command.pre_exec(|| {
-                    if libc::setsid() == -1 {
-                        Err(io::Error::last_os_error())
-                    } else {
-                        Ok(())
-                    }
-                });
+            #[cfg(unix)]
+            {
+                // SAFETY: this callback runs in the child after fork and calls only the
+                // async-signal-safe setsid syscall before exec.
+                unsafe {
+                    command.pre_exec(|| {
+                        if libc::setsid() == -1 {
+                            Err(io::Error::last_os_error())
+                        } else {
+                            Ok(())
+                        }
+                    });
+                }
             }
             command.spawn()?;
             let start = Instant::now();
@@ -4738,5 +4958,38 @@ mod tests {
                 .windows(8)
                 .any(|bytes| bytes == b"\x1b[?1006l")
         );
+    }
+
+    #[test]
+    fn console_key_events_encode_as_terminal_input() {
+        assert_eq!(
+            terminal_event_bytes(Event::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            ))),
+            vec![0x03]
+        );
+        assert_eq!(
+            terminal_event_bytes(Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT,))),
+            b"\x1b[1;3D"
+        );
+        assert_eq!(
+            terminal_event_bytes(Event::Key(KeyEvent::new(
+                KeyCode::F(12),
+                KeyModifiers::NONE,
+            ))),
+            b"\x1b[24~"
+        );
+    }
+
+    #[test]
+    fn console_mouse_events_encode_as_sgr_input() {
+        let event = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 9,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(terminal_event_bytes(Event::Mouse(event)), b"\x1b[<65;10;5M");
     }
 }

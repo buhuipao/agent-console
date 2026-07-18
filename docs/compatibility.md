@@ -21,3 +21,17 @@ against locally installed/configured binaries.
 it starts one empty real session per provider, refreshes discovery, stops the
 PTY daemon, and re-enters through the provider resume contract. It never sends
 a prompt.
+
+## Packaged platforms
+
+| OS | Architecture | Rust target | PTY lifetime |
+| --- | --- | --- | --- |
+| Windows | x86_64 | `x86_64-pc-windows-msvc` | process-local ConPTY |
+| Linux | x86_64 | `x86_64-unknown-linux-gnu` | detached daemon |
+| Linux | ARM64 | `aarch64-unknown-linux-gnu` | detached daemon |
+| macOS | Intel | `x86_64-apple-darwin` | detached daemon |
+| macOS | Apple Silicon | `aarch64-apple-darwin` | detached daemon |
+
+Every pushed semantic version tag is built on a native GitHub-hosted runner.
+Packages contain the platform binary and README; the release also contains one
+`SHA256SUMS` file covering all archives.

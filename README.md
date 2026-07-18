@@ -11,11 +11,26 @@ the session title.
 
 ## Requirements
 
-- macOS or a Unix-like terminal
+- Windows 10+, macOS, or a Unix-like terminal
 - Rust stable
 - `expect` for repeatable PTY end-to-end tests
 - `codex` and/or `claude` on `PATH`
-- `pbcopy` for clipboard support on macOS
+- a platform clipboard command: `pbcopy` on macOS, `clip.exe` on Windows, or
+  `wl-copy`/`xclip`/`xsel` on Linux
+
+## Install a release
+
+GitHub Releases contain five native packages:
+
+- Windows x86_64: `x86_64-pc-windows-msvc.zip`
+- Linux x86_64 and ARM64: `x86_64-unknown-linux-gnu.tar.gz` and
+  `aarch64-unknown-linux-gnu.tar.gz`
+- macOS Intel and Apple Silicon: `x86_64-apple-darwin.tar.gz` and
+  `aarch64-apple-darwin.tar.gz`
+
+Extract the matching archive and place `agent-console` (or
+`agent-console.exe`) on `PATH`. Verify the download against the release's
+`SHA256SUMS` file.
 
 ## Run
 
@@ -258,6 +273,11 @@ reconnect immediately.
 Set `AGENT_CONSOLE_PTY_MODE=local` only for isolated diagnostics that should
 restore the old process-local PTY behavior.
 
+Windows uses process-local ConPTY mode automatically. Agent and shell panes
+work while Agent Console is running, but they do not survive exiting or
+crashing the Agent Console process. Detached reconnect and cross-TUI leases are
+currently available on Unix platforms only.
+
 Persistent session metadata and normalized event offsets live in
 `state.db` (SQLite WAL mode). A pre-existing `state.json` is imported once.
 Provider hooks continue to append JSONL so they stay fast and independent of
@@ -329,3 +349,11 @@ An arbitrary live process in another Terminal tab cannot have its PTY stolen.
 Agent Console discovers its saved conversation and can start the provider's
 supported resume command. Live detach/reattach works for processes Agent Console
 launched and owns.
+
+## Release automation
+
+`.github/workflows/release.yml` validates that a pushed tag such as `v0.0.2`
+matches the version in `Cargo.toml`, runs formatting/lint/tests, builds all five
+native packages, generates `SHA256SUMS`, and creates the GitHub Release. The
+workflow can also be started manually with publishing disabled to exercise the
+entire packaging matrix without creating a release.

@@ -39,12 +39,15 @@ knows that its managed child is alive.
 
 ## 3. Supported environment
 
-- macOS and Unix-like terminals.
+- Windows 10+, macOS, and Unix-like terminals.
 - `codex` and/or `claude` available on `PATH`.
 - Rust stable with edition 2024.
 - No tmux dependency.
-- Clipboard integration uses `pbcopy` when present. Clipboard failure is shown
-  in the dashboard and never crashes the app.
+- Clipboard integration uses `pbcopy` on macOS, `clip.exe` on Windows, and
+  `wl-copy`, `xclip`, or `xsel` on Linux. Clipboard failure is shown in the
+  dashboard and never crashes the app.
+- Unix uses the detached PTY daemon. Windows uses process-local ConPTY and does
+  not promise PTY survival after Agent Console exits.
 
 ## 4. Commands
 

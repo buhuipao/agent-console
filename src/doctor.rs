@@ -164,12 +164,20 @@ pub fn check_state(state_root: &Path) -> ProviderStatus {
 }
 
 pub fn check_clipboard() -> ProviderStatus {
-    match executable_on_path("pbcopy") {
-        Some(path) => ProviderStatus::Available(path.display().to_string()),
-        None => ProviderStatus::Unavailable("pbcopy is not available on PATH".into()),
+    for program in crate::clipboard::command_names() {
+        if let Some(path) = executable_on_path(program) {
+            return ProviderStatus::Available(path.display().to_string());
+        }
     }
+    ProviderStatus::Unavailable(format!(
+        "no clipboard command is available on PATH (tried {})",
+        crate::clipboard::command_names()
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
 }
 
+#[cfg(unix)]
 pub fn check_daemon(state_root: &Path) -> ProviderStatus {
     let socket = state_root.join("pty-daemon.sock");
     match pty::daemon_health(&socket) {
@@ -179,6 +187,13 @@ pub fn check_daemon(state_root: &Path) -> ProviderStatus {
         }
         Err(error) => ProviderStatus::Unavailable(format!("{}: {error}", socket.display())),
     }
+}
+
+#[cfg(not(unix))]
+pub fn check_daemon(_state_root: &Path) -> ProviderStatus {
+    ProviderStatus::Available(
+        "process-local PTY mode (detached daemon is unavailable on this platform)".into(),
+    )
 }
 
 #[cfg(test)]
