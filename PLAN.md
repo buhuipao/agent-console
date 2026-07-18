@@ -1,9 +1,9 @@
-# Agent Console production plan
+# Agent Console 0.0.1 hardening plan
 
-This plan promotes the functional prototype into a reliable local control
-plane for Codex and Claude Code. Work is executed top to bottom. A checkbox is
-closed only after its focused regression tests, the full Rust suite, Clippy,
-and the relevant PTY E2E tests pass.
+This completed plan records the work that promoted the initial prototype into
+the 0.0.1 local control plane for Codex and Claude Code. A checkbox was closed
+only after its focused regression tests, the full Rust suite, Clippy, and the
+relevant PTY E2E tests passed.
 
 ## P0 — required for the core workflow
 
@@ -18,8 +18,8 @@ and the relevant PTY E2E tests pass.
 - [x] Cross-process session leases with owner information, safe refusal, and
   an explicit force-takeover operation.
 - [x] Fair summary scheduling with exponential backoff, provider circuit
-  breakers, configurable frequency, per-session enable/disable, and manual
-  retry. One failing selected session must not starve other sessions.
+  breakers, configurable frequency, and optional manual retry. One failing
+  selected session must not starve other sessions.
 - [x] Automatic rotating diagnostics, panic-safe terminal restoration,
   private state permissions, and bounded retention for sensitive event data.
 

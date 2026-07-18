@@ -64,7 +64,7 @@ proc expect_text_without_alt_leave {pattern label code} {
     }
 }
 
-set binary [file join $root target debug agent-console-prototype]
+set binary [file join $root target debug agent-console]
 spawn /bin/sh -c [format {stty rows 30 columns 120; exec "%s"} $binary]
 set timeout 30
 expect_text {Agent Console} dashboard-ready 120

@@ -4,8 +4,8 @@ The supported floor and the versions exercised for this release are:
 
 | Provider | Supported floor | Contract fixtures | Real local smoke |
 | --- | ---: | --- | --- |
-| Codex CLI | 0.100.0 | 0.100.0, 0.144.4 | 0.144.4 |
-| Claude Code | 2.0.0 | 2.0.0, 2.1.211 | 2.1.211 |
+| Codex CLI | 0.100.0 | 0.100.0, 0.144.5 | 0.144.5 |
+| Claude Code | 2.0.0 | 2.0.0, 2.1.214 | 2.1.214 |
 
 Compatibility means the provider exposes the resume and hook-configuration
 flags used by the native session command and the non-persistent structured

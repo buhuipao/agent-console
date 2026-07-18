@@ -13,7 +13,7 @@ file mtime $first_fixture [expr {[clock seconds] - 10}]
 file mtime $second_fixture [clock seconds]
 set state_dir [file join /tmp "agent-console-lease-e2e-[pid]"]
 set env(AGENT_CONSOLE_STATE_DIR) $state_dir
-set binary [file join $root target debug agent-console-prototype]
+set binary [file join $root target debug agent-console]
 set socket [file join $state_dir pty-daemon.sock]
 log_user 0
 

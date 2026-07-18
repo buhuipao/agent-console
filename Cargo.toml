@@ -1,6 +1,6 @@
 [package]
-name = "agent-console-prototype"
-version = "0.0.1"
+name = "agent-console"
+version = "0.0.2"
 edition = "2024"
 publish = false
 

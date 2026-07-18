@@ -5,7 +5,7 @@ on:
     branches:
       - "packaging-test/**"
     tags:
-      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v*.*.*"
   workflow_dispatch:
     inputs:
       publish:
@@ -136,7 +136,7 @@ jobs:
           set -euo pipefail
           archive="agent-console-v${VERSION}-${TARGET}"
           mkdir -p "dist/${archive}"
-          install -m 755 "target/${TARGET}/release/agent-console-prototype" "dist/${archive}/agent-console"
+          install -m 755 "target/${TARGET}/release/agent-console" "dist/${archive}/agent-console"
           cp README.md "dist/${archive}/README.md"
           tar -C dist -czf "dist/${archive}.tar.gz" "$archive"
           rm -rf "dist/${archive}"
@@ -151,7 +151,7 @@ jobs:
           $archive = "agent-console-v$env:VERSION-$env:TARGET"
           $directory = Join-Path "dist" $archive
           New-Item -ItemType Directory -Force -Path $directory | Out-Null
-          Copy-Item "target/$env:TARGET/release/agent-console-prototype.exe" "$directory/agent-console.exe"
+          Copy-Item "target/$env:TARGET/release/agent-console.exe" "$directory/agent-console.exe"
           Copy-Item "README.md" "$directory/README.md"
           Compress-Archive -Path "$directory/*" -DestinationPath "dist/$archive.zip"
           Remove-Item -Recurse -Force $directory

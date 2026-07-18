@@ -39,7 +39,7 @@ proc expect_text {pattern label code} {
     }
 }
 
-set binary [file join $root target debug agent-console-prototype]
+set binary [file join $root target debug agent-console]
 spawn /bin/sh -c [format {stty rows 30 columns 120; exec "%s"} $binary]
 set timeout 15
 expect_text {Agent Console} dashboard-ready 140

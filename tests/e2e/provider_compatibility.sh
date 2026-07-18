@@ -2,12 +2,12 @@
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
-binary="$root/target/debug/agent-console-prototype"
+binary="$root/target/debug/agent-console"
 config="$root/tests/fixtures/compat-config.toml"
 fixture_home="$root/tests/fixtures/e2e-home"
 
-for codex_version in 0.100.0 0.144.4; do
-  for claude_version in 2.0.0 2.1.211; do
+for codex_version in 0.100.0 0.144.5; do
+  for claude_version in 2.0.0 2.1.214; do
     state=$(mktemp -d /tmp/agent-console-compat.XXXXXX)
     output=$(
       cd "$root"

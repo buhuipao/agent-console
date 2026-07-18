@@ -4,10 +4,11 @@ Status: accepted
 
 ## Context
 
-The prototype enters Workspace through a blocking PTY loop. While that loop is
-active, Dashboard discovery, event reduction, summary scheduling, and
-cross-session attention state do not advance. PTYs are owned by the TUI
-process, so a normal exit or crash also ends shells and live agents.
+At the time of this decision, the prototype entered Workspace through a
+blocking PTY loop. While that loop was active, Dashboard discovery, event
+reduction, summary scheduling, and cross-session attention state did not
+advance. PTYs were owned by the TUI process, so a normal exit or crash also
+ended shells and live agents.
 
 ## Decision
 
@@ -29,5 +30,5 @@ owns child processes.
 - Session Lease enforcement has one authoritative owner.
 - Daemon protocol compatibility and private socket/state permissions become
   release requirements.
-- The prototype's in-process PTY adapter remains useful for tests while the
-  daemon adapter is introduced; two adapters make the seam real.
+- The process-local PTY adapter remains useful for tests and is the Windows
+  ConPTY implementation; Unix uses the daemon adapter.

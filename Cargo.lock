@@ -3,8 +3,8 @@
 version = 4
 
 [[package]]
-name = "agent-console-prototype"
-version = "0.0.1"
+name = "agent-console"
+version = "0.0.2"
 dependencies = [
  "crossterm",
  "dirs",

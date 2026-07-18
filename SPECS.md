@@ -1,10 +1,10 @@
 # Agent Console implementation specification
 
-Status: implementation contract for the Rust prototype.
+Status: implementation contract for Agent Console 0.0.2.
 
-The ordered production requirements and final real-machine acceptance matrix
-are tracked in [PLAN.md](PLAN.md). Domain terms used by that work are defined
-in [CONTEXT.md](CONTEXT.md), and accepted architecture decisions live under
+The completed hardening requirements and real-machine acceptance matrix are
+recorded in [PLAN.md](PLAN.md). Domain terms are defined in
+[CONTEXT.md](CONTEXT.md), and accepted architecture decisions live under
 `docs/adr/`.
 
 This document is intentionally explicit so an implementation agent can execute
@@ -54,9 +54,9 @@ knows that its managed child is alive.
 The binary supports these modes:
 
 ```text
-agent-console-prototype                 Open the dashboard.
-agent-console-prototype hook PROVIDER   Read one hook JSON object from stdin.
-agent-console-prototype doctor          Check provider binaries and data paths.
+agent-console                 Open the dashboard.
+agent-console hook PROVIDER   Read one hook JSON object from stdin.
+agent-console doctor          Check provider binaries and data paths.
 ```
 
 The `hook` mode appends one normalized event to the application's event inbox.
@@ -250,7 +250,7 @@ Run it with process cwd set to the selected cwd.
   days. Managed sessions remain visible for the current process lifetime.
 - Refresh transcript metadata every two seconds.
 - Preserve selection by stable session key.
-- A manual `r` key triggers an immediate refresh.
+- Refresh is automatic; there is no manual refresh key.
 - Never start an LLM summary merely because an old session was discovered for
   the first time. Summarize the selected session and sessions whose transcript
   changes after startup.
@@ -359,7 +359,8 @@ The shell capture is the latest non-empty plain-text output, capped at 200
 lines and 16 KiB.
 
 - `s`: create another shell PTY and enter the session workspace.
-- the configurable `copy` action pipes the shell capture to `pbcopy`.
+- the configurable `copy` action sends the shell capture to the platform
+  clipboard command.
 - the configurable `stage` action stages this exact text for the selected
   agent terminal:
 
@@ -408,8 +409,6 @@ are forbidden.
   capped after six doublings.
 - After `circuit_failures` consecutive failures, stop that provider for
   `circuit_cooldown_seconds`; the other provider remains eligible.
-- Persist a per-session summary enable/disable flag. A disabled session is
-  removed from the queue.
 - Manual retry clears that session's throttle/backoff and its provider circuit,
   then inserts the session at the front of the queue.
 - Always allow a final refresh after a turn completes.
@@ -573,7 +572,7 @@ errors stay in the dialog.
   the terminal cleanup path.
 
 On the first managed Codex launch, Codex may show its built-in hook trust page.
-The user reviews the generated `agent-console-prototype hook codex` commands and
+The user reviews the generated `agent-console hook codex` commands and
 chooses `Trust all and continue`. This is a one-time official safety step, not a
 manual configuration-file edit. Until trusted, transcript discovery continues
 to work but live Codex approval events are unavailable.

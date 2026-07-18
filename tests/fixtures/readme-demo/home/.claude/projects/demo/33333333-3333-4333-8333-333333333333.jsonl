@@ -1,0 +1,2 @@
+{"type":"user","sessionId":"33333333-3333-4333-8333-333333333333","cwd":"/tmp/agent-console-demo/platform","gitBranch":"perf/search-batches","message":{"role":"user","content":"Refactor search index batching without changing the API"}}
+{"type":"assistant","sessionId":"33333333-3333-4333-8333-333333333333","cwd":"/tmp/agent-console-demo/platform","gitBranch":"perf/search-batches","message":{"role":"assistant","content":"Updated the batch scheduler; tests pass"}}

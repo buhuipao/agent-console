@@ -1,7 +1,8 @@
-# Agent Console Prototype
+# Agent Console
 
-> Functional local prototype. The implementation contract is in
-> [SPECS.md](SPECS.md). Production work is tracked in [PLAN.md](PLAN.md).
+Agent Console is a local terminal control plane for Codex and Claude Code. The
+current implementation contract is in [SPECS.md](SPECS.md); the completed
+hardening plan is retained in [PLAN.md](PLAN.md).
 
 Agent Console discovers recent persisted Codex and Claude Code sessions, shows
 their current task and activity, resumes them in their native terminal UI, and
@@ -9,24 +10,33 @@ provides a Cursor-style workspace with multiple same-directory shell panes.
 Session lists are grouped by working directory and use the summarized task as
 the session title.
 
-## Requirements
+## Interface
+
+![Agent Console dashboard showing grouped sessions and their current priorities](docs/assets/dashboard.png)
+
+The screenshot uses synthetic local transcripts and fake provider commands; it
+does not contain a real coding conversation.
+
+## Runtime requirements
 
 - Windows 10+, macOS, or a Unix-like terminal
-- Rust stable
-- `expect` for repeatable PTY end-to-end tests
 - `codex` and/or `claude` on `PATH`
 - a platform clipboard command: `pbcopy` on macOS, `clip.exe` on Windows, or
   `wl-copy`/`xclip`/`xsel` on Linux
 
+Building from source additionally requires Rust stable. Running the PTY E2E
+suite requires `expect`; neither is required when installing a release.
+
 ## Install a release
 
-GitHub Releases contain five native packages:
+Each [GitHub Release](https://github.com/buhuipao/agent-console/releases)
+contains five native packages (shown here for version `0.0.2`):
 
-- Windows x86_64: `x86_64-pc-windows-msvc.zip`
-- Linux x86_64 and ARM64: `x86_64-unknown-linux-gnu.tar.gz` and
-  `aarch64-unknown-linux-gnu.tar.gz`
-- macOS Intel and Apple Silicon: `x86_64-apple-darwin.tar.gz` and
-  `aarch64-apple-darwin.tar.gz`
+- Windows x86_64: `agent-console-v0.0.2-x86_64-pc-windows-msvc.zip`
+- Linux x86_64 and ARM64: `agent-console-v0.0.2-x86_64-unknown-linux-gnu.tar.gz`
+  and `agent-console-v0.0.2-aarch64-unknown-linux-gnu.tar.gz`
+- macOS Intel and Apple Silicon: `agent-console-v0.0.2-x86_64-apple-darwin.tar.gz`
+  and `agent-console-v0.0.2-aarch64-apple-darwin.tar.gz`
 
 Extract the matching archive and place `agent-console` (or
 `agent-console.exe`) on `PATH`. Verify the download against the release's
@@ -106,8 +116,7 @@ Printable Workspace actions are active only in `FOCUS SESSIONS`; agent and
 shell panes receive those characters unchanged. Ctrl shortcuts are
 focus-aware: Shell management chords are handled in a Shell pane and are
 forwarded when an Agent pane owns focus, except `Ctrl-\`, which directly opens
-a Shell from either child pane. Function keys are never reserved by Agent
-Console.
+a Shell from either child pane. The default keymap reserves no function keys.
 
 ## Controls
 
@@ -125,7 +134,7 @@ Console.
 
 There is no command menu. Session discovery refreshes automatically; separate
 provider, status, and workspace filter modes, pinning, manual refresh, and
-per-session summary toggles are intentionally not exposed. Press `t` only when
+per-session summary toggles are intentionally absent. Press `t` only when
 a lease-conflict message explicitly offers force takeover.
 
 The Dashboard session list responds to the mouse wheel. Its right side starts
@@ -238,21 +247,23 @@ copy/stage actions are unbound by default.
 ## Tests
 
 ```bash
-cargo test
-cargo clippy --all-targets -- -D warnings
-tests/e2e/workspace_controls.exp
-tests/e2e/dashboard_controls.exp
-tests/e2e/daemon_reconnect.exp
-tests/e2e/session_leases.exp
+cargo build --locked
+cargo test --locked --all-targets
+cargo clippy --locked --all-targets -- -D warnings
+expect tests/e2e/workspace_controls.exp
+expect tests/e2e/dashboard_controls.exp
+expect tests/e2e/daemon_reconnect.exp
+expect tests/e2e/session_leases.exp
 tests/e2e/provider_compatibility.sh
 tests/e2e/real_provider_doctor.sh
-tests/e2e/real_provider_sessions.exp
+expect tests/e2e/real_provider_sessions.exp
 ```
 
-The E2E tests use isolated local fixtures and fake provider commands. They do
-not call Codex, Claude, the network, or the real clipboard.
-The compatibility matrix uses contract fixtures. The separate real-provider
-doctor smoke invokes only `--version`/`--help`, never a model; see
+The fixture E2E tests use isolated local data and fake provider commands. They
+do not call Codex, Claude, the network, or the real clipboard. The compatibility
+matrix also uses contract fixtures. The real-provider doctor invokes only
+`--version`/`--help`; the real-provider session smoke starts and resumes empty
+sessions but never sends a prompt. See
 [docs/compatibility.md](docs/compatibility.md).
 
 ## PTY daemon and reconnect
@@ -301,9 +312,9 @@ The summarizer consumes provider usage. Updates are debounced, serialized, and
 scheduled in FIFO order. Each failing session backs off exponentially; repeated
 failures open a provider-specific circuit without starving the other provider.
 The `[summary]` values above configure the minimum per-session interval, base
-backoff, failure threshold, and circuit cooldown. Retry and per-session summary
-toggle actions exist for custom Dashboard key maps but are unbound by default.
-A summary failure never stops the coding session.
+backoff, failure threshold, and circuit cooldown. A manual retry action exists
+for custom Dashboard key maps but is unbound by default. There is no per-session
+summary toggle. A summary failure never stops the coding session.
 
 Claude-mem creates internal Claude sessions under
 `~/.claude-mem/observer-sessions` to observe other conversations. Agent Console
@@ -316,7 +327,7 @@ Codex may show its built-in **Hooks need review** page the first time. Review
 the generated commands, which all invoke this binary as:
 
 ```text
-agent-console-prototype hook codex
+agent-console hook codex
 ```
 
 Choose **Trust all and continue** to enable live working/waiting/approval state.
