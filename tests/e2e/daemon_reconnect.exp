@@ -68,8 +68,6 @@ send -- "\017"
 expect_text {daemon-survives-[0-9]+} shell-output-survived 166
 expect_text {FOCUS SHELL 1/1} reconnected-shell 167
 send -- "\030"
-expect_text {again to close} confirm-close-reconnected-shell 168
-send -- "\030"
 expect_text {FOCUS AGENT} close-reconnected-shell 168
 send -- "\021"
 after 200

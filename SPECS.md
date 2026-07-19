@@ -299,7 +299,8 @@ Entering a workspace:
 
 1. Reuse the application's alternate screen. Session navigation must never
    reveal or redraw the Dashboard as an intermediate frame.
-2. Keep the session list visible on the left.
+2. Keep the session list visible on the left. Its `Cdx` and `Cla` labels use
+   the same provider colors as the Dashboard.
 3. Render the agent PTY in the upper-right pane.
 4. Render up to three shell PTYs side by side in the lower-right pane and all
    shell identities in a list at the far right.
@@ -314,9 +315,12 @@ Entering a workspace:
    shell when needed. `Ctrl-Q` returns to the Dashboard and `Ctrl-]` jumps to a
    background waiting/failed alert. `Ctrl-\` adds a Shell directly from Agent
    or Shell focus. In Shell focus, `Ctrl-N` selects the next Shell and `Ctrl-X`
-   closes it after a second confirmation when it is alive. `Ctrl-N` and
-   `Ctrl-X` are forwarded in Agent focus. `Ctrl-T`, `Esc`, printable input,
-   unrelated Ctrl keys, Alt keys, and function keys remain child input.
+   closes it immediately. `Ctrl-N` and
+   `Ctrl-X` are forwarded in Agent focus. `Ctrl-T`, `Ctrl-Enter`, `Esc`,
+   printable input, unrelated Ctrl keys, Alt keys, and function keys remain
+   child input. Modified-key reporting is enabled only while the Agent has
+   focus, allowing nested providers to distinguish `Ctrl-Enter` from Enter
+   without changing interactive Shell input.
 8. Session-list focus is navigation, not a separate command mode. Up/Down or
    `j`/`k` selects sessions; Enter activates the selected Agent; `n` opens a
    new-session dialog using the selected workspace; `s` creates a Shell;
@@ -330,9 +334,10 @@ Each agent and shell has an independent viewport. `Shift-PageUp` and
 `Shift-PageDown` move it through retained history, `Shift-End` returns to the
 live tail, and the pane title displays the current `SCROLL +N` offset. Ordinary
 child input first returns the focused pane to the live tail. A full-screen
-agent that enables mouse reporting receives its native mouse-wheel event. A
-full-screen agent without mouse reporting receives alternate-screen cursor
-scroll events, matching terminal-emulator behavior used by Claude Code.
+agent that enables mouse reporting receives its native click, drag, and wheel
+events; Shift-drag remains available for outer text selection. A full-screen
+agent without mouse reporting receives alternate-screen cursor scroll events,
+matching terminal-emulator behavior used by Claude Code.
 
 The detached PTY daemon owns managed agent and shell children. TUI exit or
 crash detaches without terminating them; a later TUI reconnects by stable

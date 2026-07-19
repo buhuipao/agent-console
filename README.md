@@ -30,13 +30,13 @@ suite requires `expect`; neither is required when installing a release.
 ## Install a release
 
 Each [GitHub Release](https://github.com/buhuipao/agent-console/releases)
-contains five native packages (shown here for version `0.0.3`):
+contains five native packages (shown here for version `0.0.4`):
 
-- Windows x86_64: `agent-console-v0.0.3-x86_64-pc-windows-msvc.zip`
-- Linux x86_64 and ARM64: `agent-console-v0.0.3-x86_64-unknown-linux-gnu.tar.gz`
-  and `agent-console-v0.0.3-aarch64-unknown-linux-gnu.tar.gz`
-- macOS Intel and Apple Silicon: `agent-console-v0.0.3-x86_64-apple-darwin.tar.gz`
-  and `agent-console-v0.0.3-aarch64-apple-darwin.tar.gz`
+- Windows x86_64: `agent-console-v0.0.4-x86_64-pc-windows-msvc.zip`
+- Linux x86_64 and ARM64: `agent-console-v0.0.4-x86_64-unknown-linux-gnu.tar.gz`
+  and `agent-console-v0.0.4-aarch64-unknown-linux-gnu.tar.gz`
+- macOS Intel and Apple Silicon: `agent-console-v0.0.4-x86_64-apple-darwin.tar.gz`
+  and `agent-console-v0.0.4-aarch64-apple-darwin.tar.gz`
 
 Extract the matching archive and place `agent-console` (or
 `agent-console.exe`) on `PATH`. Verify the download against the release's
@@ -152,11 +152,15 @@ provider. Files are excluded.
 
 Inside a session workspace, the session list stays on the left, the agent is
 on the upper right, and shell panes share the lower right. The shell list
-remains visible when there are multiple shells.
+remains visible when there are multiple shells. Provider labels keep the same
+Codex cyan and Claude orange colors used by the Dashboard.
 
 Workspace input is focus-aware; there is no separate command or Vim mode.
-Printable keys, `Esc`, function keys, and unrelated Ctrl keys go to the
-focused child. These navigation chords are global:
+Printable keys, `Esc`, function keys, `Ctrl-Enter`, and unrelated Ctrl keys go
+to the focused child. While the Agent has focus, Agent Console enables modified
+key reporting so nested Codex/Claude sessions can distinguish `Ctrl-Enter` from
+plain Enter; that mode is disabled in Shell and Session-list focus. These
+navigation chords are global:
 
 | Key | Global Workspace action |
 | --- | --- |
@@ -170,7 +174,7 @@ Common Shell operations work directly without visiting the Session list:
 | --- | --- | --- |
 | `Ctrl-\` | Agent or Shell | Add and focus a Shell in the current workspace |
 | `Ctrl-N` | Shell | Focus the next Shell |
-| `Ctrl-X` | Shell | Close the focused Shell; a live Shell requires a second press |
+| `Ctrl-X` | Shell | Close the focused Shell immediately |
 
 `Ctrl-N` and `Ctrl-X` are forwarded unchanged while the Agent has focus.
 `Ctrl-T` is never reserved, so iTerm2 can continue to own it. A lone `Esc` is
@@ -195,10 +199,12 @@ When the Session list has focus:
 `Shift-End` returns it to the live tail. The pane title shows `SCROLL +N` while
 history is visible; ordinary input also returns to the live tail before it is
 forwarded. The mouse wheel scrolls the agent or shell pane under the pointer.
-Both modern SGR and legacy X10 terminal mouse protocols are accepted. Dragging
-across agent or shell cells highlights the selection and copies it on release.
-Codex-style TUIs that enable mouse reporting receive native wheel events;
-Claude-style TUIs without mouse reporting receive equivalent alternate-screen
+Both modern SGR and legacy X10 terminal mouse protocols are accepted. An Agent
+that enables mouse reporting receives native clicks, drags, and wheel events;
+hold Shift while dragging to use Agent Console's text selection instead. Other
+agent and shell cells select and copy on an ordinary drag. Codex-style TUIs
+that enable mouse reporting receive native wheel events; Claude-style TUIs
+without mouse reporting receive equivalent alternate-screen
 cursor scrolling.
 
 When `FOCUS SESSIONS` is shown, use Up/Down (or `j`/`k`) to move between
@@ -358,7 +364,7 @@ launched and owns.
 
 ## Release automation
 
-`.github/workflows/release.yml` validates that a pushed tag such as `v0.0.3`
+`.github/workflows/release.yml` validates that a pushed tag such as `v0.0.4`
 matches the version in `Cargo.toml`, runs formatting/lint/tests, builds all five
 native packages, generates `SHA256SUMS`, and creates the GitHub Release. The
 workflow can also be started manually with publishing disabled to exercise the

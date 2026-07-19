@@ -45,6 +45,26 @@ const LEASE_STALE_AFTER: Duration = Duration::from_millis(500);
 const ENABLE_MOUSE_REPORTING: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 const DISABLE_MOUSE_REPORTING: &[u8] =
     b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l";
+const ENABLE_KEYBOARD_ENHANCEMENT: &[u8] = b"\x1b[>1u";
+const DISABLE_KEYBOARD_ENHANCEMENT: &[u8] = b"\x1b[<1u";
+
+fn sync_keyboard_enhancement(
+    output: &mut impl Write,
+    enabled: &mut bool,
+    focus: WorkspaceFocus,
+) -> io::Result<()> {
+    let should_enable = focus == WorkspaceFocus::Agent;
+    if should_enable == *enabled {
+        return Ok(());
+    }
+    output.write_all(if should_enable {
+        ENABLE_KEYBOARD_ENHANCEMENT
+    } else {
+        DISABLE_KEYBOARD_ENHANCEMENT
+    })?;
+    *enabled = should_enable;
+    Ok(())
+}
 
 #[derive(Clone, Debug)]
 pub struct CommandSpec {
@@ -76,6 +96,247 @@ struct OutputState {
     exit_description: Option<String>,
 }
 
+#[derive(Debug, Default)]
+enum OutputScanState {
+    #[default]
+    Ground,
+    Escape,
+    Csi(Vec<u8>),
+    String {
+        escaped: bool,
+    },
+}
+
+#[derive(Debug)]
+enum OutputScanEvent {
+    LineFeed,
+    Csi { params: Vec<u8>, final_byte: u8 },
+}
+
+#[derive(Debug, Default)]
+/// Captures rows removed from a top-anchored partial scroll region. Codex's inline TUI uses
+/// this pattern to keep its composer fixed at the bottom, while `vt100` only records rows from
+/// full-screen scrolling in its native scrollback buffer.
+struct StatusBarScrollback {
+    rows: VecDeque<Vec<u8>>,
+    offset: usize,
+    scroll_region: Option<(u16, u16)>,
+    scan_state: OutputScanState,
+}
+
+impl StatusBarScrollback {
+    fn process(&mut self, parser: &mut vt100::Parser, bytes: &[u8]) {
+        // Feed ordinary output to vte in batches, splitting only where a scroll operation needs
+        // a snapshot of the row that is about to leave the visible region.
+        let mut unprocessed = 0;
+        for (index, &byte) in bytes.iter().enumerate() {
+            let event = self.scan(byte);
+            match event {
+                Some(OutputScanEvent::LineFeed) => {
+                    parser.process(&bytes[unprocessed..index]);
+                    self.capture_scrolled_rows(parser, 1);
+                    parser.process(&bytes[index..=index]);
+                    unprocessed = index + 1;
+                }
+                Some(OutputScanEvent::Csi {
+                    params,
+                    final_byte: b'S',
+                }) => {
+                    parser.process(&bytes[unprocessed..index]);
+                    self.capture_scrolled_rows(parser, csi_count(&params));
+                    parser.process(&bytes[index..=index]);
+                    unprocessed = index + 1;
+                }
+                Some(OutputScanEvent::Csi {
+                    params,
+                    final_byte: b'r',
+                }) => {
+                    parser.process(&bytes[unprocessed..=index]);
+                    self.set_scroll_region(&params, parser.screen().size().0);
+                    unprocessed = index + 1;
+                }
+                _ => {}
+            }
+        }
+        if unprocessed < bytes.len() {
+            parser.process(&bytes[unprocessed..]);
+        }
+    }
+
+    fn scan(&mut self, byte: u8) -> Option<OutputScanEvent> {
+        let state = std::mem::take(&mut self.scan_state);
+        let (next, event) = match state {
+            OutputScanState::Ground if byte == 0x1b => (OutputScanState::Escape, None),
+            OutputScanState::Ground if byte == b'\n' => {
+                (OutputScanState::Ground, Some(OutputScanEvent::LineFeed))
+            }
+            OutputScanState::Ground => (OutputScanState::Ground, None),
+            OutputScanState::Escape if byte == b'[' => (OutputScanState::Csi(Vec::new()), None),
+            OutputScanState::Escape if matches!(byte, b']' | b'P' | b'X' | b'^' | b'_') => {
+                (OutputScanState::String { escaped: false }, None)
+            }
+            OutputScanState::Escape if byte == 0x1b => (OutputScanState::Escape, None),
+            OutputScanState::Escape => (OutputScanState::Ground, None),
+            OutputScanState::Csi(_params) if byte == 0x1b => (OutputScanState::Escape, None),
+            OutputScanState::Csi(params) if (0x40..=0x7e).contains(&byte) => (
+                OutputScanState::Ground,
+                Some(OutputScanEvent::Csi {
+                    params,
+                    final_byte: byte,
+                }),
+            ),
+            OutputScanState::Csi(mut params) => {
+                if (0x20..=0x3f).contains(&byte) {
+                    params.push(byte);
+                }
+                (OutputScanState::Csi(params), None)
+            }
+            OutputScanState::String { .. } if byte == 0x07 => (OutputScanState::Ground, None),
+            OutputScanState::String { escaped: true } if byte == b'\\' => {
+                (OutputScanState::Ground, None)
+            }
+            OutputScanState::String { .. } if byte == 0x1b => {
+                (OutputScanState::String { escaped: true }, None)
+            }
+            OutputScanState::String { .. } => (OutputScanState::String { escaped: false }, None),
+        };
+        self.scan_state = next;
+        event
+    }
+
+    fn set_scroll_region(&mut self, params: &[u8], screen_rows: u16) {
+        self.scroll_region = parse_scroll_region(params, screen_rows);
+    }
+
+    fn capture_scrolled_rows(&mut self, parser: &vt100::Parser, count: usize) {
+        let screen = parser.screen();
+        let (screen_rows, cols) = screen.size();
+        let Some((top, bottom)) = self.scroll_region else {
+            return;
+        };
+        if top != 0
+            || bottom >= screen_rows.saturating_sub(1)
+            || screen.cursor_position().0 != bottom
+        {
+            return;
+        }
+        let count = count.min(usize::from(bottom - top + 1));
+        for row in screen.rows_formatted(0, cols).take(count) {
+            if self.rows.len() == CAPTURE_LINES {
+                self.rows.pop_front();
+            }
+            self.rows.push_back(row);
+            if self.offset > 0 {
+                self.offset = self.offset.saturating_add(1).min(self.rows.len());
+            }
+        }
+    }
+
+    fn scroll(&mut self, rows: isize) -> usize {
+        self.offset = if rows >= 0 {
+            self.offset
+                .saturating_add(rows as usize)
+                .min(self.rows.len())
+        } else {
+            self.offset.saturating_sub(rows.unsigned_abs())
+        };
+        self.offset
+    }
+
+    fn live_tail(&mut self) {
+        self.offset = 0;
+    }
+
+    fn screen_rows(&self, live_rows: &[Vec<u8>]) -> Option<Vec<Vec<u8>>> {
+        if self.offset == 0 || self.rows.is_empty() {
+            return None;
+        }
+        let height = live_rows.len();
+        let end = self
+            .rows
+            .len()
+            .saturating_add(height)
+            .saturating_sub(self.offset);
+        let start = end.saturating_sub(height);
+        Some(
+            (start..end)
+                .filter_map(|index| {
+                    self.rows.get(index).cloned().or_else(|| {
+                        live_rows
+                            .get(index.saturating_sub(self.rows.len()))
+                            .cloned()
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    fn resize(&mut self, rows: u16) {
+        if self
+            .scroll_region
+            .is_some_and(|(top, bottom)| top >= rows || bottom >= rows || top >= bottom)
+        {
+            self.scroll_region = None;
+        }
+    }
+}
+
+fn csi_count(params: &[u8]) -> usize {
+    std::str::from_utf8(params)
+        .ok()
+        .and_then(|value| value.split(';').next())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1)
+}
+
+fn parse_scroll_region(params: &[u8], screen_rows: u16) -> Option<(u16, u16)> {
+    if params.is_empty() {
+        return None;
+    }
+    let value = std::str::from_utf8(params).ok()?;
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || byte == b';')
+    {
+        return None;
+    }
+    let mut values = value.split(';');
+    let top = values.next()?.parse::<u16>().ok()?.saturating_sub(1);
+    let bottom = values
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(screen_rows)
+        .saturating_sub(1);
+    (top < bottom && bottom < screen_rows).then_some((top, bottom))
+}
+
+fn process_terminal_output(
+    parser: &mut vt100::Parser,
+    status_bar_scrollback: &mut StatusBarScrollback,
+    bytes: &[u8],
+) {
+    status_bar_scrollback.process(parser, bytes);
+}
+
+fn terminal_screen_view(
+    parser: &vt100::Parser,
+    status_bar_scrollback: &StatusBarScrollback,
+) -> ScreenView {
+    let screen = parser.screen();
+    let (_, cols) = screen.size();
+    let live_rows = screen.rows_formatted(0, cols).collect::<Vec<_>>();
+    let rows = status_bar_scrollback
+        .screen_rows(&live_rows)
+        .unwrap_or(live_rows);
+    ScreenView {
+        rows,
+        cursor: screen.cursor_position(),
+        hide_cursor: screen.hide_cursor()
+            || screen.scrollback() > 0
+            || status_bar_scrollback.offset > 0,
+    }
+}
+
 struct LocalTerminal {
     master: Box<dyn MasterPty + Send>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
@@ -83,6 +344,7 @@ struct LocalTerminal {
     output: Arc<Mutex<OutputState>>,
     output_generation: Arc<AtomicU64>,
     parser: Arc<Mutex<vt100::Parser>>,
+    status_bar_scrollback: Arc<Mutex<StatusBarScrollback>>,
 }
 
 impl LocalTerminal {
@@ -123,6 +385,8 @@ impl LocalTerminal {
             CAPTURE_LINES,
         )));
         let parser_for_thread = Arc::clone(&parser);
+        let status_bar_scrollback = Arc::new(Mutex::new(StatusBarScrollback::default()));
+        let status_bar_scrollback_for_thread = Arc::clone(&status_bar_scrollback);
 
         thread::Builder::new()
             .name("agent-console-pty-output".into())
@@ -136,7 +400,9 @@ impl LocalTerminal {
                             let bytes = &buffer[..read];
                             let responses = {
                                 let mut parser = parser_for_thread.lock().unwrap();
-                                parser.process(bytes);
+                                let mut scrollback =
+                                    status_bar_scrollback_for_thread.lock().unwrap();
+                                process_terminal_output(&mut parser, &mut scrollback, bytes);
                                 query_router.route(bytes, parser.screen().cursor_position())
                             };
                             if !responses.is_empty() {
@@ -172,6 +438,7 @@ impl LocalTerminal {
             output,
             output_generation,
             parser,
+            status_bar_scrollback,
         })
     }
 
@@ -227,18 +494,21 @@ impl LocalTerminal {
 
     fn screen_view(&self) -> ScreenView {
         let parser = self.parser.lock().unwrap();
-        let screen = parser.screen();
-        let (_, cols) = screen.size();
-        let scrollback = screen.scrollback();
-        ScreenView {
-            rows: screen.rows_formatted(0, cols).collect(),
-            cursor: screen.cursor_position(),
-            hide_cursor: screen.hide_cursor() || scrollback > 0,
-        }
+        let scrollback = self.status_bar_scrollback.lock().unwrap();
+        terminal_screen_view(&parser, &scrollback)
     }
 
     fn scroll_viewport(&self, rows: isize) -> usize {
         let mut parser = self.parser.lock().unwrap();
+        let mut status_bar_scrollback = self.status_bar_scrollback.lock().unwrap();
+        if !status_bar_scrollback.rows.is_empty() {
+            parser.screen_mut().set_scrollback(0);
+            let applied = status_bar_scrollback.scroll(rows);
+            drop(status_bar_scrollback);
+            drop(parser);
+            self.output_generation.fetch_add(1, Ordering::Relaxed);
+            return applied;
+        }
         let screen = parser.screen_mut();
         let current = screen.scrollback();
         let requested = if rows >= 0 {
@@ -255,13 +525,20 @@ impl LocalTerminal {
 
     fn scroll_to_live_tail(&self) {
         let mut parser = self.parser.lock().unwrap();
+        self.status_bar_scrollback.lock().unwrap().live_tail();
         parser.screen_mut().set_scrollback(0);
         drop(parser);
         self.output_generation.fetch_add(1, Ordering::Relaxed);
     }
 
     fn scrollback_offset(&self) -> usize {
-        self.parser.lock().unwrap().screen().scrollback()
+        let parser = self.parser.lock().unwrap();
+        let status_bar_scrollback = self.status_bar_scrollback.lock().unwrap();
+        if status_bar_scrollback.rows.is_empty() {
+            parser.screen().scrollback()
+        } else {
+            status_bar_scrollback.offset
+        }
     }
 
     fn mouse_protocol(&self) -> (vt100::MouseProtocolMode, vt100::MouseProtocolEncoding) {
@@ -343,6 +620,7 @@ impl LocalTerminal {
             .unwrap()
             .screen_mut()
             .set_size(rows, cols);
+        self.status_bar_scrollback.lock().unwrap().resize(rows);
         self.output_generation.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -889,6 +1167,7 @@ struct RemoteTerminal {
     output: Mutex<OutputState>,
     output_generation: AtomicU64,
     parser: Mutex<vt100::Parser>,
+    status_bar_scrollback: Mutex<StatusBarScrollback>,
     size: Mutex<(u16, u16)>,
 }
 
@@ -928,6 +1207,7 @@ impl RemoteTerminal {
             output: Mutex::new(OutputState::default()),
             output_generation: AtomicU64::new(0),
             parser: Mutex::new(vt100::Parser::new(size.1, size.0, CAPTURE_LINES)),
+            status_bar_scrollback: Mutex::new(StatusBarScrollback::default()),
             size: Mutex::new(size),
         };
         terminal.sync()?;
@@ -961,12 +1241,15 @@ impl RemoteTerminal {
         if start != requested {
             let size = *self.size.lock().unwrap();
             *self.parser.lock().unwrap() = vt100::Parser::new(size.1, size.0, CAPTURE_LINES);
+            *self.status_bar_scrollback.lock().unwrap() = StatusBarScrollback::default();
             let mut output = self.output.lock().unwrap();
             output.raw.clear();
             output.base_offset = start;
         }
         if !bytes.is_empty() {
-            self.parser.lock().unwrap().process(&bytes);
+            let mut parser = self.parser.lock().unwrap();
+            let mut scrollback = self.status_bar_scrollback.lock().unwrap();
+            process_terminal_output(&mut parser, &mut scrollback, &bytes);
         }
         let mut output = self.output.lock().unwrap();
         let changed = !bytes.is_empty() || output.exited == alive;
@@ -1036,19 +1319,22 @@ impl RemoteTerminal {
     fn screen_view(&self) -> ScreenView {
         let _ = self.sync();
         let parser = self.parser.lock().unwrap();
-        let screen = parser.screen();
-        let (_, cols) = screen.size();
-        let scrollback = screen.scrollback();
-        ScreenView {
-            rows: screen.rows_formatted(0, cols).collect(),
-            cursor: screen.cursor_position(),
-            hide_cursor: screen.hide_cursor() || scrollback > 0,
-        }
+        let scrollback = self.status_bar_scrollback.lock().unwrap();
+        terminal_screen_view(&parser, &scrollback)
     }
 
     fn scroll_viewport(&self, rows: isize) -> usize {
         let _ = self.sync();
         let mut parser = self.parser.lock().unwrap();
+        let mut status_bar_scrollback = self.status_bar_scrollback.lock().unwrap();
+        if !status_bar_scrollback.rows.is_empty() {
+            parser.screen_mut().set_scrollback(0);
+            let applied = status_bar_scrollback.scroll(rows);
+            drop(status_bar_scrollback);
+            drop(parser);
+            self.output_generation.fetch_add(1, Ordering::Relaxed);
+            return applied;
+        }
         let screen = parser.screen_mut();
         let current = screen.scrollback();
         let requested = if rows >= 0 {
@@ -1064,12 +1350,20 @@ impl RemoteTerminal {
     }
 
     fn scroll_to_live_tail(&self) {
-        self.parser.lock().unwrap().screen_mut().set_scrollback(0);
+        let mut parser = self.parser.lock().unwrap();
+        self.status_bar_scrollback.lock().unwrap().live_tail();
+        parser.screen_mut().set_scrollback(0);
         self.output_generation.fetch_add(1, Ordering::Relaxed);
     }
 
     fn scrollback_offset(&self) -> usize {
-        self.parser.lock().unwrap().screen().scrollback()
+        let parser = self.parser.lock().unwrap();
+        let status_bar_scrollback = self.status_bar_scrollback.lock().unwrap();
+        if status_bar_scrollback.rows.is_empty() {
+            parser.screen().scrollback()
+        } else {
+            status_bar_scrollback.offset
+        }
     }
 
     fn mouse_protocol(&self) -> (vt100::MouseProtocolMode, vt100::MouseProtocolEncoding) {
@@ -1154,6 +1448,7 @@ impl RemoteTerminal {
             .unwrap()
             .screen_mut()
             .set_size(size.1, size.0);
+        self.status_bar_scrollback.lock().unwrap().resize(size.1);
         self.output_generation.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -1398,19 +1693,12 @@ pub enum WorkspaceFocus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ShellCloseAction {
     Ignore,
-    Confirm,
     Close,
 }
 
-fn shell_close_action(
-    focus: WorkspaceFocus,
-    shell_alive: bool,
-    already_confirmed: bool,
-) -> ShellCloseAction {
-    if !matches!(focus, WorkspaceFocus::Shell | WorkspaceFocus::Sessions) {
+fn shell_close_action(focus: WorkspaceFocus) -> ShellCloseAction {
+    if focus != WorkspaceFocus::Shell {
         ShellCloseAction::Ignore
-    } else if shell_alive && !already_confirmed {
-        ShellCloseAction::Confirm
     } else {
         ShellCloseAction::Close
     }
@@ -1637,13 +1925,15 @@ fn pane_at(layout: &WorkspaceLayout, col: u16, row: u16) -> Option<(PaneTarget, 
             width: rect.width,
             height: rect.height.saturating_sub(1),
         };
-        point_in_rect(col, row, terminal).then_some((
-            PaneTarget::Shell(*index),
-            TerminalCell {
-                row: row - terminal.top,
-                col: col - terminal.left,
-            },
-        ))
+        point_in_rect(col, row, terminal).then(|| {
+            (
+                PaneTarget::Shell(*index),
+                TerminalCell {
+                    row: row - terminal.top,
+                    col: col - terminal.left,
+                },
+            )
+        })
     })
 }
 
@@ -1704,7 +1994,7 @@ impl WorkspaceBindings {
                 labels.insert(action.to_owned(), format_key_label(label));
             }
             for label in configured {
-                if let Some(sequence) = workspace_key_sequence(&label) {
+                for sequence in workspace_key_sequences(&label) {
                     commands.push((sequence, command));
                 }
             }
@@ -1716,7 +2006,7 @@ impl WorkspaceBindings {
                 labels.insert(action, format_key_label(label));
             }
             for label in configured {
-                if let Some(sequence) = workspace_key_sequence(&label) {
+                for sequence in workspace_key_sequences(&label) {
                     commands.push((sequence, WorkspaceCommand::SelectShell(index)));
                 }
             }
@@ -1741,26 +2031,38 @@ impl WorkspaceBindings {
     }
 }
 
-fn workspace_key_sequence(label: &str) -> Option<Vec<u8>> {
+fn workspace_key_sequences(label: &str) -> Vec<Vec<u8>> {
     let lower = label.to_ascii_lowercase();
-    let bytes = match lower.as_str() {
-        "ctrl-up" => b"\x1b[1;5A".to_vec(),
-        "ctrl-down" => b"\x1b[1;5B".to_vec(),
-        "shift-pageup" => b"\x1b[5;2~".to_vec(),
-        "shift-pagedown" => b"\x1b[6;2~".to_vec(),
-        "shift-end" => b"\x1b[1;2F".to_vec(),
-        value if value.starts_with("alt-") && value.len() > 4 => {
+    match lower.as_str() {
+        "ctrl-up" => vec![b"\x1b[1;5A".to_vec()],
+        "ctrl-down" => vec![b"\x1b[1;5B".to_vec()],
+        "shift-pageup" => vec![b"\x1b[5;2~".to_vec()],
+        "shift-pagedown" => vec![b"\x1b[6;2~".to_vec()],
+        "shift-end" => vec![b"\x1b[1;2F".to_vec()],
+        value if value.starts_with("alt-") && value[4..].chars().count() == 1 => {
+            let character = value[4..].chars().next().unwrap();
             let mut sequence = vec![0x1b];
-            sequence.extend_from_slice(&value.as_bytes()[4..]);
-            sequence
+            sequence.extend_from_slice(character.to_string().as_bytes());
+            vec![
+                sequence,
+                format!("\x1b[{};3u", u32::from(character)).into_bytes(),
+                format!("\x1b[27;3;{}~", u32::from(character)).into_bytes(),
+            ]
         }
-        value if value.starts_with("ctrl-") && value.len() == 6 => {
-            vec![value.as_bytes()[5] & 0x1f]
+        value if value.starts_with("ctrl-") && value[5..].chars().count() == 1 => {
+            let character = value[5..].chars().next().unwrap();
+            let Some(ascii) = character.is_ascii().then_some(character as u8) else {
+                return Vec::new();
+            };
+            vec![
+                vec![ascii & 0x1f],
+                format!("\x1b[{};5u", u32::from(character)).into_bytes(),
+                format!("\x1b[27;5;{}~", u32::from(character)).into_bytes(),
+            ]
         }
-        value if value.chars().count() == 1 => value.as_bytes().to_vec(),
-        _ => return None,
-    };
-    Some(bytes)
+        value if value.chars().count() == 1 => vec![value.as_bytes().to_vec()],
+        _ => Vec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -1844,7 +2146,8 @@ fn terminal_key_bytes(key: KeyEvent) -> Vec<u8> {
             control_character(character).map_or_else(Vec::new, |byte| vec![byte])
         }
         KeyCode::Char(character) => character.to_string().into_bytes(),
-        KeyCode::Enter => vec![b'\r'],
+        KeyCode::Enter if modifier == 1 => vec![b'\r'],
+        KeyCode::Enter => format!("\x1b[13;{modifier}u").into_bytes(),
         KeyCode::Tab => vec![b'\t'],
         KeyCode::BackTab => b"\x1b[Z".to_vec(),
         KeyCode::Backspace => vec![0x7f],
@@ -2250,24 +2553,28 @@ impl SessionTerminals {
         let Some((pane, cell)) = pane_at(layout, col, row) else {
             return Ok(());
         };
+        if pane == PaneTarget::Agent
+            && event.button & 4 == 0
+            && let Some(terminal) = self.terminal(pane)
+        {
+            let (mode, encoding) = terminal.mouse_protocol();
+            if mode != vt100::MouseProtocolMode::None
+                && let Some(bytes) = encoded_child_mouse_event(event, cell, encoding)
+            {
+                terminal.write(&bytes)?;
+                return Ok(());
+            }
+        }
         let button = event.button & !(4 | 8 | 16 | 32);
         match button {
             64 | 65 => {
                 if let Some(terminal) = self.terminal(pane)
                     && pane == PaneTarget::Agent
+                    && terminal.alternate_screen()
+                    && let Some(bytes) = alternate_screen_scroll(button)
                 {
-                    let (mode, encoding) = terminal.mouse_protocol();
-                    if mode != vt100::MouseProtocolMode::None {
-                        if let Some(bytes) = encoded_child_mouse_event(event, cell, encoding) {
-                            terminal.write(&bytes)?;
-                            return Ok(());
-                        }
-                    } else if terminal.alternate_screen()
-                        && let Some(bytes) = alternate_screen_scroll(button)
-                    {
-                        terminal.write(&bytes)?;
-                        return Ok(());
-                    }
+                    terminal.write(&bytes)?;
+                    return Ok(());
                 }
                 if let Some(terminal) = self.terminal(pane) {
                     let amount = if button == 64 { 3 } else { -3 };
@@ -2337,7 +2644,9 @@ impl SessionTerminals {
     {
         let mut size = normalized_size(crossterm::terminal::size().unwrap_or((120, 40)));
         let mut stdout = io::stdout().lock();
+        let mut keyboard_enhancement_enabled = false;
         stdout.write_all(ENABLE_MOUSE_REPORTING)?;
+        sync_keyboard_enhancement(&mut stdout, &mut keyboard_enhancement_enabled, focus)?;
         stdout.write_all(b"\x1b[2J\x1b[H")?;
         stdout.flush()?;
         let result = (|| {
@@ -2351,7 +2660,6 @@ impl SessionTerminals {
             let mut last_layout_key = None;
             let mut clear_next_frame = true;
             let mut rename_input: Option<Vec<u8>> = None;
-            let mut close_confirmation: Option<usize> = None;
             let mut chrome = observe();
             'workspace: loop {
                 validate_lease()?;
@@ -2376,6 +2684,7 @@ impl SessionTerminals {
                         }
                     }
                 }
+                sync_keyboard_enhancement(&mut stdout, &mut keyboard_enhancement_enabled, focus)?;
                 let next_chrome = observe();
                 if next_chrome != chrome {
                     chrome = next_chrome;
@@ -2434,7 +2743,6 @@ impl SessionTerminals {
                 let input = match poll_terminal_input(Duration::from_millis(10))? {
                     PolledTerminalInput::Pending => {
                         if let Some(bytes) = input_router.flush() {
-                            close_confirmation = None;
                             self.write_focused(focus, &bytes)?;
                         }
                         continue;
@@ -2443,7 +2751,6 @@ impl SessionTerminals {
                     PolledTerminalInput::Bytes(input) => input,
                 };
                 if let Some(mut value) = rename_input.take() {
-                    close_confirmation = None;
                     let mut cancelled = false;
                     let mut committed = false;
                     for byte in &input {
@@ -2485,14 +2792,12 @@ impl SessionTerminals {
                 }
                 for routed in input_router.route(&input, focus) {
                     if let WorkspaceInput::Mouse(event) = routed {
-                        close_confirmation = None;
                         self.handle_mouse(&layout, event)?;
                         last_signature.clear();
                         continue;
                     }
                     let WorkspaceInput::Command(command) = routed else {
                         if let WorkspaceInput::Forward(bytes) = routed {
-                            close_confirmation = None;
                             if focus == WorkspaceFocus::Sessions {
                                 match session_list_input(&bytes) {
                                     Some(SessionListInput::Previous) => {
@@ -2533,9 +2838,6 @@ impl SessionTerminals {
                         }
                         continue;
                     };
-                    if command != WorkspaceCommand::CloseShell {
-                        close_confirmation = None;
-                    }
                     match command {
                         WorkspaceCommand::Dashboard => break 'workspace,
                         WorkspaceCommand::Alert => {
@@ -2697,32 +2999,14 @@ impl SessionTerminals {
                         }
                         WorkspaceCommand::CloseShell => {
                             if self.shells.is_empty() {
-                                close_confirmation = None;
                                 self.notice = Some("no shell to close".into());
                                 continue;
                             }
-                            let alive = self
-                                .shells
-                                .get(self.selected_shell)
-                                .is_some_and(|shell| shell.terminal.is_alive());
-                            match shell_close_action(
-                                focus,
-                                alive,
-                                close_confirmation == Some(self.selected_shell),
-                            ) {
+                            match shell_close_action(focus) {
                                 ShellCloseAction::Ignore => {
-                                    close_confirmation = None;
                                     self.notice = Some("focus a shell before closing it".into());
                                 }
-                                ShellCloseAction::Confirm => {
-                                    close_confirmation = Some(self.selected_shell);
-                                    self.notice = Some(format!(
-                                        "shell is running · press {} again to close",
-                                        render_bindings.label("close_shell")
-                                    ));
-                                }
                                 ShellCloseAction::Close => {
-                                    close_confirmation = None;
                                     self.shells.remove(self.selected_shell).terminal.terminate();
                                     if self.shells.is_empty() {
                                         self.selected_shell = 0;
@@ -2765,10 +3049,14 @@ impl SessionTerminals {
             }
             Ok(exit)
         })();
-        let restore = stdout
-            .write_all(DISABLE_MOUSE_REPORTING)
-            .and_then(|()| stdout.write_all(b"\x1b[0m\x1b[?25h"))
-            .and_then(|()| stdout.flush());
+        let restore = if keyboard_enhancement_enabled {
+            stdout.write_all(DISABLE_KEYBOARD_ENHANCEMENT)
+        } else {
+            Ok(())
+        }
+        .and_then(|()| stdout.write_all(DISABLE_MOUSE_REPORTING))
+        .and_then(|()| stdout.write_all(b"\x1b[0m\x1b[?25h"))
+        .and_then(|()| stdout.flush());
         match result {
             Ok(exit) => restore.map(|()| exit),
             Err(error) => Err(error),
@@ -3135,13 +3423,33 @@ fn render_sidebar(
         let line = if index == chrome.selected && focused {
             format!("\x1b[30;46;1m{label}\x1b[0m")
         } else if index == chrome.selected {
-            format!("\x1b[7m{label}\x1b[0m")
+            style_sidebar_provider(&label, "\x1b[48;2;45;53;72m")
         } else {
-            label
+            style_sidebar_provider(&label, "")
         };
         write_at(stdout, row as u16 + 1, 0, line.as_bytes())?;
     }
     render_vertical_line(stdout, layout.sidebar_width, 0, layout.status_row)
+}
+
+fn style_sidebar_provider(label: &str, base_style: &str) -> String {
+    let provider = [(" Cdx ", "\x1b[36m"), (" Cla ", "\x1b[38;2;219;126;82m")]
+        .into_iter()
+        .find_map(|(token, style)| label.find(token).map(|start| (start + 1, style)));
+    let Some((start, provider_style)) = provider else {
+        return if base_style.is_empty() {
+            label.to_owned()
+        } else {
+            format!("{base_style}{label}\x1b[0m")
+        };
+    };
+    let end = start + 3;
+    format!(
+        "{base_style}{}{provider_style}{}\x1b[0m{base_style}{}\x1b[0m",
+        &label[..start],
+        &label[start..end],
+        &label[end..]
+    )
 }
 
 fn render_session_preview(
@@ -4061,6 +4369,7 @@ mod tests {
             output: Mutex::new(OutputState::default()),
             output_generation: AtomicU64::new(0),
             parser: Mutex::new(vt100::Parser::new(24, 80, CAPTURE_LINES)),
+            status_bar_scrollback: Mutex::new(StatusBarScrollback::default()),
             size: Mutex::new((80, 24)),
         };
 
@@ -4339,6 +4648,52 @@ mod tests {
     }
 
     #[test]
+    fn mouse_wheel_scrolls_codex_style_history_above_a_status_bar() {
+        let root = tempdir().unwrap();
+        let agent = ManagedTerminal::spawn(
+            &CommandSpec::new("/bin/sh", root.path()).arg("-c").arg(
+                "printf 'oldest\\r\\nsecond\\r\\nthird\\r\\nfourth'; \
+                 printf '\\033[1;4r\\033[4;1H\\r\\nnewest'; sleep 2",
+            ),
+            (30, 6),
+        )
+        .unwrap();
+        agent.wait_for_first_output(Duration::from_secs(1));
+        let mut terminals = SessionTerminals {
+            agent: Some(agent),
+            ..SessionTerminals::default()
+        };
+        let layout = WorkspaceLayout::new(120, 30, 0, 0);
+
+        terminals
+            .handle_mouse(
+                &layout,
+                WorkspaceMouseEvent {
+                    button: 64,
+                    col: layout.agent.left + 1,
+                    row: layout.agent.top + 1,
+                    pressed: true,
+                },
+            )
+            .unwrap();
+
+        let agent = terminals.agent.as_ref().unwrap();
+        assert_eq!(agent.scrollback_offset(), 1);
+        assert!(
+            String::from_utf8_lossy(&agent.screen_view().rows[0]).contains("oldest"),
+            "the line removed by Codex's partial scroll region should remain visible"
+        );
+    }
+
+    #[test]
+    fn clicks_outside_terminal_panes_are_ignored_without_coordinate_underflow() {
+        let layout = WorkspaceLayout::new(120, 30, 1, 0);
+
+        assert_eq!(pane_at(&layout, 0, 5), None);
+        assert_eq!(pane_at(&layout, layout.agent.left + 1, 0), None);
+    }
+
+    #[test]
     fn mouse_wheel_is_forwarded_to_an_agent_tui_that_requested_mouse_reporting() {
         let root = tempdir().unwrap();
         let agent = ManagedTerminal::spawn(
@@ -4379,6 +4734,51 @@ mod tests {
         let compact = output.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
             compact.contains("1b 5b 3c 36 34 3b 32 3b 32 4d"),
+            "agent received: {output:?}"
+        );
+    }
+
+    #[test]
+    fn mouse_click_is_forwarded_to_an_agent_tui_that_requested_mouse_reporting() {
+        let root = tempdir().unwrap();
+        let agent = ManagedTerminal::spawn(
+            &CommandSpec::new("/bin/sh", root.path()).arg("-c").arg(
+                r"stty raw -echo; printf '\033[?1000h\033[?1006h'; dd bs=1 count=9 2>/dev/null | od -An -tx1; sleep 1",
+            ),
+            (80, 24),
+        )
+        .unwrap();
+        agent.wait_for_first_output(Duration::from_secs(1));
+        let start = Instant::now();
+        while agent.mouse_protocol().1 != vt100::MouseProtocolEncoding::Sgr
+            && start.elapsed() < Duration::from_secs(1)
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let mut terminals = SessionTerminals {
+            agent: Some(agent),
+            ..SessionTerminals::default()
+        };
+        let layout = WorkspaceLayout::new(120, 30, 0, 0);
+
+        terminals
+            .handle_mouse(
+                &layout,
+                WorkspaceMouseEvent {
+                    button: 0,
+                    col: layout.agent.left + 2,
+                    row: 3,
+                    pressed: true,
+                },
+            )
+            .unwrap();
+        let output = wait_for_capture(
+            terminals.agent.as_ref().unwrap(),
+            "1b 5b 3c 30 3b 32 3b 32 4d",
+        );
+        let compact = output.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            compact.contains("1b 5b 3c 30 3b 32 3b 32 4d"),
             "agent received: {output:?}"
         );
     }
@@ -4516,6 +4916,49 @@ mod tests {
     }
 
     #[test]
+    fn modified_enter_encodings_are_forwarded_to_child() {
+        for focus in [WorkspaceFocus::Agent, WorkspaceFocus::Shell] {
+            for sequence in [
+                b"\n".as_slice(),
+                b"\x1b[13;5u".as_slice(),
+                b"\x1b[27;5;13~".as_slice(),
+            ] {
+                let mut router = WorkspaceInputRouter::default();
+                assert!(matches!(
+                    router.route(sequence, focus).as_slice(),
+                    [WorkspaceInput::Forward(bytes)] if bytes == sequence
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn only_documented_control_bytes_are_reserved_in_child_focus() {
+        let agent_reserved = [0x0f, 0x11, 0x1c, 0x1d];
+        let shell_reserved = [0x0e, 0x0f, 0x11, 0x18, 0x1c, 0x1d];
+
+        for (focus, reserved) in [
+            (WorkspaceFocus::Agent, agent_reserved.as_slice()),
+            (WorkspaceFocus::Shell, shell_reserved.as_slice()),
+        ] {
+            for byte in 0x00..=0x1f {
+                if byte == 0x1b || reserved.contains(&byte) {
+                    continue;
+                }
+                let mut router = WorkspaceInputRouter::default();
+                let input = [byte];
+                assert!(
+                    matches!(
+                        router.route(&input, focus).as_slice(),
+                        [WorkspaceInput::Forward(bytes)] if bytes == &input
+                    ),
+                    "control byte 0x{byte:02x} was unexpectedly intercepted in {focus:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn ordinary_keys_and_ctrl_t_are_forwarded_in_child_focus() {
         for focus in [WorkspaceFocus::Agent, WorkspaceFocus::Shell] {
             for sequence in [
@@ -4534,6 +4977,8 @@ mod tests {
                 b"-".as_slice(),
                 b"1".as_slice(),
                 b"\x14".as_slice(),
+                b"\x1b[A".as_slice(),
+                b"\x1b[B".as_slice(),
             ] {
                 let mut router = WorkspaceInputRouter::default();
                 assert!(matches!(
@@ -4573,6 +5018,43 @@ mod tests {
     }
 
     #[test]
+    fn enhanced_control_sequences_keep_workspace_shortcuts_working() {
+        for (sequence, command) in [
+            (b"\x1b[111;5u".as_slice(), WorkspaceCommand::ToggleFocus),
+            (b"\x1b[92;5u".as_slice(), WorkspaceCommand::NewShell),
+            (b"\x1b[113;5u".as_slice(), WorkspaceCommand::Dashboard),
+            (b"\x1b[93;5u".as_slice(), WorkspaceCommand::Alert),
+        ] {
+            let mut router = WorkspaceInputRouter::default();
+            assert!(matches!(
+                router.route(sequence, WorkspaceFocus::Agent).as_slice(),
+                [WorkspaceInput::Command(actual)] if *actual == command
+            ));
+        }
+
+        for (sequence, command) in [
+            (b"\x1b[110;5u".as_slice(), WorkspaceCommand::NextShell),
+            (b"\x1b[120;5u".as_slice(), WorkspaceCommand::CloseShell),
+        ] {
+            let mut shell_router = WorkspaceInputRouter::default();
+            assert!(matches!(
+                shell_router
+                    .route(sequence, WorkspaceFocus::Shell)
+                    .as_slice(),
+                [WorkspaceInput::Command(actual)] if *actual == command
+            ));
+
+            let mut agent_router = WorkspaceInputRouter::default();
+            assert!(matches!(
+                agent_router
+                    .route(sequence, WorkspaceFocus::Agent)
+                    .as_slice(),
+                [WorkspaceInput::Forward(bytes)] if bytes == sequence
+            ));
+        }
+    }
+
+    #[test]
     fn escape_is_never_a_console_command_and_is_flushed_to_the_child() {
         for focus in [WorkspaceFocus::Agent, WorkspaceFocus::Shell] {
             let mut router = WorkspaceInputRouter::default();
@@ -4603,25 +5085,17 @@ mod tests {
     }
 
     #[test]
-    fn close_shell_requires_console_or_shell_focus_and_confirmation_for_a_live_shell() {
+    fn close_shell_is_immediate_only_when_shell_has_focus() {
         assert_eq!(
-            shell_close_action(WorkspaceFocus::Agent, true, false),
+            shell_close_action(WorkspaceFocus::Agent),
             ShellCloseAction::Ignore
         );
         assert_eq!(
-            shell_close_action(WorkspaceFocus::Sessions, true, false),
-            ShellCloseAction::Confirm
+            shell_close_action(WorkspaceFocus::Sessions),
+            ShellCloseAction::Ignore
         );
         assert_eq!(
-            shell_close_action(WorkspaceFocus::Shell, true, false),
-            ShellCloseAction::Confirm
-        );
-        assert_eq!(
-            shell_close_action(WorkspaceFocus::Shell, true, true),
-            ShellCloseAction::Close
-        );
-        assert_eq!(
-            shell_close_action(WorkspaceFocus::Shell, false, false),
+            shell_close_action(WorkspaceFocus::Shell),
             ShellCloseAction::Close
         );
     }
@@ -4925,6 +5399,23 @@ mod tests {
     }
 
     #[test]
+    fn workspace_requests_modified_key_reporting_only_for_agent_input() {
+        assert_eq!(ENABLE_KEYBOARD_ENHANCEMENT, b"\x1b[>1u");
+        assert_eq!(DISABLE_KEYBOARD_ENHANCEMENT, b"\x1b[<1u");
+
+        let mut output = Vec::new();
+        let mut enabled = false;
+        sync_keyboard_enhancement(&mut output, &mut enabled, WorkspaceFocus::Sessions).unwrap();
+        sync_keyboard_enhancement(&mut output, &mut enabled, WorkspaceFocus::Agent).unwrap();
+        sync_keyboard_enhancement(&mut output, &mut enabled, WorkspaceFocus::Agent).unwrap();
+        sync_keyboard_enhancement(&mut output, &mut enabled, WorkspaceFocus::Shell).unwrap();
+        assert_eq!(
+            output,
+            [ENABLE_KEYBOARD_ENHANCEMENT, DISABLE_KEYBOARD_ENHANCEMENT].concat()
+        );
+    }
+
+    #[test]
     fn console_key_events_encode_as_terminal_input() {
         assert_eq!(
             terminal_event_bytes(Event::Key(KeyEvent::new(
@@ -4944,6 +5435,35 @@ mod tests {
             ))),
             b"\x1b[24~"
         );
+        assert_eq!(
+            terminal_event_bytes(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::CONTROL,
+            ))),
+            b"\x1b[13;5u"
+        );
+    }
+
+    #[test]
+    fn workspace_sidebar_colors_provider_labels_like_dashboard() {
+        let chrome = WorkspaceChrome {
+            sessions: vec![
+                "▾ repo".into(),
+                "○ Cdx codex task".into(),
+                "! Cla claude task".into(),
+            ],
+            selected: 1,
+            preview: vec!["preview".into()],
+            notification: None,
+        };
+        let layout = WorkspaceLayout::new(120, 40, 0, 0);
+        let mut output = Vec::new();
+
+        render_sidebar(&mut output, &chrome, &layout, false).unwrap();
+
+        let output = String::from_utf8_lossy(&output);
+        assert!(output.contains("\x1b[36mCdx\x1b[0m"));
+        assert!(output.contains("\x1b[38;2;219;126;82mCla\x1b[0m"));
     }
 
     #[test]

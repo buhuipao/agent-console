@@ -74,6 +74,12 @@ expect_text {FOCUS AGENT} setup 121
 if {[provider_launches] != 1} { fail initial-provider-launch-count 183 }
 send -- "\017"
 expect_text {FOCUS SHELL 1/1} browse-setup-shell 184
+send -- "\033\[<0;5;5M\033\[<0;5;5m"
+send -- "echo SIDEBAR_CLICK_SAFE\r"
+expect_text {SIDEBAR_CLICK_SAFE} sidebar-click-does-not-exit 208
+send -- "\033\[<0;30;1M\033\[<0;30;1m"
+send -- "echo AGENT_TITLE_CLICK_SAFE\r"
+expect_text {AGENT_TITLE_CLICK_SAFE} agent-title-click-does-not-exit 209
 send -- "\017"
 expect_text {FOCUS SESSIONS} browse-setup-sessions 185
 send -- "j"
@@ -83,12 +89,28 @@ send -- "k"
 expect_text_without_alt_leave {SESSION PREVIEW .*Verify the second dashboard session selection} browse-back-without-dashboard 188
 send -- "\r"
 expect_text {FOCUS AGENT} browse-activate-current 189
+file mtime $second_fixture [expr {[clock seconds] + 5}]
+after 2500
+send -- "\017"
+expect_text {FOCUS SHELL 1/1} stale-transcript-shell 200
+send -- "\017"
+expect_text {FOCUS SESSIONS} stale-transcript-sessions 201
+send -- "\017"
+expect_text {FOCUS AGENT} stale-transcript-ctrl-o-reactivates-agent 202
+if {[provider_launches] != 1} { fail stale-transcript-ctrl-o-restarted-provider 203 }
+send -- "\017"
+expect_text {FOCUS SHELL 1/1} stale-transcript-shell-again 204
+send -- "\017"
+expect_text {FOCUS SESSIONS} stale-transcript-sessions-again 205
+send -- "\r"
+expect_text {FOCUS AGENT} stale-transcript-enter-reactivates-agent 206
+if {[provider_launches] != 1} { fail stale-transcript-enter-restarted-provider 207 }
 file mkdir [file join $state_dir events]
 set event_file [file join $state_dir events codex-e2e-session.jsonl]
 set event_channel [open $event_file w]
 puts $event_channel {{"provider":"codex","session_id":"e2e-session","event_id":"workspace-live-refresh","timestamp":1,"kind":"approval_requested","text":"Choose the release target"}}
 close $event_channel
-expect_text {! Cdx Exercise wor} workspace-live-runtime 146
+expect_text {! .*Cdx.*Exercise wor} workspace-live-runtime 146
 expect_text {ALERT .*Choose the release target} workspace-alert 147
 send -- "\035"
 expect_text {Exercise workspace controls} Ctrl-bracket-jump 148
@@ -105,9 +127,7 @@ expect_text {ESC_BYTE_FORWARDED:.*1b} Esc-forwarded-to-shell 199
 send -- "\034"
 expect_text {FOCUS SHELL 2/2} direct-new-shell 123
 send -- "\030"
-expect_text {shell is running .* again to close} direct-confirm-live 191
-send -- "\030"
-expect_text {FOCUS SHELL 1/1} direct-close-live 192
+expect_text {FOCUS SHELL 1/1} direct-close-live 191
 send -- "\034"
 expect_text {FOCUS SHELL 2/2} direct-new-shell-after-close 193
 send -- "\017"

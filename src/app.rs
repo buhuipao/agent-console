@@ -554,19 +554,21 @@ impl App {
                     self.runtime.jump_to_next_notification();
                     return Ok(touched_agents);
                 }
-                WorkspaceExit::ActivateSession => match self.prepare_selected_agent(current_exe) {
-                    Ok(selected) => {
-                        session = selected;
-                        focus = WorkspaceFocus::Agent;
-                        touched_agents.insert(session.key.clone());
+                WorkspaceExit::ActivateSession => {
+                    match self.activate_workspace_agent(current_exe) {
+                        Ok(selected) => {
+                            session = selected;
+                            focus = WorkspaceFocus::Agent;
+                            touched_agents.insert(session.key.clone());
+                        }
+                        Err(error) => {
+                            session = self.prepare_selected_view(current_exe)?;
+                            self.terminals
+                                .set_notice(&session.key, format!("cannot open agent: {error}"));
+                            focus = WorkspaceFocus::Sessions;
+                        }
                     }
-                    Err(error) => {
-                        session = self.prepare_selected_view(current_exe)?;
-                        self.terminals
-                            .set_notice(&session.key, format!("cannot open agent: {error}"));
-                        focus = WorkspaceFocus::Sessions;
-                    }
-                },
+                }
                 WorkspaceExit::NewSession => {
                     self.open_new_dialog_at(&session.cwd);
                     return Ok(touched_agents);
@@ -726,6 +728,14 @@ impl App {
         );
         self.runtime.store.save_incremental()?;
         Ok(session)
+    }
+
+    fn activate_workspace_agent(&mut self, current_exe: &Path) -> io::Result<Session> {
+        let session = self.prepare_selected_view(current_exe)?;
+        if self.terminals.agent_alive(&session.key) {
+            return Ok(session);
+        }
+        self.prepare_selected_agent(current_exe)
     }
 
     fn prepare_selected_view(&mut self, current_exe: &Path) -> io::Result<Session> {
