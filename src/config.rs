@@ -59,8 +59,8 @@ const WORKSPACE_ACTIONS: &[&str] = &[
     "alert",
     "previous_session",
     "next_session",
-    "rename_shell",
     "maximize",
+    "hide_shells",
     "grow_shell",
     "shrink_shell",
     "copy_command",
@@ -215,68 +215,107 @@ impl AgentConsoleConfig {
 
     pub fn help_bindings(&self) -> Vec<String> {
         let mut lines = vec!["DASHBOARD".into()];
-        lines.extend(DASHBOARD_ACTIONS.iter().filter_map(|action| {
+        for (action, label) in [
+            ("previous", "previous session"),
+            ("next", "next session"),
+            ("enter", "open agent"),
+            ("shell", "open shell"),
+            ("new", "new session"),
+            ("alert", "unread alert"),
+            ("search", "search sessions"),
+            ("alias", "rename session"),
+            ("archive", "archive / restore"),
+            ("copy", "copy shell output"),
+            ("stage", "stage shell output"),
+            ("retry_summary", "retry summary"),
+            ("takeover", "force takeover"),
+            ("help", "help"),
+            ("quit", "quit"),
+        ] {
             let keys = self.dashboard_keys(action);
-            (!keys.is_empty()).then(|| {
-                format!(
-                    "{action:<18} {}",
+            if !keys.is_empty() {
+                lines.push(format!(
+                    "{label:<22} {}",
                     keys.iter()
                         .map(|key| format_key_label(key))
                         .collect::<Vec<_>>()
                         .join(", ")
-                )
-            })
-        }));
+                ));
+            }
+        }
+        lines.push(format!("{:<22} {}", "sidebar selection", "Mouse wheel"));
         for (heading, actions) in [
             (
                 "WORKSPACE · DIRECT",
                 [
-                    "focus",
-                    "new_shell",
-                    "next_shell",
-                    "close_shell",
-                    "dashboard",
-                    "alert",
+                    ("focus", "cycle focus"),
+                    ("new_shell", "new shell"),
+                    ("next_shell", "next shell"),
+                    ("close_shell", "close shell"),
+                    ("dashboard", "dashboard"),
+                    ("alert", "unread alert"),
+                    ("previous_session", "previous session"),
+                    ("next_session", "next session"),
                 ]
                 .as_slice(),
             ),
             (
                 "WORKSPACE · SESSION LIST",
                 [
-                    "previous_shell",
-                    "rename_shell",
-                    "maximize",
-                    "grow_shell",
-                    "shrink_shell",
-                    "copy_command",
+                    ("previous_shell", "previous shell"),
+                    ("maximize", "focus last shell"),
+                    ("hide_shells", "focus agent"),
+                    ("grow_shell", "grow shell area"),
+                    ("shrink_shell", "shrink shell area"),
+                    ("copy_command", "copy command output"),
                 ]
                 .as_slice(),
             ),
             (
                 "WORKSPACE · CHILD VIEWPORT",
-                ["scroll_up", "scroll_down", "live_tail"].as_slice(),
+                [
+                    ("scroll_up", "scroll up"),
+                    ("scroll_down", "scroll down"),
+                    ("live_tail", "live tail"),
+                ]
+                .as_slice(),
             ),
         ] {
             lines.push(heading.into());
-            lines.extend(actions.iter().filter_map(|action| {
+            if heading.contains("SESSION LIST") {
+                lines.extend([
+                    format!("{:<22} {}", "select session", "↑/↓, J/K"),
+                    format!("{:<22} {}", "open agent", "Enter"),
+                    format!("{:<22} {}", "new session", "N"),
+                    format!("{:<22} {}", "open shell", "S"),
+                    format!("{:<22} {}", "archive / restore", "X"),
+                ]);
+            }
+            for (action, label) in actions {
                 let keys = self.workspace_keys(action);
-                (!keys.is_empty()).then(|| {
-                    format!(
-                        "{action:<18} {}",
+                if !keys.is_empty() {
+                    lines.push(format!(
+                        "{label:<22} {}",
                         keys.iter()
                             .map(|key| format_key_label(key))
                             .collect::<Vec<_>>()
                             .join(", ")
-                    )
-                })
-            }));
+                    ));
+                }
+            }
+            if heading.contains("CHILD VIEWPORT") {
+                lines.extend([
+                    format!("{:<22} {}", "scroll pointed pane", "Mouse wheel"),
+                    format!("{:<22} {}", "select / copy text", "Drag / Shift-Drag"),
+                ]);
+            }
             if heading.contains("SESSION LIST") {
                 let keys = (1..=9)
                     .flat_map(|index| self.workspace_keys(&format!("select_shell_{index}")))
                     .map(|key| format_key_label(&key))
                     .collect::<Vec<_>>();
                 if !keys.is_empty() {
-                    lines.push(format!("{:<18} {}", "select_shell", keys.join(", ")));
+                    lines.push(format!("{:<22} {}", "select shell", keys.join(", ")));
                 }
             }
         }
@@ -475,10 +514,10 @@ fn default_workspace_keys(action: &str) -> &'static [&'static str] {
         "dashboard" => &["ctrl-q"],
         "alert" => &["ctrl-]"],
         "previous_session" | "next_session" => &[],
-        "rename_shell" => &["r"],
         "maximize" => &["m"],
+        "hide_shells" => &["h"],
         "grow_shell" => &["+"],
-        "shrink_shell" => &["-"],
+        "shrink_shell" => &["_"],
         "copy_command" => &["y"],
         "scroll_up" => &["shift-pageup"],
         "scroll_down" => &["shift-pagedown"],
@@ -670,6 +709,21 @@ mod tests {
     }
 
     #[test]
+    fn removed_shell_rename_binding_is_rejected() {
+        let error = AgentConsoleConfig::parse(
+            "[keys.workspace]\nrename_shell = [\"r\"]\n",
+            Path::new("config.toml"),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("keys.workspace.rename_shell is not a known action")
+        );
+    }
+
+    #[test]
     fn workspace_defaults_use_direct_contextual_controls() {
         let config = AgentConsoleConfig::default();
 
@@ -682,6 +736,11 @@ mod tests {
         assert_eq!(config.workspace_keys("alert"), vec!["ctrl-]"]);
         assert!(config.workspace_keys("previous_session").is_empty());
         assert!(config.workspace_keys("next_session").is_empty());
+        assert_eq!(config.workspace_keys("maximize"), vec!["m"]);
+        assert_eq!(config.workspace_keys("hide_shells"), vec!["h"]);
+        assert_eq!(config.workspace_keys("grow_shell"), vec!["+"]);
+        assert_eq!(config.workspace_keys("shrink_shell"), vec!["_"]);
+        assert!(config.workspace_keys("rename_shell").is_empty());
     }
 
     #[test]
@@ -706,6 +765,75 @@ mod tests {
                 .iter()
                 .all(|line| !line.ends_with(' '))
         );
+    }
+
+    #[test]
+    fn help_lists_fixed_and_configured_actions_with_user_facing_names() {
+        let config = AgentConsoleConfig::parse(
+            r#"
+                [keys.dashboard]
+                alias = ["e"]
+                copy = ["y"]
+                stage = ["i"]
+                retry_summary = ["r"]
+
+                [keys.workspace]
+                previous_session = ["ctrl-up"]
+                next_session = ["ctrl-down"]
+                previous_shell = ["alt-p"]
+                select_shell_1 = ["alt-1"]
+            "#,
+            Path::new("config.toml"),
+        )
+        .unwrap();
+        let lines = config.help_bindings();
+        let help = lines.join("\n");
+
+        for (label, keys) in [
+            ("rename session", "e"),
+            ("copy shell output", "y"),
+            ("stage shell output", "i"),
+            ("retry summary", "r"),
+            ("previous session", "Ctrl-↑"),
+            ("next session", "Ctrl-↓"),
+            ("previous shell", "Alt-p"),
+            ("select session", "↑/↓, J/K"),
+            ("open agent", "Enter"),
+            ("new session", "N"),
+            ("open shell", "S"),
+            ("archive / restore", "X"),
+            ("focus last shell", "m"),
+            ("focus agent", "h"),
+            ("select shell", "Alt-1, 2, 3, 4, 5, 6, 7, 8, 9"),
+        ] {
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains(label) && line.ends_with(keys)),
+                "missing help line: {label} -> {keys}"
+            );
+        }
+        assert!(!help.contains("hide_shells"));
+        assert!(!help.contains("copy_command"));
+        assert!(help.contains("sidebar selection"));
+        assert!(help.contains("scroll pointed pane"));
+        assert!(help.contains("select / copy text"));
+        for action in DASHBOARD_ACTIONS {
+            for key in config.dashboard_keys(action) {
+                assert!(
+                    help.contains(&format_key_label(&key)),
+                    "missing {action} key"
+                );
+            }
+        }
+        for action in WORKSPACE_ACTIONS {
+            for key in config.workspace_keys(action) {
+                assert!(
+                    help.contains(&format_key_label(&key)),
+                    "missing {action} key"
+                );
+            }
+        }
     }
 
     #[test]

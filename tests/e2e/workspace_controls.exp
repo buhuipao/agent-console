@@ -67,12 +67,16 @@ proc expect_text_without_alt_leave {pattern label code} {
 set binary [file join $root target debug agent-console]
 spawn /bin/sh -c [format {stty rows 30 columns 120; exec "%s"} $binary]
 set timeout 30
-expect_text {Agent Console} dashboard-ready 120
+expect_text {Workspace controls are configurable} dashboard-ready 120
 set timeout 8
 send -- "\r"
 expect_text {FOCUS AGENT} setup 121
 if {[provider_launches] != 1} { fail initial-provider-launch-count 183 }
 send -- "\017"
+expect_text {● [0-9]+ work} workspace-status-working 210
+expect_text {◐ [0-9]+ wait} workspace-status-waiting 211
+expect_text {○ [0-9]+ idle} workspace-status-idle 212
+expect_text {× [0-9]+ fail} workspace-status-failed 213
 expect_text {FOCUS SHELL 1/1} browse-setup-shell 184
 send -- "\033\[<0;5;5M\033\[<0;5;5m"
 send -- "echo SIDEBAR_CLICK_SAFE\r"
@@ -85,6 +89,15 @@ expect_text {FOCUS SESSIONS} browse-setup-sessions 185
 send -- "j"
 expect_text_without_alt_leave {SESSION PREVIEW .*Exercise workspace controls} browse-without-dashboard 186
 if {[provider_launches] != 1} { fail browse-started-provider 187 }
+send -- "h"
+expect_text {AGENT .*Exercise workspace controls} h-starts-selected-agent 219
+expect_text {FOCUS AGENT} h-started-agent-focuses-agent 220
+if {[provider_launches] != 2} { fail h-did-not-start-selected-provider 221 }
+send -- "\017"
+expect_text {FOCUS SHELL 1/1} h-agent-to-shell 222
+send -- "\017"
+expect_text {SESSION PREVIEW .*Exercise workspace controls} h-shell-to-session-overview 223
+expect_text {FOCUS SESSIONS} h-returns-to-session-focus 224
 send -- "k"
 expect_text_without_alt_leave {SESSION PREVIEW .*Verify the second dashboard session selection} browse-back-without-dashboard 188
 send -- "\r"
@@ -97,14 +110,14 @@ send -- "\017"
 expect_text {FOCUS SESSIONS} stale-transcript-sessions 201
 send -- "\017"
 expect_text {FOCUS AGENT} stale-transcript-ctrl-o-reactivates-agent 202
-if {[provider_launches] != 1} { fail stale-transcript-ctrl-o-restarted-provider 203 }
+if {[provider_launches] != 2} { fail stale-transcript-ctrl-o-restarted-provider 203 }
 send -- "\017"
 expect_text {FOCUS SHELL 1/1} stale-transcript-shell-again 204
 send -- "\017"
 expect_text {FOCUS SESSIONS} stale-transcript-sessions-again 205
 send -- "\r"
 expect_text {FOCUS AGENT} stale-transcript-enter-reactivates-agent 206
-if {[provider_launches] != 1} { fail stale-transcript-enter-restarted-provider 207 }
+if {[provider_launches] != 2} { fail stale-transcript-enter-restarted-provider 207 }
 file mkdir [file join $state_dir events]
 set event_file [file join $state_dir events codex-e2e-session.jsonl]
 set event_channel [open $event_file w]
@@ -135,18 +148,24 @@ expect_text {FOCUS SESSIONS} session-list-select-shell 166
 send -- "1"
 expect_text {selected shell 1} select-shell-1 167
 send -- "\017"
-expect_text {FOCUS SESSIONS} session-list-rename 168
-send -- "r"
-expect_text {rename shell} r-rename 168
-send -- "logs\r"
-expect_text {renamed shell to logs} rename-shell 169
+expect_text {FOCUS SESSIONS} session-list-layout 168
 send -- "m"
-expect_text {pane maximized} maximize 170
+expect_text {shell maximized} maximize-selected-shell 170
+expect_text {FOCUS SHELL 1/2} maximize-focuses-previous-shell 171
 send -- "\017"
-expect_text {FOCUS SESSIONS} restore-pane 171
+expect_text {SESSION PREVIEW .*Exercise workspace controls} maximize-return-restores-overview 225
+expect_text {FOCUS SESSIONS} maximize-return-focuses-sessions 226
+send -- "h"
+expect_text {AGENT .*Exercise workspace controls} live-agent-not-session-preview 217
+expect_text {FOCUS AGENT} maximize-focuses-agent 215
+send -- "\017"
+expect_text {FOCUS SHELL 1/2} maximized-agent-to-shell 216
+send -- "\017"
+expect_text {SESSION PREVIEW .*Exercise workspace controls} restore-session-overview 227
+expect_text {FOCUS SESSIONS} restore-session-focus 228
 send -- "+"
 expect_text {shell area enlarged} grow-pane 172
-send -- "-"
+send -- "_"
 expect_text {shell area reduced} shrink-pane 173
 send -- "1"
 expect_text {FOCUS SHELL 1/2} focus-command-shell 173
@@ -171,13 +190,12 @@ expect_text {Verify the second dashboard session selection} session-list-j 177
 expect_text {FOCUS SESSIONS} session-list-j-focus 178
 send -- "k"
 expect_text {Exercise workspace controls} session-list-k 179
-expect_text {logs} session-list-shells-restored 182
+expect_text {shell 1} session-list-shells-restored 182
 send -- "x"
-expect_text {SESSION ARCHIVED} session-list-archive 194
 expect_text {Archived} session-list-archived-group 195
+expect_text {SESSION ARCHIVED} session-list-archive 194
 send -- "x"
-expect_text {SESSION RESTORED} session-list-restore 196
-expect_text {FOCUS SESSIONS} session-list-restore-focus 197
+expect_text {FOCUS SESSIONS.*SESSION RESTORED} session-list-restore-focus 197
 send -- "n"
 expect_text {NEW SESSION} workspace-new-session 198
 send -- "\r"

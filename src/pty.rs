@@ -28,7 +28,7 @@ use crossterm::event::{
 };
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use uuid::Uuid;
 
 use crate::{
@@ -337,6 +337,29 @@ fn terminal_screen_view(
     }
 }
 
+fn terminal_state_checkpoint(
+    parser: &vt100::Parser,
+    status_bar_scrollback: &StatusBarScrollback,
+) -> Vec<u8> {
+    let screen = parser.screen();
+    let mut checkpoint = Vec::new();
+    if screen.alternate_screen() {
+        checkpoint.extend_from_slice(b"\x1b[?1049h");
+    }
+    if let Some((top, bottom)) = status_bar_scrollback.scroll_region {
+        checkpoint.extend_from_slice(
+            format!(
+                "\x1b[{};{}r",
+                top.saturating_add(1),
+                bottom.saturating_add(1)
+            )
+            .as_bytes(),
+        );
+    }
+    checkpoint.extend(screen.state_formatted());
+    checkpoint
+}
+
 struct LocalTerminal {
     master: Box<dyn MasterPty + Send>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
@@ -403,7 +426,18 @@ impl LocalTerminal {
                                 let mut scrollback =
                                     status_bar_scrollback_for_thread.lock().unwrap();
                                 process_terminal_output(&mut parser, &mut scrollback, bytes);
-                                query_router.route(bytes, parser.screen().cursor_position())
+                                let responses =
+                                    query_router.route(bytes, parser.screen().cursor_position());
+                                // Keep the parsed screen and retained raw offset in one atomic
+                                // order. Poll can then create a checkpoint that corresponds
+                                // exactly to the returned end offset.
+                                let mut state = output_for_thread.lock().unwrap();
+                                state.raw.extend(bytes);
+                                while state.raw.len() > RAW_CAPTURE_BYTES {
+                                    state.raw.pop_front();
+                                    state.base_offset = state.base_offset.saturating_add(1);
+                                }
+                                responses
                             };
                             if !responses.is_empty() {
                                 let mut writer = writer_for_thread.lock().unwrap();
@@ -411,14 +445,6 @@ impl LocalTerminal {
                                     let _ = writer.write_all(&response);
                                 }
                                 let _ = writer.flush();
-                            }
-                            {
-                                let mut state = output_for_thread.lock().unwrap();
-                                state.raw.extend(bytes);
-                                while state.raw.len() > RAW_CAPTURE_BYTES {
-                                    state.raw.pop_front();
-                                    state.base_offset = state.base_offset.saturating_add(1);
-                                }
                             }
                             generation_for_thread.fetch_add(1, Ordering::Relaxed);
                         }
@@ -632,13 +658,25 @@ impl LocalTerminal {
         }
     }
 
-    fn output_since(&self, requested: u64) -> (u64, u64, Vec<u8>, Option<String>) {
+    fn output_since(&self, requested: u64) -> (u64, u64, Vec<u8>, Option<Vec<u8>>, Option<String>) {
+        let parser = self.parser.lock().unwrap();
+        let scrollback = self.status_bar_scrollback.lock().unwrap();
         let state = self.output.lock().unwrap();
-        let start = requested.max(state.base_offset);
+        let end = state.base_offset.saturating_add(state.raw.len() as u64);
+        if requested < state.base_offset || requested > end {
+            let checkpoint = terminal_state_checkpoint(&parser, &scrollback);
+            return (
+                end,
+                end,
+                Vec::new(),
+                Some(checkpoint),
+                state.exit_description.clone(),
+            );
+        }
+        let start = requested;
         let skip = start.saturating_sub(state.base_offset) as usize;
         let bytes = state.raw.iter().skip(skip).copied().collect::<Vec<_>>();
-        let end = state.base_offset.saturating_add(state.raw.len() as u64);
-        (start, end, bytes, state.exit_description.clone())
+        (start, end, bytes, None, state.exit_description.clone())
     }
 }
 
@@ -847,6 +885,8 @@ enum DaemonResponse {
         start: u64,
         end: u64,
         bytes: Vec<u8>,
+        #[serde(default)]
+        checkpoint: Option<Vec<u8>>,
         alive: bool,
         exit: Option<String>,
     },
@@ -893,11 +933,12 @@ impl PtyDaemonState {
                     );
                 };
                 let alive = terminal.is_alive();
-                let (start, end, bytes, exit) = terminal.output_since(offset);
+                let (start, end, bytes, checkpoint, exit) = terminal.output_since(offset);
                 DaemonResponse::Poll {
                     start,
                     end,
                     bytes,
+                    checkpoint,
                     alive,
                     exit,
                 }
@@ -1227,6 +1268,7 @@ impl RemoteTerminal {
             start,
             end,
             bytes,
+            checkpoint,
             alive,
             exit,
         } = response
@@ -1238,7 +1280,7 @@ impl RemoteTerminal {
                 ))),
             };
         };
-        if start != requested {
+        if checkpoint.is_some() || start != requested {
             let size = *self.size.lock().unwrap();
             *self.parser.lock().unwrap() = vt100::Parser::new(size.1, size.0, CAPTURE_LINES);
             *self.status_bar_scrollback.lock().unwrap() = StatusBarScrollback::default();
@@ -1246,13 +1288,19 @@ impl RemoteTerminal {
             output.raw.clear();
             output.base_offset = start;
         }
-        if !bytes.is_empty() {
+        if checkpoint.is_some() || !bytes.is_empty() {
             let mut parser = self.parser.lock().unwrap();
             let mut scrollback = self.status_bar_scrollback.lock().unwrap();
+            if let Some(checkpoint) = checkpoint.as_deref() {
+                process_terminal_output(&mut parser, &mut scrollback, checkpoint);
+            }
             process_terminal_output(&mut parser, &mut scrollback, &bytes);
         }
         let mut output = self.output.lock().unwrap();
-        let changed = !bytes.is_empty() || output.exited == alive;
+        let changed = checkpoint.is_some() || !bytes.is_empty() || output.exited == alive;
+        if let Some(checkpoint) = checkpoint {
+            output.raw.extend(checkpoint);
+        }
         output.raw.extend(bytes);
         while output.raw.len() > RAW_CAPTURE_BYTES {
             output.raw.pop_front();
@@ -1709,6 +1757,7 @@ pub enum WorkspaceExit {
     Dashboard,
     Alert,
     ActivateSession,
+    FocusShell,
     NewSession,
     OpenShell,
     ToggleArchive,
@@ -1733,6 +1782,7 @@ struct TerminalSelection {
 pub struct WorkspaceChrome {
     pub sessions: Vec<String>,
     pub selected: usize,
+    pub status_counts: (usize, usize, usize, usize),
     pub preview: Vec<String>,
     pub notification: Option<String>,
 }
@@ -1949,8 +1999,8 @@ enum WorkspaceCommand {
     PreviousSession,
     NextSession,
     SelectShell(usize),
-    RenameShell,
     ToggleMaximize,
+    ToggleShellArea,
     GrowShell,
     ShrinkShell,
     CopyCommandBlock,
@@ -1979,8 +2029,8 @@ impl WorkspaceBindings {
             ("alert", WorkspaceCommand::Alert),
             ("previous_session", WorkspaceCommand::PreviousSession),
             ("next_session", WorkspaceCommand::NextSession),
-            ("rename_shell", WorkspaceCommand::RenameShell),
             ("maximize", WorkspaceCommand::ToggleMaximize),
+            ("hide_shells", WorkspaceCommand::ToggleShellArea),
             ("grow_shell", WorkspaceCommand::GrowShell),
             ("shrink_shell", WorkspaceCommand::ShrinkShell),
             ("copy_command", WorkspaceCommand::CopyCommandBlock),
@@ -2416,8 +2466,8 @@ fn workspace_command_active(
         }
         WorkspaceCommand::PreviousShell
         | WorkspaceCommand::SelectShell(_)
-        | WorkspaceCommand::RenameShell
         | WorkspaceCommand::ToggleMaximize
+        | WorkspaceCommand::ToggleShellArea
         | WorkspaceCommand::GrowShell
         | WorkspaceCommand::ShrinkShell
         | WorkspaceCommand::CopyCommandBlock => focus == WorkspaceFocus::Sessions,
@@ -2659,7 +2709,6 @@ impl SessionTerminals {
             let mut last_signature = Vec::new();
             let mut last_layout_key = None;
             let mut clear_next_frame = true;
-            let mut rename_input: Option<Vec<u8>> = None;
             let mut chrome = observe();
             'workspace: loop {
                 validate_lease()?;
@@ -2750,46 +2799,6 @@ impl SessionTerminals {
                     PolledTerminalInput::EndOfFile => break,
                     PolledTerminalInput::Bytes(input) => input,
                 };
-                if let Some(mut value) = rename_input.take() {
-                    let mut cancelled = false;
-                    let mut committed = false;
-                    for byte in &input {
-                        match *byte {
-                            b'\r' | b'\n' => committed = true,
-                            0x1b => cancelled = true,
-                            0x7f | 0x08 => {
-                                value.pop();
-                                while value
-                                    .last()
-                                    .is_some_and(|byte| byte & 0b1100_0000 == 0b1000_0000)
-                                {
-                                    value.pop();
-                                }
-                            }
-                            byte if !byte.is_ascii_control() => value.push(byte),
-                            _ => {}
-                        }
-                    }
-                    if committed {
-                        let name = String::from_utf8_lossy(&value).trim().to_owned();
-                        if !name.is_empty()
-                            && let Some(shell) = self.shells.get_mut(self.selected_shell)
-                        {
-                            shell.name = name.clone();
-                            self.notice = Some(format!("renamed shell to {name}"));
-                        }
-                    } else if cancelled {
-                        self.notice = Some("shell rename cancelled".into());
-                    } else {
-                        self.notice = Some(format!(
-                            "rename shell: {}_ · Enter apply · Esc cancel",
-                            String::from_utf8_lossy(&value)
-                        ));
-                        rename_input = Some(value);
-                    }
-                    last_signature.clear();
-                    continue;
-                }
                 for routed in input_router.route(&input, focus) {
                     if let WorkspaceInput::Mouse(event) = routed {
                         self.handle_mouse(&layout, event)?;
@@ -2864,46 +2873,22 @@ impl SessionTerminals {
                                 self.notice = Some(format!("shell {} does not exist", index + 1));
                             }
                         }
-                        WorkspaceCommand::RenameShell => {
-                            if let Some(shell) = self.shells.get(self.selected_shell) {
-                                self.notice = Some(format!(
-                                    "rename shell '{}' to: _ · Enter apply · Esc cancel",
-                                    shell.name
-                                ));
-                                rename_input = Some(Vec::new());
-                            } else {
-                                self.notice = Some("focus a shell before renaming".into());
-                            }
-                        }
                         WorkspaceCommand::ToggleMaximize => {
-                            let target = match focus {
-                                WorkspaceFocus::Sessions => {
-                                    if !self.shells.is_empty() {
-                                        focus = WorkspaceFocus::Shell;
-                                        PaneTarget::Shell(self.selected_shell)
-                                    } else if self.agent.is_some() {
-                                        focus = WorkspaceFocus::Agent;
-                                        PaneTarget::Agent
-                                    } else {
-                                        self.notice = Some(
-                                            "no agent or shell is available to maximize".into(),
-                                        );
-                                        continue;
-                                    }
-                                }
-                                WorkspaceFocus::Agent => PaneTarget::Agent,
-                                WorkspaceFocus::Shell => PaneTarget::Shell(self.selected_shell),
-                            };
-                            self.maximized = (self.maximized != Some(target)).then_some(target);
-                            self.notice = Some(if self.maximized.is_some() {
-                                format!(
-                                    "pane maximized · {} restores",
-                                    render_bindings.label("maximize")
-                                )
-                            } else {
-                                "pane restored".into()
-                            });
-                            clear_next_frame = true;
+                            if self.shells.is_empty() {
+                                self.notice = Some("no shell is available to maximize".into());
+                                continue;
+                            }
+                            self.maximized = Some(PaneTarget::Shell(self.selected_shell));
+                            self.notice =
+                                Some("shell maximized · Ctrl-O returns to sessions".into());
+                            exit = WorkspaceExit::FocusShell;
+                            break 'workspace;
+                        }
+                        WorkspaceCommand::ToggleShellArea => {
+                            self.maximized = Some(PaneTarget::Agent);
+                            self.notice = Some("agent maximized · Ctrl-O changes focus".into());
+                            exit = WorkspaceExit::ActivateSession;
+                            break 'workspace;
                         }
                         WorkspaceCommand::GrowShell => {
                             if self.maximized.is_none() && !self.shells.is_empty() {
@@ -3194,13 +3179,15 @@ fn render_workspace_with_bindings(
             .get(chrome.selected)
             .cloned()
             .unwrap_or_else(|| "session".into());
-        let agent_label = if focus == WorkspaceFocus::Sessions {
-            format!("SESSION PREVIEW · {selected_label}")
-        } else {
+        let show_live_agent = focus != WorkspaceFocus::Sessions
+            || terminals.maximized == Some(PaneTarget::Agent) && terminals.agent.is_some();
+        let agent_label = if show_live_agent {
             pane_label_with_scrollback(
                 &format!("AGENT · {selected_label}"),
                 terminals.agent.as_ref(),
             )
+        } else {
+            format!("SESSION PREVIEW · {selected_label}")
         };
         render_pane_title(
             stdout,
@@ -3210,16 +3197,18 @@ fn render_workspace_with_bindings(
             &agent_label,
             focus == WorkspaceFocus::Agent,
         )?;
-        if focus == WorkspaceFocus::Sessions {
-            render_session_preview(stdout, &chrome.preview, layout.agent)?;
-        } else if let Some(agent) = &terminals.agent {
-            render_terminal(stdout, agent, layout.agent)?;
-            if let Some(selection) = terminals
-                .selection
-                .filter(|selection| selection.pane == PaneTarget::Agent)
-            {
-                render_selection(stdout, agent, selection, layout.agent)?;
+        if show_live_agent {
+            if let Some(agent) = &terminals.agent {
+                render_terminal(stdout, agent, layout.agent)?;
+                if let Some(selection) = terminals
+                    .selection
+                    .filter(|selection| selection.pane == PaneTarget::Agent)
+                {
+                    render_selection(stdout, agent, selection, layout.agent)?;
+                }
             }
+        } else {
+            render_session_preview(stdout, &chrome.preview, layout.agent)?;
         }
     }
     if let Some(row) = layout.shell_divider_row {
@@ -3323,43 +3312,54 @@ fn render_workspace_with_bindings(
     } else {
         let shortcuts = match focus {
             WorkspaceFocus::Sessions => format!(
-                "↑↓/j/k session  Enter agent  n session  s shell  x archive  {} focus  {} dashboard",
+                "{} dashboard  {} focus  ↑↓/j/k select  Enter agent  {} agent  {} shell  n new  s +shell  x archive",
+                bindings.label("dashboard"),
                 bindings.label("focus"),
-                bindings.label("dashboard")
+                bindings.label("hide_shells"),
+                bindings.label("maximize")
             ),
             WorkspaceFocus::Agent => format!(
-                "keys pass through  ·  {} new shell  {} focus  {} dashboard  ·  Shift-PageUp/Down scroll",
-                bindings.label("new_shell"),
+                "{} dashboard  {} focus  {} new shell  ·  keys pass through  ·  Shift-PageUp/Down scroll",
+                bindings.label("dashboard"),
                 bindings.label("focus"),
-                bindings.label("dashboard")
+                bindings.label("new_shell")
             ),
             WorkspaceFocus::Shell => format!(
-                "{} new  {} next  {} close  {} focus  {} dashboard  ·  Shift-PageUp/Down scroll",
+                "{} dashboard  {} focus  {} new  {} next  {} close  ·  Shift-PageUp/Down scroll",
+                bindings.label("dashboard"),
+                bindings.label("focus"),
                 bindings.label("new_shell"),
                 bindings.label("next_shell"),
-                bindings.label("close_shell"),
-                bindings.label("focus"),
-                bindings.label("dashboard")
+                bindings.label("close_shell")
             ),
         };
         terminals.notice.as_deref().map_or_else(
             || format!("  {shortcuts}"),
             |notice| {
                 let essentials = match focus {
-                    WorkspaceFocus::Sessions => "n session  s shell  x archive".to_owned(),
+                    WorkspaceFocus::Sessions => format!(
+                        "{} dashboard  {} focus  {} agent  {} shell  n new  s +shell  x archive",
+                        bindings.label("dashboard"),
+                        bindings.label("focus"),
+                        bindings.label("hide_shells"),
+                        bindings.label("maximize")
+                    ),
                     WorkspaceFocus::Agent => format!(
-                        "{} new shell  {} focus",
-                        bindings.label("new_shell"),
-                        bindings.label("focus")
+                        "{} dashboard  {} focus  {} new shell",
+                        bindings.label("dashboard"),
+                        bindings.label("focus"),
+                        bindings.label("new_shell")
                     ),
                     WorkspaceFocus::Shell => format!(
-                        "{} new  {} next  {} close",
+                        "{} dashboard  {} focus  {} new  {} next  {} close",
+                        bindings.label("dashboard"),
+                        bindings.label("focus"),
                         bindings.label("new_shell"),
                         bindings.label("next_shell"),
                         bindings.label("close_shell")
                     ),
                 };
-                format!("  {notice}  ·  {essentials}")
+                format!("  {essentials}  ·  {notice}")
             },
         )
     };
@@ -3398,7 +3398,9 @@ fn render_sidebar(
 ) -> io::Result<()> {
     let title = fit_text(" SESSIONS", layout.sidebar_width);
     write_at(stdout, 0, 0, format!("\x1b[1;36m{title}\x1b[0m").as_bytes())?;
-    let visible = usize::from(layout.status_row.saturating_sub(1));
+    render_sidebar_status_summary(stdout, chrome.status_counts, layout.sidebar_width)?;
+    let list_top = 3;
+    let visible = usize::from(layout.status_row.saturating_sub(list_top));
     let first = chrome.selected.saturating_add(1).saturating_sub(visible);
     for (row, (index, session)) in chrome
         .sessions
@@ -3412,7 +3414,7 @@ fn render_sidebar(
             let label = fit_text(session, layout.sidebar_width);
             write_at(
                 stdout,
-                row as u16 + 1,
+                row as u16 + list_top,
                 0,
                 format!("\x1b[1;36m{label}\x1b[0m").as_bytes(),
             )?;
@@ -3427,9 +3429,62 @@ fn render_sidebar(
         } else {
             style_sidebar_provider(&label, "")
         };
-        write_at(stdout, row as u16 + 1, 0, line.as_bytes())?;
+        write_at(stdout, row as u16 + list_top, 0, line.as_bytes())?;
     }
     render_vertical_line(stdout, layout.sidebar_width, 0, layout.status_row)
+}
+
+fn render_sidebar_status_summary(
+    stdout: &mut impl Write,
+    counts: (usize, usize, usize, usize),
+    width: u16,
+) -> io::Result<()> {
+    let (working, waiting, idle, failed) = counts;
+    let expanded = width >= 26;
+    let working = format!("● {working} {}", if expanded { "working" } else { "work" });
+    let waiting = format!("◐ {waiting} {}", if expanded { "waiting" } else { "wait" });
+    let idle = format!("○ {idle} idle");
+    let failed = format!("× {failed} {}", if expanded { "failed" } else { "fail" });
+    render_sidebar_status_pair(
+        stdout,
+        1,
+        width,
+        (&working, "\x1b[32m"),
+        (&waiting, "\x1b[33m"),
+    )?;
+    render_sidebar_status_pair(stdout, 2, width, (&idle, "\x1b[90m"), (&failed, "\x1b[31m"))
+}
+
+fn render_sidebar_status_pair(
+    stdout: &mut impl Write,
+    row: u16,
+    width: u16,
+    left: (&str, &str),
+    right: (&str, &str),
+) -> io::Result<()> {
+    write_at(stdout, row, 0, fit_text("", width).as_bytes())?;
+    let (left_text, left_style) = left;
+    let (right_text, right_style) = right;
+    let left_width = left_text.width().min(usize::from(width));
+    let right_width = right_text.width().min(usize::from(width));
+    let right_col = usize::from(width).saturating_sub(right_width);
+    let left = fit_text(left_text, left_width as u16);
+    write_at(
+        stdout,
+        row,
+        0,
+        format!("{left_style}{left}\x1b[0m").as_bytes(),
+    )?;
+    if right_col > left_width {
+        let right = fit_text(right_text, right_width as u16);
+        write_at(
+            stdout,
+            row,
+            right_col as u16,
+            format!("{right_style}{right}\x1b[0m").as_bytes(),
+        )?;
+    }
+    Ok(())
 }
 
 fn style_sidebar_provider(label: &str, base_style: &str) -> String {
@@ -4359,6 +4414,79 @@ mod tests {
     }
 
     #[test]
+    fn daemon_replay_preserves_screen_after_raw_history_rollover() {
+        let root = tempdir().unwrap();
+        let terminal = LocalTerminal::spawn(
+            &CommandSpec::new("/bin/sh", root.path()).arg("-c").arg(
+                "printf '\\033]0;'; dd if=/dev/zero bs=1024 count=132 2>/dev/null | tr '\\000' x; printf '\\007FINAL_SCREEN'; sleep 2",
+            ),
+            (40, 6),
+        )
+        .unwrap();
+
+        let start = Instant::now();
+        loop {
+            let state = terminal.output.lock().unwrap();
+            let rolled_over = state.base_offset > 0;
+            let reached_final = state
+                .raw
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+                .windows(b"FINAL_SCREEN".len())
+                .any(|window| window == b"FINAL_SCREEN");
+            drop(state);
+            if rolled_over && reached_final {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "terminal did not produce enough output to roll over raw history"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let (replay_start, _, replay, checkpoint, _) = terminal.output_since(0);
+        assert!(replay_start > 0);
+        let checkpoint = checkpoint.expect("rolled-over history must return a screen checkpoint");
+        let mut replay_parser = vt100::Parser::new(6, 40, CAPTURE_LINES);
+        let mut replay_scrollback = StatusBarScrollback::default();
+        process_terminal_output(&mut replay_parser, &mut replay_scrollback, &checkpoint);
+        process_terminal_output(&mut replay_parser, &mut replay_scrollback, &replay);
+
+        let expected = terminal.parser.lock().unwrap().screen().contents();
+        assert_eq!(replay_parser.screen().contents(), expected);
+    }
+
+    #[test]
+    fn terminal_checkpoint_restores_screen_modes_and_scroll_region() {
+        let mut parser = vt100::Parser::new(8, 40, CAPTURE_LINES);
+        let mut scrollback = StatusBarScrollback::default();
+        process_terminal_output(
+            &mut parser,
+            &mut scrollback,
+            b"\x1b[?1049h\x1b[2;7r\x1b[?1002h\x1b[?1006h\x1b[4;6Hcheckpoint",
+        );
+
+        let checkpoint = terminal_state_checkpoint(&parser, &scrollback);
+        let mut restored = vt100::Parser::new(8, 40, CAPTURE_LINES);
+        let mut restored_scrollback = StatusBarScrollback::default();
+        process_terminal_output(&mut restored, &mut restored_scrollback, &checkpoint);
+
+        assert_eq!(restored.screen().contents(), parser.screen().contents());
+        assert_eq!(
+            restored.screen().cursor_position(),
+            parser.screen().cursor_position()
+        );
+        assert!(restored.screen().alternate_screen());
+        assert_eq!(
+            restored.screen().mouse_protocol_mode(),
+            parser.screen().mouse_protocol_mode()
+        );
+        assert_eq!(restored_scrollback.scroll_region, Some((1, 6)));
+    }
+
+    #[test]
     fn remote_terminal_marks_a_lost_daemon_dead_so_resume_can_respawn() {
         let root = tempdir().unwrap();
         let terminal = RemoteTerminal {
@@ -4487,18 +4615,18 @@ mod tests {
                 WorkspaceFocus::Sessions,
             ),
             (
-                b"r",
-                WorkspaceCommand::RenameShell,
-                WorkspaceFocus::Sessions,
-            ),
-            (
                 b"m",
                 WorkspaceCommand::ToggleMaximize,
                 WorkspaceFocus::Sessions,
             ),
+            (
+                b"h",
+                WorkspaceCommand::ToggleShellArea,
+                WorkspaceFocus::Sessions,
+            ),
             (b"+", WorkspaceCommand::GrowShell, WorkspaceFocus::Sessions),
             (
-                b"-",
+                b"_",
                 WorkspaceCommand::ShrinkShell,
                 WorkspaceFocus::Sessions,
             ),
@@ -4886,6 +5014,7 @@ mod tests {
         let chrome = WorkspaceChrome {
             sessions: vec!["▾ repo".into(), "○ Cdx select output".into()],
             selected: 1,
+            status_counts: (0, 0, 1, 0),
             preview: vec!["preview".into()],
             notification: None,
         };
@@ -5124,6 +5253,7 @@ mod tests {
         let chrome = WorkspaceChrome {
             sessions: vec!["repo  codex".into()],
             selected: 0,
+            status_counts: (0, 0, 1, 0),
             preview: vec!["preview".into()],
             notification: None,
         };
@@ -5148,6 +5278,7 @@ mod tests {
         let chrome = WorkspaceChrome {
             sessions: vec!["▾ repo".into(), "○ Cdx current task".into()],
             selected: 1,
+            status_counts: (0, 0, 1, 0),
             preview: vec!["preview".into()],
             notification: None,
         };
@@ -5165,6 +5296,45 @@ mod tests {
             !output.contains("\x1b[30;46;1m SESSIONS"),
             "the section title must not look like the focused row"
         );
+    }
+
+    #[test]
+    fn workspace_sidebar_shows_live_status_counts_above_sessions() {
+        let chrome = WorkspaceChrome {
+            sessions: vec!["▾ repo".into(), "○ Cdx current task".into()],
+            selected: 1,
+            status_counts: (2, 1, 18, 3),
+            preview: vec!["preview".into()],
+            notification: None,
+        };
+
+        let mut narrow = Vec::new();
+        render_sidebar(
+            &mut narrow,
+            &chrome,
+            &WorkspaceLayout::new(120, 40, 0, 0),
+            false,
+        )
+        .unwrap();
+        let narrow = String::from_utf8_lossy(&narrow);
+        assert!(narrow.contains("\x1b[32m● 2 work\x1b[0m"));
+        assert!(narrow.contains("\x1b[33m◐ 1 wait\x1b[0m"));
+        assert!(narrow.contains("\x1b[90m○ 18 idle\x1b[0m"));
+        assert!(narrow.contains("\x1b[31m× 3 fail\x1b[0m"));
+        assert!(narrow.contains("\x1b[4;1H\x1b[1;36m▾ repo"));
+
+        let mut wide = Vec::new();
+        render_sidebar(
+            &mut wide,
+            &chrome,
+            &WorkspaceLayout::new(180, 40, 0, 0),
+            false,
+        )
+        .unwrap();
+        let wide = String::from_utf8_lossy(&wide);
+        assert!(wide.contains("● 2 working"));
+        assert!(wide.contains("◐ 1 waiting"));
+        assert!(wide.contains("× 3 failed"));
     }
 
     #[test]
@@ -5288,6 +5458,7 @@ mod tests {
         let chrome = WorkspaceChrome {
             sessions: vec!["▾ repo".into(), "Cdx fix focus".into()],
             selected: 1,
+            status_counts: (0, 0, 1, 0),
             preview: vec!["preview".into()],
             notification: None,
         };
@@ -5306,9 +5477,56 @@ mod tests {
         .unwrap();
         let output = String::from_utf8_lossy(&output);
         assert!(output.contains("AGENT · Cdx fix focus"));
+        assert!(output.contains("Ctrl-Q dashboard"));
         assert!(output.contains("Ctrl-\\ new shell"));
         assert!(output.contains("Ctrl-O focus"));
+        assert!(output.contains("Shift-PageUp/Down scroll"));
         assert!(output.contains("FOCUS AGENT"));
+    }
+
+    #[test]
+    fn focused_shell_footer_shows_all_direct_controls() {
+        let root = tempdir().unwrap();
+        let shell = ManagedTerminal::spawn(
+            &CommandSpec::new("/bin/sh", root.path())
+                .arg("-c")
+                .arg("printf 'shell ready\\n'; sleep 2"),
+            (80, 12),
+        )
+        .unwrap();
+        shell.wait_for_first_output(Duration::from_secs(1));
+        let terminals = SessionTerminals {
+            shells: vec![ShellPane::new(shell, "shell 1".into())],
+            ..SessionTerminals::default()
+        };
+        let chrome = WorkspaceChrome {
+            sessions: vec!["▾ repo".into(), "○ Cdx inspect shell".into()],
+            selected: 1,
+            status_counts: (0, 0, 1, 0),
+            preview: vec!["preview".into()],
+            notification: None,
+        };
+        let layout = WorkspaceLayout::new(160, 40, 1, 0);
+        let mut output = Vec::new();
+
+        render_workspace(
+            &mut output,
+            &terminals,
+            &chrome,
+            &layout,
+            WorkspaceFocus::Shell,
+            false,
+        )
+        .unwrap();
+        let output = String::from_utf8_lossy(&output);
+
+        assert!(output.contains("FOCUS SHELL 1/1"));
+        assert!(output.contains("Ctrl-Q dashboard"));
+        assert!(output.contains("Ctrl-O focus"));
+        assert!(output.contains("Ctrl-\\ new"));
+        assert!(output.contains("Ctrl-N next"));
+        assert!(output.contains("Ctrl-X close"));
+        assert!(output.contains("Shift-PageUp/Down scroll"));
     }
 
     #[test]
@@ -5320,6 +5538,7 @@ mod tests {
         let chrome = WorkspaceChrome {
             sessions: vec!["▾ repo".into(), "○ Cdx inspect session".into()],
             selected: 1,
+            status_counts: (0, 0, 1, 0),
             preview: vec!["preview".into()],
             notification: None,
         };
@@ -5339,11 +5558,56 @@ mod tests {
 
         assert!(output.contains("FOCUS SESSIONS"));
         assert!(output.contains("SESSION ARCHIVED"));
-        assert!(output.contains("n session"));
-        assert!(output.contains("s shell"));
+        assert!(output.contains("n new"));
+        assert!(output.contains("s +shell"));
         assert!(output.contains("x archive"));
+        assert!(output.contains("h agent"));
+        assert!(output.contains("m shell"));
         assert!(output.contains("\x1b[30;46;1m▸ ○ Cdx inspect sess"));
         assert!(!output.contains("\x1b[30;46;1m SESSIONS"));
+    }
+
+    #[test]
+    fn maximized_agent_renders_the_live_pty_instead_of_the_session_preview() {
+        let root = tempdir().unwrap();
+        let agent = ManagedTerminal::spawn(
+            &CommandSpec::new("/bin/sh", root.path())
+                .arg("-c")
+                .arg("printf 'LIVE AGENT SCREEN\\n'; sleep 2"),
+            (80, 24),
+        )
+        .unwrap();
+        agent.wait_for_first_output(Duration::from_secs(1));
+        let terminals = SessionTerminals {
+            agent: Some(agent),
+            maximized: Some(PaneTarget::Agent),
+            ..SessionTerminals::default()
+        };
+        let chrome = WorkspaceChrome {
+            sessions: vec!["▾ repo".into(), "Cdx current task".into()],
+            selected: 1,
+            status_counts: (0, 0, 1, 0),
+            preview: vec!["STALE SESSION PREVIEW".into()],
+            notification: None,
+        };
+        let layout = WorkspaceLayout::new(120, 40, 0, 0);
+        let mut output = Vec::new();
+
+        render_workspace(
+            &mut output,
+            &terminals,
+            &chrome,
+            &layout,
+            WorkspaceFocus::Agent,
+            false,
+        )
+        .unwrap();
+        let output = String::from_utf8_lossy(&output);
+
+        assert!(output.contains("AGENT · Cdx current task"));
+        assert!(output.contains("LIVE AGENT SCREEN"));
+        assert!(!output.contains("STALE SESSION PREVIEW"));
+        assert!(output.contains("FOCUS AGENT"));
     }
 
     #[test]
@@ -5365,6 +5629,7 @@ mod tests {
         let chrome = WorkspaceChrome {
             sessions: vec!["▾ repo".into(), "○ Cdx inspect history".into()],
             selected: 1,
+            status_counts: (0, 0, 1, 0),
             preview: vec!["preview".into()],
             notification: None,
         };
@@ -5453,6 +5718,7 @@ mod tests {
                 "! Cla claude task".into(),
             ],
             selected: 1,
+            status_counts: (0, 1, 1, 0),
             preview: vec!["preview".into()],
             notification: None,
         };

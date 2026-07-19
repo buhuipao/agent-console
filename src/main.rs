@@ -1206,10 +1206,10 @@ fn draw_text_dialog(frame: &mut Frame, app: &App, dialog: &app::TextDialog) {
             Line::from(value),
             Line::from(match dialog.kind {
                 TextDialogKind::Search => format!(
-                    "{} matches · Enter keep · Esc cancel",
+                    "{} matches · live filter · Enter keep · Esc cancel",
                     app.session_display_order().len()
                 ),
-                TextDialogKind::Alias => "Enter apply · Esc cancel".into(),
+                TextDialogKind::Alias => "Enter apply · empty clears · Esc cancel".into(),
             }),
         ])
         .block(
@@ -1224,35 +1224,58 @@ fn draw_text_dialog(frame: &mut Frame, app: &App, dialog: &app::TextDialog) {
 }
 
 fn draw_help(frame: &mut Frame, app: &App) {
-    let area = centered_rect(90, frame.area().height.saturating_sub(4), frame.area());
+    let area = centered_rect(98, frame.area().height.saturating_sub(2), frame.area());
     frame.render_widget(WidgetClear, area);
+    let title = format!(
+        " KEY BINDINGS · Esc / {} close ",
+        app.dashboard_key_label("help")
+    );
     let inner = Block::default()
-        .title(" KEY BINDINGS · Esc close ")
+        .title(title.clone())
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
         .inner(area);
     frame.render_widget(
         Block::default()
-            .title(" KEY BINDINGS · Esc close ")
+            .title(title)
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan)),
         area,
     );
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+        ])
         .split(inner);
     let all = app.help_lines();
-    let workspace = all
+    let direct = all
         .iter()
-        .position(|line| line.starts_with("WORKSPACE"))
+        .position(|line| line == "WORKSPACE · DIRECT")
         .unwrap_or(all.len());
-    let dashboard_lines = all[1..workspace]
+    let session_list = all
+        .iter()
+        .position(|line| line == "WORKSPACE · SESSION LIST")
+        .unwrap_or(all.len());
+    let viewport = all
+        .iter()
+        .position(|line| line == "WORKSPACE · CHILD VIEWPORT")
+        .unwrap_or(all.len());
+    let dashboard_lines = all[1..direct]
         .iter()
         .map(|line| Line::from(line.clone()))
         .collect::<Vec<_>>();
-    let workspace_lines = all
-        .get(workspace..)
+    let direct_lines = all
+        .get(direct.saturating_add(1)..session_list)
+        .unwrap_or_default()
+        .iter()
+        .chain(all.get(viewport..).unwrap_or_default())
+        .map(|line| Line::from(line.clone()))
+        .collect::<Vec<_>>();
+    let session_lines = all
+        .get(session_list.saturating_add(1)..viewport)
         .unwrap_or_default()
         .iter()
         .map(|line| Line::from(line.clone()))
@@ -1266,13 +1289,22 @@ fn draw_help(frame: &mut Frame, app: &App) {
         columns[0],
     );
     frame.render_widget(
-        Paragraph::new(workspace_lines).block(
+        Paragraph::new(direct_lines).block(
             Block::default()
-                .title(" WORKSPACE ")
+                .title(" WORKSPACE · DIRECT ")
                 .borders(Borders::LEFT)
                 .padding(Padding::new(1, 1, 0, 0)),
         ),
         columns[1],
+    );
+    frame.render_widget(
+        Paragraph::new(session_lines).block(
+            Block::default()
+                .title(" WORKSPACE · SESSION LIST ")
+                .borders(Borders::LEFT)
+                .padding(Padding::new(1, 1, 0, 0)),
+        ),
+        columns[2],
     );
 }
 
@@ -1429,18 +1461,18 @@ fn draw_new_session_dialog(frame: &mut Frame, dialog: &app::NewSessionDialog) {
     };
     let guidance = if dialog.field == DialogField::Cwd {
         if dialog.cwd_replace_on_input {
-            "Workspace selected · type/paste to replace · Backspace clear"
+            "type/paste replace · arrows edit · Tab field · Enter start · Esc cancel"
         } else if dialog.cwd_cursor < dialog.cwd.chars().count() {
-            "←/→ move · Home/End · Backspace/Delete edit · Tab next field · Enter start"
+            "arrows move · Bksp/Del edit · Tab field · Enter start · Esc cancel"
         } else if dialog.cwd_completion_accepted {
-            "Completed · ←/→ move · keep typing for child · Tab provider · Enter start"
+            "Completed · type child or Tab provider · Enter start · Esc cancel"
         } else if !completions.is_empty() {
-            "←/→ move · ↑/↓ choose · Tab complete · Enter start"
+            "↑/↓ choose · Tab complete · Enter start · Esc cancel"
         } else {
-            "←/→ move · Home/End · Backspace/Delete edit · Enter validates"
+            "type/paste path · arrows move · Enter validate · Esc cancel"
         }
     } else {
-        "Tab field · ←/→ or h/l change · Enter start · Esc cancel"
+        "Tab/Shift-Tab field · arrows/h/l change · Enter start · Esc cancel"
     };
     let mut workspace_line = vec![Span::styled(
         "workspace ",
@@ -1890,10 +1922,133 @@ mod tests {
 
         assert!(rendered.contains("WORKSPACE · DIRECT"));
         assert!(rendered.contains("WORKSPACE · SESSION LIST"));
-        assert!(rendered.contains("new_shell"));
+        assert!(rendered.contains("select session"));
+        assert!(rendered.contains("open agent"));
+        assert!(rendered.contains("focus last shell"));
+        assert!(rendered.contains("focus agent"));
+        assert!(rendered.contains("CHILD VIEWPORT"));
+        assert!(!rendered.contains("hide_shells"));
         assert!(rendered.contains("Ctrl-\\"));
         assert!(!rendered.contains("Ctrl-T"));
         assert!(rendered.contains("Ctrl-X"));
+        assert!(rendered.contains("Esc / ? close"));
+    }
+
+    #[test]
+    fn help_panel_keeps_every_group_visible_at_a_standard_terminal_size() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::test_fixture();
+        app.help_open = true;
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("force takeover"));
+        assert!(rendered.contains("sidebar selection"));
+        assert!(rendered.contains("CHILD VIEWPORT"));
+        assert!(rendered.contains("scroll pointed pane"));
+        assert!(rendered.contains("select / copy text"));
+        assert!(rendered.contains("copy command output"));
+        assert!(rendered.contains("select shell"));
+    }
+
+    #[test]
+    fn search_and_new_session_dialogs_show_their_contextual_controls() {
+        let backend = TestBackend::new(140, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::test_fixture();
+
+        app.open_search_dialog();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let search = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(search.contains("live filter"));
+        assert!(search.contains("Enter keep"));
+        assert!(search.contains("Esc cancel"));
+
+        app.cancel_text_dialog();
+        app.open_alias_dialog();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let alias = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(alias.contains("SESSION ALIAS"));
+        assert!(alias.contains("Enter apply"));
+        assert!(alias.contains("empty clears"));
+        assert!(alias.contains("Esc cancel"));
+
+        app.cancel_text_dialog();
+        app.open_new_dialog();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let provider = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(provider.contains("Tab/Shift-Tab field"));
+        assert!(provider.contains("Enter start"));
+        assert!(provider.contains("Esc cancel"));
+
+        app.dialog.as_mut().unwrap().field = DialogField::Cwd;
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let workspace = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(workspace.contains("Tab field"));
+        assert!(workspace.contains("Enter start"));
+        assert!(workspace.contains("Esc cancel"));
+    }
+
+    #[test]
+    fn dashboard_footer_shows_all_primary_controls() {
+        let backend = TestBackend::new(180, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let app = App::test_fixture();
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        for label in [
+            "select",
+            "agent",
+            "shell",
+            "new",
+            "alert",
+            "search",
+            "archive/restore",
+            "help",
+            "quit",
+        ] {
+            assert!(rendered.contains(label), "missing dashboard hint: {label}");
+        }
     }
 
     #[test]

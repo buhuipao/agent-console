@@ -43,11 +43,24 @@ proc expect_text {pattern label code} {
     }
 }
 
+proc expect_text_without_garble {pattern label code} {
+    global spawn_id
+    expect {
+        -i $spawn_id -re {x{40}} { fail "$label (truncated OSC rendered as text)" $code }
+        -i $spawn_id -re $pattern {
+            puts "ok $label"
+            flush stdout
+        }
+        -i $spawn_id timeout { fail $label $code }
+        -i $spawn_id eof { fail "$label (unexpected exit)" $code }
+    }
+}
+
 spawn /bin/sh -c [format {stty rows 30 columns 120; exec "%s"} $binary]
 expect_text {Agent Console} first-dashboard 160
 send -- "s"
 expect_text {FOCUS SHELL 1/1} first-shell 161
-send -- "i=1; while true; do echo daemon-survives-\$i; i=\$((i+1)); sleep 0.1; done\r"
+send -- "printf '\\033]0;'; dd if=/dev/zero bs=1024 count=132 2>/dev/null | tr '\\000' x; printf '\\007'; i=1; while true; do echo daemon-survives-\$i; i=\$((i+1)); sleep 0.1; done\r"
 expect_text {daemon-survives-[2-9]} shell-running 162
 
 exec kill -KILL [exp_pid -i $spawn_id]
@@ -63,7 +76,7 @@ after 500
 spawn /bin/sh -c [format {stty rows 30 columns 120; exec "%s"} $binary]
 expect_text {Agent Console} second-dashboard 164
 send -- "\r"
-expect_text {FOCUS AGENT} reconnected-agent 165
+expect_text_without_garble {FOCUS AGENT} reconnected-agent 165
 send -- "\017"
 expect_text {daemon-survives-[0-9]+} shell-output-survived 166
 expect_text {FOCUS SHELL 1/1} reconnected-shell 167

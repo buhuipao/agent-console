@@ -106,7 +106,11 @@ dashboard = ["ctrl-q"]
 `[keys.dashboard]` and `[keys.workspace]` replace the defaults one action at a
 time. Unsupported labels, unknown actions, empty bindings, and duplicate
 effective keys are startup errors. Press `?` to see the complete effective
-binding set. Workspace labels support a printable character, `ctrl-<char>`,
+binding set. Help uses three columns for Dashboard, direct Workspace, and
+Session-list controls; child-viewport keys and mouse gestures are included in
+the same panel. Modal dialogs show their own edit, commit, and cancel controls,
+while the Dashboard and Workspace footers keep only the relevant high-frequency
+subset visible. Workspace labels support a printable character, `ctrl-<char>`,
 `alt-<char>`, optional Ctrl-Up/Down, Shift-PageUp/Down, and Shift-End.
 Printable Workspace actions are active only in `FOCUS SESSIONS`; agent and
 shell panes receive those characters unchanged. Ctrl shortcuts are
@@ -124,7 +128,7 @@ a Shell from either child pane. The default keymap reserves no function keys.
 | `n` | Start a new Codex or Claude session |
 | `/` | Search by alias, task, path, branch, session ID, provider, workspace, or status; filters live while typing |
 | `x` | Archive the selected session, or restore it from the `Archived` group |
-| `?` | Show effective Dashboard and Workspace key bindings |
+| `?` | Show effective Dashboard, Workspace, viewport, and mouse bindings |
 | `a` | Jump to the next unread waiting/failed alert |
 | `q` | Quit |
 
@@ -140,7 +144,9 @@ an adaptive overview uses at most three cards per row. Every card has a short
 status title and a bright `TASK` row; its priority row is `NEEDS YOU`,
 `BLOCKER`, `NOW`, or `LAST`, with fallback text when a summary is missing.
 
-In the new-session dialog, `Tab` and `Shift-Tab` move between provider and
+Search filters live and labels its `Enter`/`Esc` behavior in the dialog. The
+alias dialog likewise explains apply, clear, and cancel. In the new-session
+dialog, `Tab` and `Shift-Tab` move between provider and
 workspace. Left/Right or `h`/`l` changes provider. The workspace starts as the dashboard directory, but focusing it
 selects the whole value: typing or pasting immediately replaces the default.
 Left/Right moves the workspace caret, Home/End jumps to either edge,
@@ -153,7 +159,10 @@ provider. Files are excluded.
 Inside a session workspace, the session list stays on the left, the agent is
 on the upper right, and shell panes share the lower right. The shell list
 remains visible when there are multiple shells. Provider labels keep the same
-Codex cyan and Claude orange colors used by the Dashboard.
+Codex cyan and Claude orange colors used by the Dashboard. A live two-line
+summary above the session list shows the current working, waiting, idle, and
+failed totals, so background sessions needing attention remain visible while
+another agent is open.
 
 Workspace input is focus-aware; there is no separate command or Vim mode.
 Printable keys, `Esc`, function keys, `Ctrl-Enter`, and unrelated Ctrl keys go
@@ -189,9 +198,9 @@ When the Session list has focus:
 | `n` | Open the new-session dialog, defaulted to the selected workspace |
 | `s` | Add and focus a shell for the selected session |
 | `1` … `9` | Focus a numbered shell |
-| `r` | Rename the selected shell |
-| `m` | Maximize the selected shell (or agent when no shell exists) |
-| `+` / `-` | Grow or shrink the shell area |
+| `m` | Maximize and focus the previously selected Shell |
+| `h` | Start/resume, maximize, and focus the selected Agent |
+| `+` / `_` | Grow or shrink the shell area |
 | `y` | Copy output from the latest submitted shell command |
 | `x` | Archive or restore the selected session |
 
@@ -218,10 +227,10 @@ agent. Browsing therefore remains inside the Workspace and has no provider
 startup delay.
 
 Agent Console remembers the transcript fingerprint associated with each
-managed Agent. If the same conversation is later advanced by another terminal,
-an idle/failed stale Agent is restarted and resumed on explicit activation. A
-working/waiting Agent is preserved and reported as a conflict rather than
-being terminated.
+managed Agent. A live daemon-owned Agent is authoritative and is reattached
+even when its transcript advanced while the Dashboard was visible; re-entry
+never restarts that provider. If no live PTY remains, activation resumes the
+provider from the latest local transcript.
 
 Default `Alt-*` controls are not reserved. A lone `Esc` is forwarded after only
 the short delay needed to distinguish a terminal escape sequence.
@@ -275,6 +284,13 @@ only detaches the view; it does not terminate those processes. Starting Agent
 Console again and opening the same session reconnects the agent and all live
 shells, including retained terminal output. Closing a shell explicitly still
 terminates that shell.
+
+Raw PTY history is bounded, but reaching that bound never kills or restarts the
+agent/shell process. The daemon keeps parsing the live PTY and, when a
+reconnecting view has fallen behind the byte tail, restores an authoritative
+terminal-screen checkpoint rather than replaying a truncated ANSI sequence.
+This keeps full-screen Codex and Claude interfaces intact after high-volume
+output.
 
 The daemon grants one Workspace lease per session. A competing TUI is refused
 with the current owner PID and instance ID. Press `t` on the dashboard only
@@ -364,7 +380,7 @@ launched and owns.
 
 ## Release automation
 
-`.github/workflows/release.yml` validates that a pushed tag such as `v0.0.4`
+`.github/workflows/release.yml` validates that a pushed tag such as `v0.0.5`
 matches the version in `Cargo.toml`, runs formatting/lint/tests, builds all five
 native packages, generates `SHA256SUMS`, and creates the GitHub Release. The
 workflow can also be started manually with publishing disabled to exercise the

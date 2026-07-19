@@ -252,17 +252,7 @@ impl App {
     }
 
     pub fn status_counts(&self) -> (usize, usize, usize, usize) {
-        self.sessions
-            .iter()
-            .fold((0, 0, 0, 0), |mut counts, session| {
-                match session.status {
-                    SessionStatus::Working => counts.0 += 1,
-                    SessionStatus::Waiting => counts.1 += 1,
-                    SessionStatus::Idle => counts.2 += 1,
-                    SessionStatus::Failed => counts.3 += 1,
-                }
-                counts
-            })
+        session_status_counts(&self.sessions)
     }
 
     pub fn open_new_dialog(&mut self) {
@@ -514,11 +504,15 @@ impl App {
         current_exe: &Path,
         force_takeover: bool,
     ) -> io::Result<()> {
-        let session = self.prepare_selected_agent(current_exe)?;
+        let session = self.prepare_agent_entry(current_exe)?;
         let touched =
             self.run_workspace(current_exe, session, WorkspaceFocus::Agent, force_takeover)?;
         self.finish_workspace(&touched)?;
         Ok(())
+    }
+
+    fn prepare_agent_entry(&mut self, current_exe: &Path) -> io::Result<Session> {
+        self.activate_workspace_agent(current_exe)
     }
 
     pub fn enter_selected_shell(&mut self, current_exe: &Path) -> io::Result<()> {
@@ -568,6 +562,10 @@ impl App {
                             focus = WorkspaceFocus::Sessions;
                         }
                     }
+                }
+                WorkspaceExit::FocusShell => {
+                    session = self.prepare_selected_view(current_exe)?;
+                    focus = WorkspaceFocus::Shell;
                 }
                 WorkspaceExit::NewSession => {
                     self.open_new_dialog_at(&session.cwd);
@@ -634,7 +632,7 @@ impl App {
         if focus == WorkspaceFocus::Sessions {
             return self.prepare_selected_view(current_exe);
         }
-        match self.prepare_selected_agent(current_exe) {
+        match self.activate_workspace_agent(current_exe) {
             Ok(session) => Ok(session),
             Err(error) => {
                 let session = self.prepare_selected_view(current_exe)?;
@@ -1124,6 +1122,7 @@ impl RuntimeState {
         WorkspaceChrome {
             sessions: lines,
             selected: selected_row,
+            status_counts: session_status_counts(&self.sessions),
             preview,
             notification: self.active_notification().map(|notification| {
                 let title = self
@@ -1474,6 +1473,18 @@ impl RuntimeState {
     }
 }
 
+fn session_status_counts(sessions: &[Session]) -> (usize, usize, usize, usize) {
+    sessions.iter().fold((0, 0, 0, 0), |mut counts, session| {
+        match session.status {
+            SessionStatus::Working => counts.0 += 1,
+            SessionStatus::Waiting => counts.1 += 1,
+            SessionStatus::Idle => counts.2 += 1,
+            SessionStatus::Failed => counts.3 += 1,
+        }
+        counts
+    })
+}
+
 impl App {
     #[cfg(test)]
     pub fn test_fixture() -> Self {
@@ -1738,6 +1749,7 @@ mod tests {
             ]
         );
         assert_eq!(chrome.selected, 1);
+        assert_eq!(chrome.status_counts, (1, 1, 0, 1));
     }
 
     #[test]
@@ -2049,6 +2061,62 @@ mod tests {
             fs::read_to_string(&launches).unwrap(),
             "xx",
             "an already-running legacy agent must be discovered, classified stale, and restarted"
+        );
+    }
+
+    #[test]
+    fn dashboard_entry_reuses_a_live_managed_agent_after_its_transcript_changes() {
+        let root = tempdir().unwrap();
+        let launches = root.path().join("launches");
+        let provider = root.path().join("fake-codex");
+        fs::write(
+            &provider,
+            format!(
+                "#!/bin/sh\nprintf x >> '{}'\nprintf 'fake agent ready\\n'\nexec /bin/cat\n",
+                launches.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&provider).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&provider, permissions).unwrap();
+        }
+        let config = AgentConsoleConfig::parse(
+            &format!("[providers]\ncodex = [\"{}\"]\n", provider.display()),
+            Path::new("config.toml"),
+        )
+        .unwrap();
+        let mut session = fixture_session("codex:live");
+        session.status = SessionStatus::Working;
+        session.transcript_path = Some(root.path().join("session.jsonl"));
+        session.transcript_fingerprint = "new-fingerprint".into();
+        let mut terminals = TerminalManager::new_local(config.clone());
+        terminals
+            .ensure_agent(&session, Path::new("/tmp/agent-console"), false, (80, 24))
+            .unwrap()
+            .wait_for_first_output(Duration::from_secs(1));
+
+        let mut app = App::test_fixture();
+        app.runtime.sessions = vec![session];
+        app.runtime.selected = 0;
+        app.runtime
+            .store
+            .set_managed_transcript_fingerprint("codex:live", Some("old-fingerprint".into()));
+        app.terminals = terminals;
+        app.config = config;
+
+        let selected = app
+            .prepare_agent_entry(Path::new("/tmp/agent-console"))
+            .unwrap();
+
+        assert_eq!(selected.key, "codex:live");
+        assert_eq!(
+            fs::read_to_string(&launches).unwrap(),
+            "x",
+            "re-entering must attach the existing PTY instead of restarting the provider"
         );
     }
 

@@ -146,7 +146,12 @@ the same bytes in agent/shell focus are forwarded. Focus, Dashboard, alert, and
 new-Shell chords are global. Next-Shell and close-Shell chords are active only
 in Shell focus and are forwarded in Agent focus. The input router and all
 displayed control hints use the same resolved binding map. The `help` action
-groups direct, Session-list, and child-viewport bindings; `Esc` closes a modal
+opens a three-column panel that lists all effective Dashboard and direct
+Workspace bindings, fixed and configurable Session-list controls,
+child-viewport controls, and mouse gestures using user-facing action names.
+Context footers show the relevant high-frequency subset rather than repeating
+the whole panel. Every modal shows its edit/commit/cancel behavior in place;
+the configured Help key and `Esc` both close Help. `Esc` closes another modal
 but is never a Workspace command while a child has focus.
 
 ## 6. Session identity
@@ -299,8 +304,10 @@ Entering a workspace:
 
 1. Reuse the application's alternate screen. Session navigation must never
    reveal or redraw the Dashboard as an intermediate frame.
-2. Keep the session list visible on the left. Its `Cdx` and `Cla` labels use
-   the same provider colors as the Dashboard.
+2. Keep the session list visible on the left. A two-line summary immediately
+   below its heading continuously shows working, waiting, idle, and failed
+   totals using the Dashboard status colors. Its `Cdx` and `Cla` labels use the
+   same provider colors as the Dashboard.
 3. Render the agent PTY in the upper-right pane.
 4. Render up to three shell PTYs side by side in the lower-right pane and all
    shell identities in a list at the far right.
@@ -324,8 +331,11 @@ Entering a workspace:
 8. Session-list focus is navigation, not a separate command mode. Up/Down or
    `j`/`k` selects sessions; Enter activates the selected Agent; `n` opens a
    new-session dialog using the selected workspace; `s` creates a Shell;
-   `r` renames it; `m` maximizes it; `+`/`-` resize the shell area; `y` copies
-   its current command block; digits select a numbered shell; and `x`
+   `m` maximizes and focuses the previously selected Shell; `h` starts/resumes,
+   maximizes, and focuses the selected Agent. Returning to Session-list focus
+   restores the regular Agent/Shell split; `+`/`_`
+   resize the shell area; `y` copies its current command block; digits select a
+   numbered shell; and `x`
    archives/restores the selected session.
 9. Returning to Dashboard forces one redraw; switching sessions inside the
    Workspace does not leave the alternate screen.
@@ -341,15 +351,19 @@ matching terminal-emulator behavior used by Claude Code.
 
 The detached PTY daemon owns managed agent and shell children. TUI exit or
 crash detaches without terminating them; a later TUI reconnects by stable
-session identity and restores retained output. Only an explicit close action
-terminates a shell.
+session identity and restores retained output. If a client falls behind the
+bounded raw-output tail, the daemon sends an authoritative VT screen
+checkpoint instead of replaying bytes from the middle of an ANSI control
+sequence. Crossing the raw-output bound never terminates or restarts a child;
+only an explicit close action terminates a shell.
 
 The persisted managed transcript fingerprint records the transcript version
 last associated with a Console-owned Agent. If discovery observes a different
-fingerprint, Session preview always shows the new transcript. Explicitly
-activating an idle/failed stale Agent terminates that stale PTY and resumes the
-same provider session from current history. A working/waiting stale Agent is
-never terminated automatically; keep preview focus and surface the conflict.
+fingerprint, Session preview always shows the new transcript. A live
+daemon-owned Agent is authoritative: Dashboard Enter, Workspace Enter, and
+direct Agent focus reattach that PTY without restarting it or treating its own
+new transcript output as an external conflict. If no live PTY remains,
+activation resumes the provider from current history.
 
 ## 10. Shell capture and injection
 
@@ -481,8 +495,9 @@ Ctrl-N/X         Next / close Shell (Shell focus only; forwarded in Agent)
 j/k or Up/Down   Select session (FOCUS SESSIONS only)
 n/s              New session / add Shell (FOCUS SESSIONS only)
 1..9             Select shell (FOCUS SESSIONS only)
-r                Rename shell (FOCUS SESSIONS only)
-m or +/-         Maximize / resize shell area (FOCUS SESSIONS only)
+m                Maximize and focus last-selected Shell (FOCUS SESSIONS only)
+h                Maximize and focus selected Agent (FOCUS SESSIONS only)
++/_              Resize shell area (FOCUS SESSIONS only)
 y/x              Copy command block / archive session (FOCUS SESSIONS only)
 ```
 
@@ -514,10 +529,11 @@ selected card keeps a background and marker so selection remains visible when
 the grid scrolls.
 
 Search matches user alias, summarized task, path, branch, provider session ID,
-provider, workspace, and status. Search filters the session list after every typed character or
-Backspace; Enter keeps the current query and Esc restores the query and
-selection from before the search dialog opened. The Dashboard session list responds to the mouse
-wheel. In Workspace, the mouse wheel scrolls the independent agent or shell
+provider, workspace, and status. Search filters the session list after every
+typed character or Backspace; the dialog explicitly labels live filtering,
+Enter keeping the current query, and Esc restoring the query and selection
+from before the search dialog opened. The Dashboard session list responds to
+the mouse wheel. In Workspace, the mouse wheel scrolls the independent agent or shell
 viewport under the pointer using either SGR or legacy X10 mouse input.
 Aliases and archive state are persistent user metadata. Archive moves a
 session into one dimmed `Archived` group after all active workspace groups.
@@ -552,7 +568,10 @@ active for child-directory completion. Right remains a caret key. The next Tab
 returns to provider. Preserve a leading `~/` in displayed completions. Enter
 validates that cwd is a directory, creates the provider session, closes the
 dialog, selects the session, and immediately enters its native terminal.
-Validation errors stay in the dialog.
+Validation errors stay in the dialog. Guidance on the last row changes with
+the active field/completion state and always exposes field movement, editing or
+completion, Enter, and Esc. The search and alias dialogs similarly expose live
+filter/apply and cancel behavior.
 
 ## 14. Failure behavior
 

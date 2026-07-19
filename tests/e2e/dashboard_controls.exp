@@ -98,7 +98,7 @@ after 100
 send -- "n"
 expect_text {NEW SESSION} new-dialog 146
 send -- "\t"
-expect_text {type/paste} new-dialog-workspace 168
+expect_text {Enter start.*Esc cancel} new-dialog-workspace 168
 send -- "${workspace_partial}x"
 expect_text {project-com.*x} new-dialog-cursor-seed 169
 send -- "\033\[H"
@@ -110,7 +110,7 @@ send -- "\033\[D"
 send -- "\033\[3~"
 expect_text {project-complete/} new-dialog-workspace-suggestion 169
 send -- "\t"
-expect_text {Tab provider} new-dialog-workspace-completed 169
+expect_text {Completed} new-dialog-workspace-completed 169
 send -- "\t"
 send -- "\033\[C"
 expect_text {laude >} new-dialog-provider 171
