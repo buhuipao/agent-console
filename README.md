@@ -37,19 +37,20 @@ contains five native packages:
   `agent-console-v<version>-x86_64-unknown-linux-gnu.tar.gz` and
   `agent-console-v<version>-aarch64-unknown-linux-gnu.tar.gz`
 - macOS Intel and Apple Silicon:
-  `agent-console-v<version>-x86_64-apple-darwin.tar.gz` and
-  `agent-console-v<version>-aarch64-apple-darwin.tar.gz`
+  `agent-console-v<version>-x86_64-apple-darwin.dmg` and
+  `agent-console-v<version>-aarch64-apple-darwin.dmg`
 
-Extract the matching archive and place `agent-console` (or
-`agent-console.exe`) on `PATH`. Verify the download against the release's
-`SHA256SUMS` file.
+Open the matching macOS DMG, then copy `agent-console` to a directory on
+`PATH`. On Linux and Windows, extract the matching archive and place
+`agent-console` (or `agent-console.exe`) on `PATH`. Verify the download against
+the release's `SHA256SUMS` file.
 
 Starting with v0.0.6, published macOS binaries are signed with the
 `Developer ID Application` identity for Apple team `69VD3J69AA`, use the
-hardened runtime and a secure timestamp, and are accepted by Apple's notary
-service before packaging. The release remains a normal command-line `tar.gz`;
-macOS retrieves the standalone binary's notarization ticket online on first
-launch because Apple cannot staple a ticket directly to a bare executable.
+hardened runtime and a secure timestamp. Starting with v0.0.7, the
+final macOS DMG is also signed, accepted by Apple's notary service, and carries
+a stapled notarization ticket so Gatekeeper does not need an online ticket
+lookup when the image is opened.
 
 ## Run
 
@@ -424,12 +425,9 @@ base64 -i AuthKey_Z665697VSB.p8 | pbcopy
 
 The first macOS release step imports the `.p12` into an ephemeral keychain,
 selects only a `Developer ID Application` identity belonging to the expected
-team, signs the Rust executable, and deletes the keychain. The next step submits
-a temporary ZIP through `notarytool`, requires an explicit `Accepted` result,
-verifies the embedded signature with `codesign`, and only then creates the
-public `tar.gz`. `spctl --type execute` is deliberately not used as a CI gate:
-that command rejects standalone command-line Mach-O files as “not an app” even
-when their Developer ID signature and notarization ticket are valid. The
-release smoke test instead executes a notarized binary carrying a quarantine
-attribute, which exercises the actual Gatekeeper launch path. Non-publishing
+team, and signs the Rust executable. The workflow then creates the public DMG,
+signs that final image, submits the image itself through `notarytool`, requires
+an explicit `Accepted` result, staples and validates its ticket, and assesses
+the image with Gatekeeper's `context:primary-signature` policy. Publishing fails
+unless the public DMG reports `Notarization Ticket=stapled`. Non-publishing
 packaging dry runs remain unsigned and do not require Apple secrets.
