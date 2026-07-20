@@ -34,4 +34,6 @@ a prompt.
 
 Every pushed semantic version tag is built on a native GitHub-hosted runner.
 Packages contain the platform binary and README; the release also contains one
-`SHA256SUMS` file covering all archives.
+`SHA256SUMS` file covering all archives. Starting with v0.0.6, both macOS
+targets are Developer ID signed and notarized before their archives are
+created; non-publishing packaging dry runs intentionally remain unsigned.

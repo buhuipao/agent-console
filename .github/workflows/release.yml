@@ -24,6 +24,14 @@ concurrency:
   group: release-${{ github.ref }}-${{ inputs.tag }}
   cancel-in-progress: false
 
+# These identifiers match the Apple team and App Store Connect API key used by
+# NextPlan. The certificate private key and API private key remain GitHub
+# Actions secrets; see README.md for their exact names and setup.
+env:
+  APPLE_TEAM_ID: 69VD3J69AA
+  APPLE_NOTARY_KEY_ID: Z665697VSB
+  APPLE_NOTARY_ISSUER_ID: d2af6eee-fb40-4389-ba1c-23320b32bd7d
+
 jobs:
   prepare:
     runs-on: ubuntu-24.04
@@ -126,6 +134,102 @@ jobs:
       - name: Build
         shell: bash
         run: cargo build --locked --release --target "${{ matrix.target }}"
+      - name: Import Developer ID Application identity
+        if: runner.os == 'macOS' && needs.prepare.outputs.publish == 'true'
+        shell: bash
+        env:
+          APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_APPLICATION_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64"
+          test -n "$APPLE_DEVELOPER_ID_APPLICATION_PASSWORD"
+
+          certificate_path="$RUNNER_TEMP/developer-id-application.p12"
+          keychain_path="$RUNNER_TEMP/agent-console-signing.keychain-db"
+          keychain_password="$(uuidgen)"
+
+          printf '%s' "$APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64" \
+            | base64 --decode > "$certificate_path"
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$certificate_path" \
+            -k "$keychain_path" \
+            -P "$APPLE_DEVELOPER_ID_APPLICATION_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain_path"
+          security list-keychains -d user -s "$keychain_path"
+
+          signing_identity="$(
+            security find-identity -v -p codesigning "$keychain_path" \
+              | awk -v team="$APPLE_TEAM_ID" \
+                'index($0, "Developer ID Application:") && index($0, "(" team ")") { print $2; exit }'
+          )"
+          test -n "$signing_identity"
+          echo "APPLE_SIGNING_IDENTITY=$signing_identity" >> "$GITHUB_ENV"
+
+          rm -f "$certificate_path"
+      - name: Sign and notarize macOS binary
+        if: runner.os == 'macOS' && needs.prepare.outputs.publish == 'true'
+        shell: bash
+        env:
+          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          test -n "$APPLE_NOTARY_KEY_P8_BASE64"
+
+          binary="target/${TARGET}/release/agent-console"
+          notary_key="$RUNNER_TEMP/AuthKey_${APPLE_NOTARY_KEY_ID}.p8"
+          submission="$RUNNER_TEMP/agent-console-${TARGET}-notarization.zip"
+
+          codesign \
+            --force \
+            --options runtime \
+            --timestamp \
+            --identifier com.buhuipao.agent-console \
+            --sign "$APPLE_SIGNING_IDENTITY" \
+            "$binary"
+          codesign --verify --strict --verbose=2 "$binary"
+
+          printf '%s' "$APPLE_NOTARY_KEY_P8_BASE64" \
+            | base64 --decode > "$notary_key"
+          chmod 600 "$notary_key"
+          ditto -c -k --keepParent "$binary" "$submission"
+          notary_result="$(
+            xcrun notarytool submit "$submission" \
+              --key "$notary_key" \
+              --key-id "$APPLE_NOTARY_KEY_ID" \
+              --issuer "$APPLE_NOTARY_ISSUER_ID" \
+              --wait \
+              --output-format json
+          )"
+          printf '%s\n' "$notary_result"
+          notary_status="$(
+            printf '%s' "$notary_result" \
+              | plutil -extract status raw -o - -
+          )"
+          if [[ "$notary_status" != "Accepted" ]]; then
+            echo "Apple notarization did not finish as Accepted: $notary_status" >&2
+            exit 1
+          fi
+
+          codesign --verify --strict --verbose=2 "$binary"
+          quarantine_timestamp="$(printf '%x' "$(date +%s)")"
+          xattr -w \
+            com.apple.quarantine \
+            "0081;${quarantine_timestamp};AgentConsoleReleaseCI;" \
+            "$binary"
+          printf '%s' '{"session_id":"gatekeeper-release-probe"}' \
+            | AGENT_CONSOLE_STATE_DIR="$RUNNER_TEMP/agent-console-gatekeeper-state" \
+              "$binary" hook codex
+          xattr -d com.apple.quarantine "$binary"
+          rm -f "$notary_key" "$submission"
       - name: Package Unix binary
         if: matrix.archive == 'tar.gz'
         shell: bash
@@ -155,6 +259,19 @@ jobs:
           Copy-Item "README.md" "$directory/README.md"
           Compress-Archive -Path "$directory/*" -DestinationPath "dist/$archive.zip"
           Remove-Item -Recurse -Force $directory
+      - name: Remove temporary signing keychain
+        if: always() && runner.os == 'macOS' && needs.prepare.outputs.publish == 'true'
+        shell: bash
+        run: |
+          keychain_path="$RUNNER_TEMP/agent-console-signing.keychain-db"
+          if [[ -f "$keychain_path" ]]; then
+            security delete-keychain "$keychain_path"
+          fi
+          rm -f \
+            "$RUNNER_TEMP/developer-id-application.p12" \
+            "$RUNNER_TEMP/AuthKey_${APPLE_NOTARY_KEY_ID}.p8" \
+            "$RUNNER_TEMP/agent-console-${{ matrix.target }}-notarization.zip"
+          rm -rf "$RUNNER_TEMP/agent-console-gatekeeper-state"
       - name: Upload package
         uses: actions/upload-artifact@v4
         with:

@@ -1,2 +1,4 @@
 /target/
 /tests/fixtures/e2e-home/.zsh_history
+*.p12
+AuthKey_*.p8

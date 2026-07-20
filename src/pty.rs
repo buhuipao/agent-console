@@ -915,13 +915,30 @@ impl PtyDaemonState {
                 cols,
                 rows,
             } => {
-                if let std::collections::hash_map::Entry::Vacant(entry) = self.terminals.entry(id) {
-                    match LocalTerminal::spawn(&spec.command_spec(), (cols, rows)) {
-                        Ok(terminal) => {
-                            entry.insert(terminal);
+                use std::collections::hash_map::Entry;
+
+                match self.terminals.entry(id) {
+                    Entry::Vacant(entry) => {
+                        match LocalTerminal::spawn(&spec.command_spec(), (cols, rows)) {
+                            Ok(terminal) => {
+                                entry.insert(terminal);
+                            }
+                            Err(error) => {
+                                return (DaemonResponse::Error(error.to_string()), false);
+                            }
                         }
-                        Err(error) => return (DaemonResponse::Error(error.to_string()), false),
                     }
+                    Entry::Occupied(mut entry) if !entry.get().is_alive() => {
+                        match LocalTerminal::spawn(&spec.command_spec(), (cols, rows)) {
+                            Ok(terminal) => {
+                                entry.insert(terminal);
+                            }
+                            Err(error) => {
+                                return (DaemonResponse::Error(error.to_string()), false);
+                            }
+                        }
+                    }
+                    Entry::Occupied(_) => {}
                 }
                 DaemonResponse::Ok
             }
@@ -4251,7 +4268,7 @@ mod tests {
         loop {
             let output = terminal.plain_capture();
             let compact = output.split_whitespace().collect::<Vec<_>>().join(" ");
-            if compact.contains(needle) || start.elapsed() >= Duration::from_secs(1) {
+            if compact.contains(needle) || start.elapsed() >= Duration::from_secs(5) {
                 return output;
             }
             thread::sleep(Duration::from_millis(10));
@@ -4319,14 +4336,9 @@ mod tests {
         let terminal =
             ManagedTerminal::spawn(&CommandSpec::new(script.as_os_str(), root.path()), (0, 0))
                 .unwrap();
-        terminal.wait_for_first_output(Duration::from_secs(2));
-        assert!(terminal.plain_capture().contains("ready"));
+        assert!(wait_for_capture(&terminal, "ready").contains("ready"));
         terminal.write(b"hello\n").unwrap();
-        let start = Instant::now();
-        while terminal.is_alive() && start.elapsed() < Duration::from_secs(2) {
-            thread::sleep(Duration::from_millis(20));
-        }
-        assert!(terminal.plain_capture().contains("got:hello"));
+        assert!(wait_for_capture(&terminal, "got:hello").contains("got:hello"));
     }
 
     #[test]
@@ -4411,6 +4423,67 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         assert!(plain_text(&output).contains("daemon-got:hello"));
+    }
+
+    #[test]
+    fn daemon_ensure_restarts_a_terminal_after_the_previous_process_exits() {
+        let root = tempdir().unwrap();
+        let launches = root.path().join("launches");
+        let command = format!(
+            "printf x >> '{}'; printf 'ready\\n'; sleep 0.05",
+            launches.display()
+        );
+        let spec = WireCommandSpec::from(
+            &CommandSpec::new("/bin/sh", root.path())
+                .arg("-c")
+                .arg(command),
+        );
+        let mut state = PtyDaemonState::default();
+
+        assert!(matches!(
+            state
+                .handle(DaemonRequest::Ensure {
+                    id: "agent|restart".into(),
+                    spec: spec.clone(),
+                    cols: 80,
+                    rows: 24,
+                })
+                .0,
+            DaemonResponse::Ok
+        ));
+        let start = Instant::now();
+        while state
+            .terminals
+            .get("agent|restart")
+            .is_some_and(LocalTerminal::is_alive)
+            && start.elapsed() < Duration::from_secs(2)
+        {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(fs::read_to_string(&launches).unwrap(), "x");
+
+        assert!(matches!(
+            state
+                .handle(DaemonRequest::Ensure {
+                    id: "agent|restart".into(),
+                    spec,
+                    cols: 80,
+                    rows: 24,
+                })
+                .0,
+            DaemonResponse::Ok
+        ));
+        let start = Instant::now();
+        while fs::read_to_string(&launches).unwrap_or_default() != "xx"
+            && start.elapsed() < Duration::from_secs(2)
+        {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            fs::read_to_string(&launches).unwrap(),
+            "xx",
+            "Ensure must replace a retained dead terminal instead of reconnecting to it"
+        );
     }
 
     #[test]

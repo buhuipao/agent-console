@@ -931,7 +931,11 @@ impl RuntimeState {
         for session in &mut discovered {
             if let Some(previous) = old.remove(&session.key) {
                 let changed = previous.transcript_fingerprint != session.transcript_fingerprint;
+                let discovered_task = std::mem::take(&mut session.summary.task);
                 session.summary = previous.summary;
+                if session.summary.task.trim().is_empty() {
+                    session.summary.task = discovered_task;
+                }
                 session
                     .summary_fingerprint
                     .clone_from(&previous.summary_fingerprint);
@@ -2117,6 +2121,46 @@ mod tests {
             fs::read_to_string(&launches).unwrap(),
             "x",
             "re-entering must attach the existing PTY instead of restarting the provider"
+        );
+    }
+
+    #[test]
+    fn provisional_session_adopts_the_first_discovered_prompt_as_its_title() {
+        let root = tempdir().unwrap();
+        let codex_sessions = root.path().join("codex");
+        fs::create_dir_all(&codex_sessions).unwrap();
+        fs::write(
+            codex_sessions.join("rollout-new-session.jsonl"),
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"actual-id\",\"cwd\":\"/tmp\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Implement signed releases\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let mut app = App::test_fixture();
+        let mut provisional = fixture_session("codex:provisional-id");
+        provisional.transcript_modified_at = unix_timestamp();
+        provisional.managed_alive = true;
+        app.runtime.sessions = vec![provisional];
+        app.runtime.selected = 0;
+        app.runtime.discovery_paths = DiscoveryPaths {
+            codex_sessions,
+            claude_projects: root.path().join("claude"),
+        };
+        let alive = HashSet::from(["codex:provisional-id".to_owned()]);
+
+        let rekeys = app.runtime.refresh_now(&alive);
+
+        assert_eq!(
+            rekeys,
+            vec![("codex:provisional-id".into(), "codex:actual-id".into())]
+        );
+        assert_eq!(app.runtime.sessions[0].key, "codex:actual-id");
+        assert_eq!(
+            app.session_title(&app.runtime.sessions[0]),
+            "Implement signed releases",
+            "the parsed prompt must replace the provisional session-id title"
         );
     }
 

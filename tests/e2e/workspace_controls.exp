@@ -118,6 +118,12 @@ expect_text {FOCUS SESSIONS} stale-transcript-sessions-again 205
 send -- "\r"
 expect_text {FOCUS AGENT} stale-transcript-enter-reactivates-agent 206
 if {[provider_launches] != 2} { fail stale-transcript-enter-restarted-provider 207 }
+send -- "\004"
+expect_text {FOCUS SESSIONS} ctrl-d-returns-to-session-list 225
+if {[provider_launches] != 2} { fail ctrl-d-unexpected-provider-launch 226 }
+send -- "\r"
+expect_text {FOCUS AGENT} enter-resumes-after-ctrl-d 227
+if {[provider_launches] != 3} { fail enter-did-not-resume-after-ctrl-d 228 }
 file mkdir [file join $state_dir events]
 set event_file [file join $state_dir events codex-e2e-session.jsonl]
 set event_channel [open $event_file w]

@@ -30,17 +30,26 @@ suite requires `expect`; neither is required when installing a release.
 ## Install a release
 
 Each [GitHub Release](https://github.com/buhuipao/agent-console/releases)
-contains five native packages (shown here for version `0.0.4`):
+contains five native packages:
 
-- Windows x86_64: `agent-console-v0.0.4-x86_64-pc-windows-msvc.zip`
-- Linux x86_64 and ARM64: `agent-console-v0.0.4-x86_64-unknown-linux-gnu.tar.gz`
-  and `agent-console-v0.0.4-aarch64-unknown-linux-gnu.tar.gz`
-- macOS Intel and Apple Silicon: `agent-console-v0.0.4-x86_64-apple-darwin.tar.gz`
-  and `agent-console-v0.0.4-aarch64-apple-darwin.tar.gz`
+- Windows x86_64: `agent-console-v<version>-x86_64-pc-windows-msvc.zip`
+- Linux x86_64 and ARM64:
+  `agent-console-v<version>-x86_64-unknown-linux-gnu.tar.gz` and
+  `agent-console-v<version>-aarch64-unknown-linux-gnu.tar.gz`
+- macOS Intel and Apple Silicon:
+  `agent-console-v<version>-x86_64-apple-darwin.tar.gz` and
+  `agent-console-v<version>-aarch64-apple-darwin.tar.gz`
 
 Extract the matching archive and place `agent-console` (or
 `agent-console.exe`) on `PATH`. Verify the download against the release's
 `SHA256SUMS` file.
+
+Starting with v0.0.6, published macOS binaries are signed with the
+`Developer ID Application` identity for Apple team `69VD3J69AA`, use the
+hardened runtime and a secure timestamp, and are accepted by Apple's notary
+service before packaging. The release remains a normal command-line `tar.gz`;
+macOS retrieves the standalone binary's notarization ticket online on first
+launch because Apple cannot staple a ticket directly to a bare executable.
 
 ## Run
 
@@ -380,10 +389,47 @@ launched and owns.
 
 ## Release automation
 
-`.github/workflows/release.yml` validates that a pushed tag such as `v0.0.5`
+`.github/workflows/release.yml` validates that a pushed tag such as `v0.0.6`
 matches the version in `Cargo.toml`, runs formatting/lint/tests, builds all five
 native packages, generates `SHA256SUMS`, and creates the GitHub Release. The
 workflow can also be started manually with publishing disabled to exercise the
 entire packaging matrix without creating a release. A push to an explicitly
 named `packaging-test/**` branch performs the same non-publishing dry run for
 environments where GitHub API dispatch is unavailable.
+
+Published macOS builds reuse NextPlan's Apple team and App Store Connect Team
+API key identifiers:
+
+```text
+Team ID:   69VD3J69AA
+Key ID:    Z665697VSB
+Issuer ID: d2af6eee-fb40-4389-ba1c-23320b32bd7d
+```
+
+The private material is never stored in git. Configure these repository
+Actions secrets before publishing a tag:
+
+| Secret | Value |
+| --- | --- |
+| `APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64` | Base64 of the password-protected `Developer ID Application: sha qiu (69VD3J69AA)` identity exported as `.p12` |
+| `APPLE_DEVELOPER_ID_APPLICATION_PASSWORD` | Password chosen when exporting that `.p12` |
+| `APPLE_NOTARY_KEY_P8_BASE64` | Base64 of NextPlan's `AuthKey_Z665697VSB.p8` Team API private key |
+
+On macOS, encode the two files without writing another unencrypted copy:
+
+```sh
+base64 -i DeveloperIDApplication.p12 | pbcopy
+base64 -i AuthKey_Z665697VSB.p8 | pbcopy
+```
+
+The first macOS release step imports the `.p12` into an ephemeral keychain,
+selects only a `Developer ID Application` identity belonging to the expected
+team, signs the Rust executable, and deletes the keychain. The next step submits
+a temporary ZIP through `notarytool`, requires an explicit `Accepted` result,
+verifies the embedded signature with `codesign`, and only then creates the
+public `tar.gz`. `spctl --type execute` is deliberately not used as a CI gate:
+that command rejects standalone command-line Mach-O files as “not an app” even
+when their Developer ID signature and notarization ticket are valid. The
+release smoke test instead executes a notarized binary carrying a quarantine
+attribute, which exercises the actual Gatekeeper launch path. Non-publishing
+packaging dry runs remain unsigned and do not require Apple secrets.
