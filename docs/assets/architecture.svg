@@ -1,0 +1,118 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" role="img" aria-labelledby="title desc">
+  <title id="title">Agent Console runtime architecture and data flow</title>
+  <desc id="desc">Codex and Claude Code transcripts and hooks flow into a continuous runtime backed by SQLite. The runtime updates dashboard and workspace views, invokes only the matching provider for summaries, and connects native agent and shell terminals through the PTY layer.</desc>
+  <defs>
+    <style>
+      .bg { fill: #0b0f14; }
+      .panel { fill: #111820; stroke: #334155; stroke-width: 2; }
+      .panel-accent { fill: #10212a; stroke: #22d3ee; stroke-width: 2; }
+      .panel-store { fill: #18152a; stroke: #a78bfa; stroke-width: 2; }
+      .title { fill: #e2e8f0; font: 700 22px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      .label { fill: #e2e8f0; font: 600 18px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      .body { fill: #94a3b8; font: 15px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      .small { fill: #64748b; font: 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      .cyan { fill: #22d3ee; }
+      .orange { fill: #fb923c; }
+      .purple { fill: #a78bfa; }
+      .green { fill: #4ade80; }
+      .flow { fill: none; stroke: #64748b; stroke-width: 2.5; marker-end: url(#arrow); }
+      .flow-cyan { fill: none; stroke: #22d3ee; stroke-width: 2.5; marker-end: url(#arrow-cyan); }
+      .flow-dashed { fill: none; stroke: #a78bfa; stroke-width: 2.5; stroke-dasharray: 7 6; marker-end: url(#arrow-purple); }
+      .flow-both { fill: none; stroke: #64748b; stroke-width: 2.5; marker-start: url(#arrow); marker-end: url(#arrow); }
+      .flow-both-purple { fill: none; stroke: #a78bfa; stroke-width: 2.5; stroke-dasharray: 7 6; marker-start: url(#arrow-purple); marker-end: url(#arrow-purple); }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+    <marker id="arrow-cyan" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#22d3ee"/>
+    </marker>
+    <marker id="arrow-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#a78bfa"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" width="1280" height="720" rx="18"/>
+  <text class="title" x="44" y="48">AGENT CONSOLE · RUNTIME ARCHITECTURE</text>
+  <text class="small" x="44" y="72">one continuously advancing runtime · native provider UI · local-first state</text>
+
+  <!-- Provider sources -->
+  <rect class="panel" x="44" y="112" width="230" height="218" rx="12"/>
+  <text class="label cyan" x="68" y="146">Codex</text>
+  <text class="body" x="68" y="178">session transcripts</text>
+  <text class="body" x="68" y="204">hook events</text>
+  <line x1="68" y1="226" x2="250" y2="226" stroke="#334155"/>
+  <text class="label orange" x="68" y="262">Claude Code</text>
+  <text class="body" x="68" y="294">session transcripts</text>
+  <text class="body" x="68" y="320">hook events</text>
+
+  <!-- Ingress adapters -->
+  <rect class="panel" x="342" y="112" width="240" height="94" rx="12"/>
+  <text class="label" x="366" y="146">Discovery</text>
+  <text class="body" x="366" y="176">recent transcript scan</text>
+  <rect class="panel" x="342" y="236" width="240" height="94" rx="12"/>
+  <text class="label" x="366" y="270">Event ingress</text>
+  <text class="body" x="366" y="300">bounded JSONL + index</text>
+
+  <path class="flow" d="M274 166 H342"/>
+  <path class="flow" d="M274 278 H342"/>
+
+  <!-- Runtime -->
+  <rect class="panel-accent" x="650" y="112" width="276" height="218" rx="12"/>
+  <text class="label cyan" x="674" y="148">Continuous Runtime</text>
+  <text class="body" x="674" y="184">session discovery</text>
+  <text class="body" x="674" y="212">status reduction</text>
+  <text class="body" x="674" y="240">summary scheduling</text>
+  <text class="body" x="674" y="268">attention + notifications</text>
+  <text class="small" x="674" y="302">Dashboard and Workspace are views</text>
+  <path class="flow-cyan" d="M582 159 H650"/>
+  <path class="flow-cyan" d="M582 283 H650"/>
+
+  <!-- Persistence -->
+  <rect class="panel-store" x="1000" y="112" width="236" height="94" rx="12"/>
+  <text class="label purple" x="1024" y="146">SQLite state.db</text>
+  <text class="body" x="1024" y="176">cache + event index</text>
+  <path class="flow-both-purple" d="M936 159 H990"/>
+
+  <!-- Summary -->
+  <rect class="panel" x="1000" y="236" width="236" height="94" rx="12"/>
+  <text class="label" x="1024" y="270">Summary worker</text>
+  <text class="body" x="1024" y="300">Codex→Codex · Claude→Claude</text>
+  <path class="flow-both" d="M936 283 H990"/>
+
+  <!-- Views -->
+  <text class="small" x="44" y="394">LIVE VIEWS</text>
+  <rect class="panel" x="44" y="418" width="274" height="122" rx="12"/>
+  <text class="label" x="68" y="454">Dashboard</text>
+  <text class="body" x="68" y="486">session map · status · alerts</text>
+  <text class="small" x="68" y="516">select, search, archive, resume</text>
+
+  <rect class="panel-accent" x="362" y="418" width="274" height="122" rx="12"/>
+  <text class="label cyan" x="386" y="454">Workspace</text>
+  <text class="body" x="386" y="486">session list + native terminals</text>
+  <text class="small" x="386" y="516">Agent · Shell 1 · Shell N</text>
+
+  <path class="flow-cyan" d="M760 330 V372 H181 V418"/>
+  <path class="flow-cyan" d="M816 330 V386 H499 V418"/>
+
+  <!-- PTY ownership -->
+  <rect class="panel" x="704" y="418" width="244" height="122" rx="12"/>
+  <text class="label green" x="728" y="454">PTY layer</text>
+  <text class="body" x="728" y="486">Unix: detached daemon</text>
+  <text class="body" x="728" y="514">Windows: local ConPTY</text>
+  <path class="flow-cyan" d="M636 479 H704"/>
+
+  <rect class="panel" x="1016" y="392" width="220" height="70" rx="12"/>
+  <text class="label" x="1040" y="424">Native Agent TUI</text>
+  <text class="small" x="1040" y="448">resume / input / screen</text>
+  <rect class="panel" x="1016" y="490" width="220" height="70" rx="12"/>
+  <text class="label" x="1040" y="522">Shell PTYs</text>
+  <text class="small" x="1040" y="546">same cwd · zero or more</text>
+  <path class="flow-cyan" d="M948 458 H982 V427 H1016"/>
+  <path class="flow-cyan" d="M948 500 H982 V525 H1016"/>
+
+  <!-- Principle footer -->
+  <rect x="44" y="618" width="1192" height="62" rx="10" fill="#0f172a" stroke="#1e293b"/>
+  <text class="body" x="68" y="654">State stays local</text>
+  <text class="small" x="246" y="654">· summaries never cross providers · leaving the TUI detaches managed Unix PTYs instead of killing them</text>
+</svg>

@@ -9,28 +9,28 @@ fail() {
   exit 1
 }
 
-dmg_matrix_entries="$(grep -c 'archive: dmg' "$workflow" || true)"
-[[ "$dmg_matrix_entries" == "2" ]] \
-  || fail "expected two macOS DMG matrix entries, found $dmg_matrix_entries"
+mac_tar_entries="$({
+  awk '
+    /target: (x86_64|aarch64)-apple-darwin/ { mac = 1; next }
+    mac && /archive: tar\.gz/ { count += 1; mac = 0; next }
+    mac && /archive:/ { mac = 0 }
+    END { print count + 0 }
+  ' "$workflow"
+})"
+[[ "$mac_tar_entries" == "2" ]] \
+  || fail "expected two macOS tar.gz matrix entries, found $mac_tar_entries"
 
-grep -Fq 'xcrun notarytool submit "$dmg"' "$workflow" \
-  || fail "the final DMG is not submitted to Apple notarization"
-grep -Fq 'xcrun stapler staple "$dmg"' "$workflow" \
-  || fail "the notarization ticket is not stapled to the final DMG"
-grep -Fq 'xcrun stapler validate "$dmg"' "$workflow" \
-  || fail "the stapled ticket is not validated"
-grep -Fq 'context:primary-signature "$dmg"' "$workflow" \
-  || fail "the final DMG is not assessed by Gatekeeper"
-grep -Fq 'Notarization Ticket=stapled' "$workflow" \
-  || fail "the workflow does not assert that the public DMG carries its ticket"
+grep -Fq 'submission="$RUNNER_TEMP/agent-console-${TARGET}-notarization.zip"' "$workflow" \
+  || fail "the signed macOS binary is not staged for notarization"
+grep -Fq 'xcrun notarytool submit "$submission"' "$workflow" \
+  || fail "the signed macOS binary is not submitted to Apple notarization"
+grep -Fq 'if [[ "$notary_status" != "Accepted" ]]' "$workflow" \
+  || fail "publishing does not require an Accepted notarization result"
+grep -Fq 'codesign --verify --strict --verbose=2 "$binary"' "$workflow" \
+  || fail "the signed macOS binary is not verified"
 
-if awk '
-  /target: (x86_64|aarch64)-apple-darwin/ { mac = 1; next }
-  mac && /archive: tar\.gz/ { bad = 1 }
-  mac && /archive:/ { mac = 0 }
-  END { exit bad ? 0 : 1 }
-' "$workflow"; then
-  fail "macOS still publishes tar.gz instead of a stapled container"
+if grep -Eq 'archive: dmg|hdiutil|stapler|Notarization Ticket=stapled' "$workflow"; then
+  fail "macOS release policy still contains DMG/stapling steps"
 fi
 
 echo "release workflow check passed"

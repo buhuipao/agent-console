@@ -118,10 +118,10 @@ jobs:
             archive: tar.gz
           - runner: macos-15-intel
             target: x86_64-apple-darwin
-            archive: dmg
+            archive: tar.gz
           - runner: macos-15
             target: aarch64-apple-darwin
-            archive: dmg
+            archive: tar.gz
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
@@ -176,15 +176,19 @@ jobs:
           echo "APPLE_SIGNING_IDENTITY=$signing_identity" >> "$GITHUB_ENV"
 
           rm -f "$certificate_path"
-      - name: Sign macOS binary
+      - name: Sign and notarize macOS binary
         if: runner.os == 'macOS' && needs.prepare.outputs.publish == 'true'
         shell: bash
         env:
+          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
+          test -n "$APPLE_NOTARY_KEY_P8_BASE64"
 
           binary="target/${TARGET}/release/agent-console"
+          notary_key="$RUNNER_TEMP/AuthKey_${APPLE_NOTARY_KEY_ID}.p8"
+          submission="$RUNNER_TEMP/agent-console-${TARGET}-notarization.zip"
 
           codesign \
             --force \
@@ -194,70 +198,13 @@ jobs:
             --sign "$APPLE_SIGNING_IDENTITY" \
             "$binary"
           codesign --verify --strict --verbose=2 "$binary"
-      - name: Package Unix binary
-        if: matrix.archive == 'tar.gz'
-        shell: bash
-        env:
-          VERSION: ${{ needs.prepare.outputs.version }}
-          TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          archive="agent-console-v${VERSION}-${TARGET}"
-          mkdir -p "dist/${archive}"
-          install -m 755 "target/${TARGET}/release/agent-console" "dist/${archive}/agent-console"
-          cp README.md "dist/${archive}/README.md"
-          tar -C dist -czf "dist/${archive}.tar.gz" "$archive"
-          rm -rf "dist/${archive}"
-      - name: Package macOS DMG
-        if: matrix.archive == 'dmg'
-        shell: bash
-        env:
-          VERSION: ${{ needs.prepare.outputs.version }}
-          TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          archive="agent-console-v${VERSION}-${TARGET}"
-          stage="$RUNNER_TEMP/${archive}"
-          dmg="dist/${archive}.dmg"
-
-          rm -rf "$stage"
-          mkdir -p "$stage" dist
-          install -m 755 "target/${TARGET}/release/agent-console" "$stage/agent-console"
-          cp README.md "$stage/README.md"
-          hdiutil create \
-            -volname "Agent Console ${VERSION}" \
-            -srcfolder "$stage" \
-            -ov \
-            -format UDZO \
-            "$dmg"
-          hdiutil verify "$dmg"
-          rm -rf "$stage"
-      - name: Sign, notarize, and staple macOS DMG
-        if: matrix.archive == 'dmg' && needs.prepare.outputs.publish == 'true'
-        shell: bash
-        env:
-          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
-          VERSION: ${{ needs.prepare.outputs.version }}
-          TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          test -n "$APPLE_NOTARY_KEY_P8_BASE64"
-
-          dmg="dist/agent-console-v${VERSION}-${TARGET}.dmg"
-          notary_key="$RUNNER_TEMP/AuthKey_${APPLE_NOTARY_KEY_ID}.p8"
-
-          codesign \
-            --force \
-            --timestamp \
-            --sign "$APPLE_SIGNING_IDENTITY" \
-            "$dmg"
-          codesign --verify --strict --verbose=2 "$dmg"
 
           printf '%s' "$APPLE_NOTARY_KEY_P8_BASE64" \
             | base64 --decode > "$notary_key"
           chmod 600 "$notary_key"
+          ditto -c -k --keepParent "$binary" "$submission"
           notary_result="$(
-            xcrun notarytool submit "$dmg" \
+            xcrun notarytool submit "$submission" \
               --key "$notary_key" \
               --key-id "$APPLE_NOTARY_KEY_ID" \
               --issuer "$APPLE_NOTARY_ISSUER_ID" \
@@ -274,16 +221,31 @@ jobs:
             exit 1
           fi
 
-          xcrun stapler staple "$dmg"
-          xcrun stapler validate "$dmg"
-          codesign --verify --strict --verbose=2 "$dmg"
-          codesign -dvvv "$dmg" 2>&1 \
-            | grep -F "Notarization Ticket=stapled"
-          spctl -a -vv \
-            --type open \
-            --context context:primary-signature "$dmg"
-          hdiutil verify "$dmg"
-          rm -f "$notary_key"
+          codesign --verify --strict --verbose=2 "$binary"
+          quarantine_timestamp="$(printf '%x' "$(date +%s)")"
+          xattr -w \
+            com.apple.quarantine \
+            "0081;${quarantine_timestamp};AgentConsoleReleaseCI;" \
+            "$binary"
+          printf '%s' '{"session_id":"gatekeeper-release-probe"}' \
+            | AGENT_CONSOLE_STATE_DIR="$RUNNER_TEMP/agent-console-gatekeeper-state" \
+              "$binary" hook codex
+          xattr -d com.apple.quarantine "$binary"
+          rm -f "$notary_key" "$submission"
+      - name: Package Unix binary
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          archive="agent-console-v${VERSION}-${TARGET}"
+          mkdir -p "dist/${archive}"
+          install -m 755 "target/${TARGET}/release/agent-console" "dist/${archive}/agent-console"
+          cp README.md "dist/${archive}/README.md"
+          tar -C dist -czf "dist/${archive}.tar.gz" "$archive"
+          rm -rf "dist/${archive}"
       - name: Package Windows binary
         if: matrix.archive == 'zip'
         shell: pwsh
@@ -309,8 +271,9 @@ jobs:
           fi
           rm -f \
             "$RUNNER_TEMP/developer-id-application.p12" \
-            "$RUNNER_TEMP/AuthKey_${APPLE_NOTARY_KEY_ID}.p8"
-          rm -rf "$RUNNER_TEMP/agent-console-v${{ needs.prepare.outputs.version }}-${{ matrix.target }}"
+            "$RUNNER_TEMP/AuthKey_${APPLE_NOTARY_KEY_ID}.p8" \
+            "$RUNNER_TEMP/agent-console-${{ matrix.target }}-notarization.zip"
+          rm -rf "$RUNNER_TEMP/agent-console-gatekeeper-state"
       - name: Upload package
         uses: actions/upload-artifact@v4
         with:
