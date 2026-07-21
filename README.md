@@ -37,8 +37,17 @@ Download the package for your platform from
 - Windows Intel: `agent-console-v<version>-x86_64-pc-windows-msvc.zip`
 
 Extract the archive and place `agent-console` (`agent-console.exe` on Windows)
-in a directory on `PATH`. Agent Console is a terminal program; launch it from
-your terminal rather than Finder.
+in a directory on `PATH`. On macOS, install and upgrade it with an atomic
+rename so the kernel never reuses a cached signature from the old inode:
+
+```sh
+sudo install -m 755 ./agent-console /usr/local/bin/agent-console.new
+sudo mv -f /usr/local/bin/agent-console.new /usr/local/bin/agent-console
+```
+
+Do not copy directly over a running or previously launched signed binary on
+macOS. Agent Console is a terminal program; launch it from your terminal rather
+than Finder.
 
 Published macOS binaries are signed with Developer ID, use the hardened
 runtime, and are accepted by Apple's notarization service. Because Apple cannot
@@ -50,6 +59,9 @@ online notarization lookup on first launch.
 ```sh
 agent-console
 ```
+
+`agent-console --version` and `agent-console --help` print metadata without
+opening the dashboard.
 
 Check provider and terminal prerequisites without opening the dashboard:
 

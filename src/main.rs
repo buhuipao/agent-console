@@ -55,6 +55,14 @@ fn main() -> io::Result<()> {
 fn dispatch() -> io::Result<()> {
     let mut args = env::args().skip(1);
     match args.next().as_deref() {
+        Some("--version" | "-V") => {
+            println!("agent-console {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Some("--help" | "-h") => {
+            print!("{}", cli_help());
+            Ok(())
+        }
         Some("hook") => run_hook(args.next()),
         Some("doctor") => run_doctor(),
         Some("pty-daemon") => args
@@ -83,6 +91,19 @@ fn dispatch() -> io::Result<()> {
         )),
         None => run_dashboard(),
     }
+}
+
+fn cli_help() -> &'static str {
+    concat!(
+        "Agent Console ",
+        env!("CARGO_PKG_VERSION"),
+        "\n\n",
+        "Usage:\n",
+        "  agent-console             Open the dashboard\n",
+        "  agent-console doctor      Check providers and terminal prerequisites\n",
+        "  agent-console --help      Show this help\n",
+        "  agent-console --version   Show the version\n",
+    )
 }
 
 fn run_hook(provider: Option<String>) -> io::Result<()> {
@@ -2110,5 +2131,13 @@ mod tests {
         );
 
         assert_eq!(app.selected, 1);
+    }
+
+    #[test]
+    fn cli_help_exposes_non_interactive_metadata_commands() {
+        let help = cli_help();
+        assert!(help.starts_with(&format!("Agent Console {}\n", env!("CARGO_PKG_VERSION"))));
+        assert!(help.contains("agent-console --help"));
+        assert!(help.contains("agent-console --version"));
     }
 }

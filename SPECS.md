@@ -615,6 +615,11 @@ Automated tests must cover:
     hook ingress/index, and daemon health.
 11. A provider contract matrix at every supported floor and current real local
     `--version`/`--help` smoke checks without model invocation.
+12. A published macOS archive is extracted onto a fresh inode, signature
+    verified, quarantined, launched, and exercised through the documented
+    atomic install/upgrade path. Directly overwriting an already launched
+    signed inode is unsupported because macOS can retain its old signature
+    cache and kill the replacement.
 
 Manual smoke test:
 

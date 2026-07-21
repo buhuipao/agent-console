@@ -25,8 +25,7 @@ concurrency:
   cancel-in-progress: false
 
 # These identifiers match the Apple team and App Store Connect API key used by
-# NextPlan. The certificate private key and API private key remain GitHub
-# Actions secrets; see README.md for their exact names and setup.
+# NextPlan. Private signing material remains in GitHub Actions secrets.
 env:
   APPLE_TEAM_ID: 69VD3J69AA
   APPLE_NOTARY_KEY_ID: Z665697VSB
@@ -246,6 +245,38 @@ jobs:
           cp README.md "dist/${archive}/README.md"
           tar -C dist -czf "dist/${archive}.tar.gz" "$archive"
           rm -rf "dist/${archive}"
+      - name: Verify packaged macOS binary
+        if: runner.os == 'macOS' && needs.prepare.outputs.publish == 'true'
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          archive="agent-console-v${VERSION}-${TARGET}"
+          verify_dir="$RUNNER_TEMP/${archive}-verify"
+          install_dir="$RUNNER_TEMP/${archive}-install"
+          mkdir -p "$verify_dir" "$install_dir"
+          tar -C "$verify_dir" -xzf "dist/${archive}.tar.gz"
+          packaged="$verify_dir/${archive}/agent-console"
+
+          codesign --verify --strict --verbose=4 "$packaged"
+          "$packaged" --version | grep -Fx "agent-console ${VERSION}"
+          "$packaged" --help | grep -Fq 'Usage:'
+
+          xattr -w \
+            com.apple.quarantine \
+            "0081;$(printf '%x' "$(date +%s)");AgentConsoleReleaseCI;" \
+            "$packaged"
+          printf '%s' '{"session_id":"packaged-gatekeeper-probe"}' \
+            | AGENT_CONSOLE_STATE_DIR="$RUNNER_TEMP/agent-console-packaged-state" \
+              "$packaged" hook codex
+
+          install -m 755 "$packaged" "$install_dir/agent-console.new"
+          mv -f "$install_dir/agent-console.new" "$install_dir/agent-console"
+          codesign --verify --strict --verbose=4 "$install_dir/agent-console"
+          "$install_dir/agent-console" --version \
+            | grep -Fx "agent-console ${VERSION}"
       - name: Package Windows binary
         if: matrix.archive == 'zip'
         shell: pwsh
