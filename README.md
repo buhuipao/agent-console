@@ -127,7 +127,8 @@ Agent and shell viewport controls:
 | `Shift-PageUp` / `Shift-PageDown` | Scroll one viewport |
 | `Shift-End` | Return to live output |
 | Mouse wheel | Scroll the pane under the pointer |
-| Drag, or `Shift`-drag in a mouse-aware Agent | Select and copy text |
+| Drag | Select and copy immediately; do not press `Cmd-C` afterward |
+| Terminal bypass modifier + drag | Use native selection, then copy normally (`Option`-drag in iTerm2; commonly `Shift`-drag elsewhere) |
 
 The new-session dialog supports `Tab` / `Shift-Tab` between provider and
 workspace, arrows (or `h` / `l`) to choose a provider, normal cursor movement
@@ -146,6 +147,9 @@ bindings overridden in the configuration file.
   conversation. Disable them with `AGENT_CONSOLE_SUMMARIZER=off`.
 - Agent Console can reconnect only to processes it launched and owns. Existing
   sessions from other terminal tabs are resumed from their saved transcript.
+- Each managed pane retains up to 2,000 scrollback rows. The separate 128 KiB
+  daemon replay tail is a reconnect transport bound; crossing it does not stop
+  the process or discard Codex's retained viewport rows.
 - Local state is stored under `~/.local/state/agent-console` by default.
 - Detailed behavior and constraints are documented in [SPECS.md](SPECS.md).
 

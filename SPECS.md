@@ -345,9 +345,16 @@ Each agent and shell has an independent viewport. `Shift-PageUp` and
 live tail, and the pane title displays the current `SCROLL +N` offset. Ordinary
 child input first returns the focused pane to the live tail. A full-screen
 agent that enables mouse reporting receives its native click, drag, and wheel
-events; Shift-drag remains available for outer text selection. A full-screen
+events; ordinary outer drag selection copies immediately, while the terminal's
+mouse-reporting bypass modifier (for example, Option in iTerm2) remains
+available for terminal-native text selection. A full-screen
 agent without mouse reporting receives alternate-screen cursor scroll events,
 matching terminal-emulator behavior used by Claude Code.
+
+Each outer viewport retains up to 2,000 rows independently of the 128 KiB raw
+daemon replay tail. When a Codex-style partial scroll region has outgrown that
+raw tail, the daemon checkpoint also carries its retained formatted rows so a
+new TUI can reconnect without losing the available viewport history.
 
 The detached PTY daemon owns managed agent and shell children. TUI exit or
 crash detaches without terminating them; a later TUI reconnects by stable

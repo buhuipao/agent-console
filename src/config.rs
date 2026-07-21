@@ -306,7 +306,10 @@ impl AgentConsoleConfig {
             if heading.contains("CHILD VIEWPORT") {
                 lines.extend([
                     format!("{:<22} {}", "scroll pointed pane", "Mouse wheel"),
-                    format!("{:<22} {}", "select / copy text", "Drag / Shift-Drag"),
+                    format!(
+                        "{:<22} {}",
+                        "select / copy text", "Drag auto-copies; Option-Drag native in iTerm2"
+                    ),
                 ]);
             }
             if heading.contains("SESSION LIST") {

@@ -39,6 +39,7 @@ use crate::{
 };
 
 const CAPTURE_LINES: usize = 200;
+const SCROLLBACK_LINES: usize = 2_000;
 const CAPTURE_BYTES: usize = 16 * 1024;
 const RAW_CAPTURE_BYTES: usize = 128 * 1024;
 const LEASE_STALE_AFTER: Duration = Duration::from_millis(500);
@@ -94,6 +95,15 @@ struct OutputState {
     base_offset: u64,
     exited: bool,
     exit_description: Option<String>,
+}
+
+struct TerminalOutputDelta {
+    start: u64,
+    end: u64,
+    bytes: Vec<u8>,
+    checkpoint: Option<Vec<u8>>,
+    status_bar_rows: Option<Vec<Vec<u8>>>,
+    exit: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -222,7 +232,7 @@ impl StatusBarScrollback {
         }
         let count = count.min(usize::from(bottom - top + 1));
         for row in screen.rows_formatted(0, cols).take(count) {
-            if self.rows.len() == CAPTURE_LINES {
+            if self.rows.len() == SCROLLBACK_LINES {
                 self.rows.pop_front();
             }
             self.rows.push_back(row);
@@ -337,6 +347,60 @@ fn terminal_screen_view(
     }
 }
 
+fn terminal_selected_rows(
+    parser: &vt100::Parser,
+    status_bar_scrollback: &StatusBarScrollback,
+    first: TerminalCell,
+    second: TerminalCell,
+) -> Vec<(TerminalCell, String)> {
+    let screen = parser.screen();
+    let (rows, cols) = screen.size();
+    if rows == 0 || cols == 0 {
+        return Vec::new();
+    }
+    let mut start = first.clamped(rows, cols);
+    let mut end = second.clamped(rows, cols);
+    if (start.row, start.col) > (end.row, end.col) {
+        std::mem::swap(&mut start, &mut end);
+    }
+    let view = terminal_screen_view(parser, status_bar_scrollback);
+    (start.row..=end.row)
+        .map(|row| {
+            let first_col = if row == start.row { start.col } else { 0 };
+            let last_col = if row == end.row { end.col } else { cols - 1 };
+            let width = last_col - first_col + 1;
+            let mut row_parser = vt100::Parser::new(1, cols, 0);
+            if let Some(formatted) = view.rows.get(usize::from(row)) {
+                row_parser.process(formatted);
+            }
+            let text =
+                row_parser
+                    .screen()
+                    .contents_between(0, first_col, 0, last_col.saturating_add(1));
+            (
+                TerminalCell {
+                    row,
+                    col: first_col,
+                },
+                fit_text(&text, width),
+            )
+        })
+        .collect()
+}
+
+fn terminal_selected_text(
+    parser: &vt100::Parser,
+    status_bar_scrollback: &StatusBarScrollback,
+    first: TerminalCell,
+    second: TerminalCell,
+) -> String {
+    terminal_selected_rows(parser, status_bar_scrollback, first, second)
+        .into_iter()
+        .map(|(_, text)| text.trim_end().to_owned())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn terminal_state_checkpoint(
     parser: &vt100::Parser,
     status_bar_scrollback: &StatusBarScrollback,
@@ -405,7 +469,7 @@ impl LocalTerminal {
         let parser = Arc::new(Mutex::new(vt100::Parser::new(
             size.1,
             size.0,
-            CAPTURE_LINES,
+            SCROLLBACK_LINES,
         )));
         let parser_for_thread = Arc::clone(&parser);
         let status_bar_scrollback = Arc::new(Mutex::new(StatusBarScrollback::default()));
@@ -582,17 +646,8 @@ impl LocalTerminal {
 
     fn selected_text(&self, first: TerminalCell, second: TerminalCell) -> String {
         let parser = self.parser.lock().unwrap();
-        let screen = parser.screen();
-        let (rows, cols) = screen.size();
-        if rows == 0 || cols == 0 {
-            return String::new();
-        }
-        let mut start = first.clamped(rows, cols);
-        let mut end = second.clamped(rows, cols);
-        if (start.row, start.col) > (end.row, end.col) {
-            std::mem::swap(&mut start, &mut end);
-        }
-        screen.contents_between(start.row, start.col, end.row, end.col.saturating_add(1))
+        let scrollback = self.status_bar_scrollback.lock().unwrap();
+        terminal_selected_text(&parser, &scrollback, first, second)
     }
 
     fn selected_rows(
@@ -601,34 +656,8 @@ impl LocalTerminal {
         second: TerminalCell,
     ) -> Vec<(TerminalCell, String)> {
         let parser = self.parser.lock().unwrap();
-        let screen = parser.screen();
-        let (rows, cols) = screen.size();
-        if rows == 0 || cols == 0 {
-            return Vec::new();
-        }
-        let mut start = first.clamped(rows, cols);
-        let mut end = second.clamped(rows, cols);
-        if (start.row, start.col) > (end.row, end.col) {
-            std::mem::swap(&mut start, &mut end);
-        }
-        (start.row..=end.row)
-            .map(|row| {
-                let first_col = if row == start.row { start.col } else { 0 };
-                let last_col = if row == end.row { end.col } else { cols - 1 };
-                let width = last_col - first_col + 1;
-                let text = screen
-                    .rows(first_col, width)
-                    .nth(usize::from(row))
-                    .unwrap_or_default();
-                (
-                    TerminalCell {
-                        row,
-                        col: first_col,
-                    },
-                    fit_text(&text, width),
-                )
-            })
-            .collect()
+        let scrollback = self.status_bar_scrollback.lock().unwrap();
+        terminal_selected_rows(&parser, &scrollback, first, second)
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
@@ -658,25 +687,33 @@ impl LocalTerminal {
         }
     }
 
-    fn output_since(&self, requested: u64) -> (u64, u64, Vec<u8>, Option<Vec<u8>>, Option<String>) {
+    fn output_since(&self, requested: u64) -> TerminalOutputDelta {
         let parser = self.parser.lock().unwrap();
         let scrollback = self.status_bar_scrollback.lock().unwrap();
         let state = self.output.lock().unwrap();
         let end = state.base_offset.saturating_add(state.raw.len() as u64);
         if requested < state.base_offset || requested > end {
             let checkpoint = terminal_state_checkpoint(&parser, &scrollback);
-            return (
+            return TerminalOutputDelta {
+                start: end,
                 end,
-                end,
-                Vec::new(),
-                Some(checkpoint),
-                state.exit_description.clone(),
-            );
+                bytes: Vec::new(),
+                checkpoint: Some(checkpoint),
+                status_bar_rows: Some(scrollback.rows.iter().cloned().collect()),
+                exit: state.exit_description.clone(),
+            };
         }
         let start = requested;
         let skip = start.saturating_sub(state.base_offset) as usize;
         let bytes = state.raw.iter().skip(skip).copied().collect::<Vec<_>>();
-        (start, end, bytes, None, state.exit_description.clone())
+        TerminalOutputDelta {
+            start,
+            end,
+            bytes,
+            checkpoint: None,
+            status_bar_rows: None,
+            exit: state.exit_description.clone(),
+        }
     }
 }
 
@@ -887,6 +924,8 @@ enum DaemonResponse {
         bytes: Vec<u8>,
         #[serde(default)]
         checkpoint: Option<Vec<u8>>,
+        #[serde(default)]
+        status_bar_rows: Option<Vec<Vec<u8>>>,
         alive: bool,
         exit: Option<String>,
     },
@@ -950,14 +989,15 @@ impl PtyDaemonState {
                     );
                 };
                 let alive = terminal.is_alive();
-                let (start, end, bytes, checkpoint, exit) = terminal.output_since(offset);
+                let delta = terminal.output_since(offset);
                 DaemonResponse::Poll {
-                    start,
-                    end,
-                    bytes,
-                    checkpoint,
+                    start: delta.start,
+                    end: delta.end,
+                    bytes: delta.bytes,
+                    checkpoint: delta.checkpoint,
+                    status_bar_rows: delta.status_bar_rows,
                     alive,
-                    exit,
+                    exit: delta.exit,
                 }
             }
             DaemonRequest::Write {
@@ -1264,7 +1304,7 @@ impl RemoteTerminal {
             offset: Mutex::new(0),
             output: Mutex::new(OutputState::default()),
             output_generation: AtomicU64::new(0),
-            parser: Mutex::new(vt100::Parser::new(size.1, size.0, CAPTURE_LINES)),
+            parser: Mutex::new(vt100::Parser::new(size.1, size.0, SCROLLBACK_LINES)),
             status_bar_scrollback: Mutex::new(StatusBarScrollback::default()),
             size: Mutex::new(size),
         };
@@ -1286,6 +1326,7 @@ impl RemoteTerminal {
             end,
             bytes,
             checkpoint,
+            status_bar_rows,
             alive,
             exit,
         } = response
@@ -1299,7 +1340,7 @@ impl RemoteTerminal {
         };
         if checkpoint.is_some() || start != requested {
             let size = *self.size.lock().unwrap();
-            *self.parser.lock().unwrap() = vt100::Parser::new(size.1, size.0, CAPTURE_LINES);
+            *self.parser.lock().unwrap() = vt100::Parser::new(size.1, size.0, SCROLLBACK_LINES);
             *self.status_bar_scrollback.lock().unwrap() = StatusBarScrollback::default();
             let mut output = self.output.lock().unwrap();
             output.raw.clear();
@@ -1312,6 +1353,16 @@ impl RemoteTerminal {
                 process_terminal_output(&mut parser, &mut scrollback, checkpoint);
             }
             process_terminal_output(&mut parser, &mut scrollback, &bytes);
+        }
+        if let Some(rows) = status_bar_rows {
+            self.status_bar_scrollback.lock().unwrap().rows = rows
+                .into_iter()
+                .rev()
+                .take(SCROLLBACK_LINES)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
         }
         let mut output = self.output.lock().unwrap();
         let changed = checkpoint.is_some() || !bytes.is_empty() || output.exited == alive;
@@ -1448,17 +1499,8 @@ impl RemoteTerminal {
 
     fn selected_text(&self, first: TerminalCell, second: TerminalCell) -> String {
         let parser = self.parser.lock().unwrap();
-        let screen = parser.screen();
-        let (rows, cols) = screen.size();
-        if rows == 0 || cols == 0 {
-            return String::new();
-        }
-        let mut start = first.clamped(rows, cols);
-        let mut end = second.clamped(rows, cols);
-        if (start.row, start.col) > (end.row, end.col) {
-            std::mem::swap(&mut start, &mut end);
-        }
-        screen.contents_between(start.row, start.col, end.row, end.col.saturating_add(1))
+        let scrollback = self.status_bar_scrollback.lock().unwrap();
+        terminal_selected_text(&parser, &scrollback, first, second)
     }
 
     fn selected_rows(
@@ -1467,34 +1509,8 @@ impl RemoteTerminal {
         second: TerminalCell,
     ) -> Vec<(TerminalCell, String)> {
         let parser = self.parser.lock().unwrap();
-        let screen = parser.screen();
-        let (rows, cols) = screen.size();
-        if rows == 0 || cols == 0 {
-            return Vec::new();
-        }
-        let mut start = first.clamped(rows, cols);
-        let mut end = second.clamped(rows, cols);
-        if (start.row, start.col) > (end.row, end.col) {
-            std::mem::swap(&mut start, &mut end);
-        }
-        (start.row..=end.row)
-            .map(|row| {
-                let first_col = if row == start.row { start.col } else { 0 };
-                let last_col = if row == end.row { end.col } else { cols - 1 };
-                let width = last_col - first_col + 1;
-                let text = screen
-                    .rows(first_col, width)
-                    .nth(usize::from(row))
-                    .unwrap_or_default();
-                (
-                    TerminalCell {
-                        row,
-                        col: first_col,
-                    },
-                    fit_text(&text, width),
-                )
-            })
-            .collect()
+        let scrollback = self.status_bar_scrollback.lock().unwrap();
+        terminal_selected_rows(&parser, &scrollback, first, second)
     }
 
     fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
@@ -4519,13 +4535,16 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
 
-        let (replay_start, _, replay, checkpoint, _) = terminal.output_since(0);
-        assert!(replay_start > 0);
-        let checkpoint = checkpoint.expect("rolled-over history must return a screen checkpoint");
+        let delta = terminal.output_since(0);
+        assert!(delta.start > 0);
+        let checkpoint = delta
+            .checkpoint
+            .expect("rolled-over history must return a screen checkpoint");
+        assert_eq!(delta.status_bar_rows, Some(Vec::new()));
         let mut replay_parser = vt100::Parser::new(6, 40, CAPTURE_LINES);
         let mut replay_scrollback = StatusBarScrollback::default();
         process_terminal_output(&mut replay_parser, &mut replay_scrollback, &checkpoint);
-        process_terminal_output(&mut replay_parser, &mut replay_scrollback, &replay);
+        process_terminal_output(&mut replay_parser, &mut replay_scrollback, &delta.bytes);
 
         let expected = terminal.parser.lock().unwrap().screen().contents();
         assert_eq!(replay_parser.screen().contents(), expected);
@@ -4557,6 +4576,36 @@ mod tests {
             parser.screen().mouse_protocol_mode()
         );
         assert_eq!(restored_scrollback.scroll_region, Some((1, 6)));
+    }
+
+    #[test]
+    fn daemon_checkpoint_carries_codex_scrollback_beyond_the_raw_tail() {
+        let root = tempdir().unwrap();
+        let terminal = LocalTerminal::spawn(
+            &CommandSpec::new("/bin/sh", root.path()).arg("-c").arg(
+                "printf '\\033]0;'; dd if=/dev/zero bs=1024 count=132 2>/dev/null | tr '\\000' x; printf '\\007done'; sleep 2",
+            ),
+            (40, 6),
+        )
+        .unwrap();
+        let start = Instant::now();
+        while terminal.output.lock().unwrap().base_offset == 0 {
+            assert!(start.elapsed() < Duration::from_secs(2));
+            thread::sleep(Duration::from_millis(20));
+        }
+        terminal
+            .status_bar_scrollback
+            .lock()
+            .unwrap()
+            .rows
+            .push_back(b"retained-before-128-kib".to_vec());
+
+        let delta = terminal.output_since(0);
+        assert!(delta.checkpoint.is_some());
+        assert_eq!(
+            delta.status_bar_rows,
+            Some(vec![b"retained-before-128-kib".to_vec()])
+        );
     }
 
     #[test]
@@ -4887,6 +4936,47 @@ mod tests {
     }
 
     #[test]
+    fn selection_uses_the_displayed_codex_scrollback_viewport() {
+        let root = tempdir().unwrap();
+        let agent = ManagedTerminal::spawn(
+            &CommandSpec::new("/bin/sh", root.path()).arg("-c").arg(
+                "printf 'oldest\\r\\nsecond\\r\\nthird\\r\\nfourth'; \
+                 printf '\\033[1;4r\\033[4;1H\\r\\nnewest'; sleep 2",
+            ),
+            (30, 6),
+        )
+        .unwrap();
+        agent.wait_for_first_output(Duration::from_secs(1));
+        assert_eq!(agent.scroll_viewport(1), 1);
+
+        let first = TerminalCell { row: 0, col: 0 };
+        let last = TerminalCell { row: 0, col: 5 };
+        assert_eq!(agent.selected_text(first, last), "oldest");
+        assert_eq!(agent.selected_rows(first, last)[0].1, "oldest");
+    }
+
+    #[test]
+    fn codex_style_scrollback_retains_more_than_two_hundred_lines() {
+        let root = tempdir().unwrap();
+        let agent = ManagedTerminal::spawn(
+            &CommandSpec::new("/bin/sh", root.path()).arg("-c").arg(
+                "printf '\\033[1;4r\\033[4;1H'; \
+                 i=1; while [ $i -le 260 ]; do printf 'history-%03d\\r\\n' $i; i=$((i+1)); done; \
+                 printf 'live'; sleep 2",
+            ),
+            (30, 6),
+        )
+        .unwrap();
+        agent.wait_for_first_output(Duration::from_secs(1));
+
+        let retained = agent.scroll_viewport(isize::MAX);
+        assert!(
+            retained >= 250,
+            "expected long session history, retained only {retained} rows"
+        );
+    }
+
+    #[test]
     fn clicks_outside_terminal_panes_are_ignored_without_coordinate_underflow() {
         let layout = WorkspaceLayout::new(120, 30, 1, 0);
 
@@ -5041,6 +5131,29 @@ mod tests {
         );
 
         assert_eq!(selected, "beta\ngamma");
+    }
+
+    #[test]
+    fn selection_uses_the_claude_style_alternate_screen_viewport() {
+        let root = tempdir().unwrap();
+        let terminal = ManagedTerminal::spawn(
+            &CommandSpec::new("/bin/sh", root.path())
+                .arg("-c")
+                .arg("printf '\\033[?1049hclaude-old\\033[2J\\033[Hclaude-visible'; sleep 2"),
+            (24, 4),
+        )
+        .unwrap();
+        terminal.wait_for_first_output(Duration::from_secs(1));
+
+        assert!(terminal.alternate_screen());
+        assert_eq!(terminal.mouse_protocol().0, vt100::MouseProtocolMode::None);
+        assert_eq!(
+            terminal.selected_text(
+                TerminalCell { row: 0, col: 0 },
+                TerminalCell { row: 0, col: 13 },
+            ),
+            "claude-visible"
+        );
     }
 
     #[test]
