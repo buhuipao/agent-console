@@ -10,9 +10,11 @@ set env(PATH) "[file join $root tests fixtures bin]:$env(PATH)"
 set state_dir [file join /tmp "agent-console-dashboard-e2e-[pid]"]
 set workspace_root [file join /tmp "agent-console-workspace-e2e-[pid]"]
 set workspace_target [file join $workspace_root project-complete]
+set workspace_other [file join $workspace_root project-companion]
 set workspace_partial [file join $workspace_root project-com]
 set workspace_name project-complete
 file mkdir $workspace_target
+file mkdir $workspace_other
 set env(AGENT_CONSOLE_STATE_DIR) $state_dir
 log_user 0
 
@@ -98,7 +100,9 @@ after 100
 send -- "n"
 expect_text {NEW SESSION} new-dialog 146
 send -- "\t"
-expect_text {Enter start.*Esc cancel} new-dialog-workspace 168
+expect_text {Shift-Tab workspace} new-dialog-tab-stays-provider 175
+send -- "\033\[Z"
+expect_text {type/paste replace} new-dialog-workspace 168
 send -- "${workspace_partial}x"
 expect_text {project-com.*x} new-dialog-cursor-seed 169
 send -- "\033\[H"
@@ -109,9 +113,10 @@ send -- "\033\[F"
 send -- "\033\[D"
 send -- "\033\[3~"
 expect_text {project-complete/} new-dialog-workspace-suggestion 169
+send -- "\033\[B"
 send -- "\t"
 expect_text {Completed} new-dialog-workspace-completed 169
-send -- "\t"
+send -- "\033\[Z"
 send -- "\033\[C"
 expect_text {laude >} new-dialog-provider 171
 send -- "\r"

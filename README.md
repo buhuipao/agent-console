@@ -120,6 +120,9 @@ With the Sessions list focused:
 | --- | --- |
 | `↑` / `↓`, `j` / `k` | Select a session |
 | `Enter`, `Ctrl-O` | Open/resume and focus its agent |
+| `/` | Search sessions as you type |
+| `a` | Jump to the next unread alert |
+| `?` | Show the Workspace key bindings |
 | `n` | Create a session in the selected workspace |
 | `s` | Create and focus a shell |
 | `x` | Archive or restore the session |
@@ -142,11 +145,15 @@ Agent and shell viewport controls:
 | Drag | Select and copy immediately; do not press `Cmd-C` afterward |
 | Terminal bypass modifier + drag | Use native selection, then copy normally (`Option`-drag in iTerm2; commonly `Shift`-drag elsewhere) |
 
-The new-session dialog supports `Tab` / `Shift-Tab` between provider and
+The new-session dialog uses `Shift-Tab` to switch between provider and
 workspace, arrows (or `h` / `l`) to choose a provider, normal cursor movement
-and editing in the workspace path, Up/Down plus `Tab` for directory completion,
-`Enter` to start, and `Esc` to cancel. Search filters live; `Enter` keeps the
-filter and `Esc` restores it.
+and editing in the workspace path, Up/Down to choose a directory completion,
+`Tab` to accept it, `Enter` to start, and `Esc` to cancel. Search filters live
+on both Dashboard and the focused Sessions list; `Enter` keeps the filter and
+`Esc` restores it. It matches aliases, provider session names and generated
+titles, first/latest prompts, conversation summaries, Claude tags and PR/MR
+metadata, workspace names and paths, branches, provider session IDs, providers,
+statuses, and active/archived state.
 
 Agent Console does not reserve `Ctrl-T`, `Ctrl-Enter`, `Esc`, function keys, or
 unrelated Ctrl combinations from the focused Codex, Claude, or shell process.
@@ -159,6 +166,10 @@ bindings overridden in the configuration file.
   conversation. Disable them with `AGENT_CONSOLE_SUMMARIZER=off`.
 - Agent Console can reconnect only to processes it launched and owns. Existing
   sessions from other terminal tabs are resumed from their saved transcript.
+- Managed Codex sessions run with `--no-alt-screen`, allowing the Workspace
+  pane to retain and scroll the transcript in every Codex state.
+- Running Codex fork subagents are identified from transcript metadata and
+  disappear from Sessions when their final task completes or aborts.
 - Each managed pane retains up to 2,000 scrollback rows. The separate 128 KiB
   daemon replay tail is a reconnect transport bound; crossing it does not stop
   the process or discard Codex's retained viewport rows.

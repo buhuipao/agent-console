@@ -49,11 +49,38 @@ proc provider_launches {} {
     return $launches
 }
 
+proc clipboard_contents {} {
+    global state_dir
+    set path [file join $state_dir clipboard]
+    if {![file exists $path]} {
+        return ""
+    }
+    set channel [open $path r]
+    set contents [read $channel]
+    close $channel
+    return $contents
+}
+
 proc expect_text_without_alt_leave {pattern label code} {
     global spawn_id
     expect {
         -i $spawn_id -exact "\033\[?1049l" {
             fail "$label (left workspace screen)" $code
+        }
+        -i $spawn_id -re $pattern {
+            puts "ok $label"
+            flush stdout
+        }
+        -i $spawn_id timeout { fail $label $code }
+        -i $spawn_id eof { fail "$label (unexpected exit)" $code }
+    }
+}
+
+proc expect_text_without_clear {pattern label code} {
+    global spawn_id
+    expect {
+        -i $spawn_id -exact "\033\[2J" {
+            fail "$label (remounted workspace)" $code
         }
         -i $spawn_id -re $pattern {
             puts "ok $label"
@@ -86,6 +113,47 @@ send -- "echo AGENT_TITLE_CLICK_SAFE\r"
 expect_text {AGENT_TITLE_CLICK_SAFE} agent-title-click-does-not-exit 209
 send -- "\017"
 expect_text {FOCUS SESSIONS} browse-setup-sessions 185
+send -- "?"
+expect_text {WORKSPACE KEY BINDINGS} workspace-help-open 246
+expect_text {WORKSPACE · SESSIONS} workspace-help-session-controls 247
+send -- "?"
+expect_text {FOCUS SESSIONS} workspace-help-key-close 248
+send -- "?"
+expect_text {WORKSPACE KEY BINDINGS} workspace-help-reopen 249
+send -- "\033"
+expect_text {FOCUS SESSIONS} workspace-help-escape-close 250
+send -- "/"
+expect_text {SEARCH SESSIONS} workspace-search-open 229
+send -- "Exercise"
+expect_text {SESSION PREVIEW .*Exercise workspace controls} workspace-search-live 230
+send -- "\033"
+expect_text {FOCUS SESSIONS} workspace-search-cancel-focus 231
+expect_text {SESSION PREVIEW .*Verify the second dashboard session selection} workspace-search-cancel-selection 232
+send -- "/"
+expect_text {SEARCH SESSIONS} workspace-search-reopen 233
+send -- "Exercise"
+expect_text {SESSION PREVIEW .*Exercise workspace controls} workspace-search-live-again 234
+send -- "\r"
+expect_text_without_clear {FOCUS SESSIONS} workspace-search-commit-focus 235
+expect_text {SESSION PREVIEW .*Exercise workspace controls} workspace-search-commit-selection 236
+send -- "/"
+expect_text {SEARCH SESSIONS} workspace-search-clear-open 237
+send -- "\177\177\177\177\177\177\177\177\r"
+expect_text {FOCUS SESSIONS} workspace-search-clear-commit 238
+send -- "/"
+expect_text {SEARCH SESSIONS} workspace-search-empty-open 240
+send -- "definitely-no-match"
+expect_text {No selected session} workspace-search-empty-live 241
+send -- "\r"
+expect_text {No selected session} workspace-search-empty-stays-in-sessions 243
+expect_text {FOCUS SESSIONS} workspace-search-empty-commit 242
+send -- "/"
+expect_text {SEARCH SESSIONS} workspace-search-empty-clear-open 244
+send -- [string repeat "\177" 19]
+send -- "\r"
+expect_text {FOCUS SESSIONS} workspace-search-empty-clear-commit 245
+send -- "k"
+expect_text_without_alt_leave {SESSION PREVIEW .*Verify the second dashboard session selection} workspace-search-restored-browse-order 239
 send -- "j"
 expect_text_without_alt_leave {SESSION PREVIEW .*Exercise workspace controls} browse-without-dashboard 186
 if {[provider_launches] != 1} { fail browse-started-provider 187 }
@@ -135,6 +203,25 @@ send -- "\035"
 expect_text {Exercise workspace controls} Ctrl-bracket-jump 148
 send -- "\r"
 expect_text {FOCUS AGENT} alert-target-agent 149
+set second_event_file [file join $state_dir events codex-e2e-session-second.jsonl]
+set second_event_channel [open $second_event_file w]
+puts $second_event_channel {{"provider":"codex","session_id":"e2e-session-second","event_id":"workspace-second-alert","timestamp":2,"kind":"approval_requested","text":"Second session needs attention"}}
+close $second_event_channel
+expect_text {ALERT .*Second session needs attention} workspace-second-alert 251
+send -- "\017"
+expect_text {FOCUS SHELL 1/1} alert-a-setup-shell 252
+send -- "\017"
+expect_text {FOCUS SESSIONS} alert-a-setup-sessions 253
+send -- "a"
+expect_text {Verify the second dashboard session selection} session-list-a-jump 254
+send -- "\r"
+expect_text {FOCUS AGENT} session-list-a-target-agent 255
+send -- "\021"
+expect_text {Agent Console} session-list-a-return-dashboard 256
+send -- "k"
+send -- "\r"
+expect_text {AGENT .*Exercise workspace controls} restore-first-session-after-a 257
+expect_text {FOCUS AGENT} restore-first-session-focus 258
 send -- "\017"
 expect_text {FOCUS SHELL 1/1} Ctrl-O 122
 send -- {stty -echo -icanon min 1 time 0; byte=$(/usr/bin/od -An -tx1 -N1); stty sane; echo ESC_BYTE_FORWARDED:$byte}
@@ -156,8 +243,8 @@ expect_text {selected shell 1} select-shell-1 167
 send -- "\017"
 expect_text {FOCUS SESSIONS} session-list-layout 168
 send -- "m"
-expect_text {shell maximized} maximize-selected-shell 170
 expect_text {FOCUS SHELL 1/2} maximize-focuses-previous-shell 171
+expect_text {shell maximized} maximize-selected-shell 170
 send -- "\017"
 expect_text {SESSION PREVIEW .*Exercise workspace controls} maximize-return-restores-overview 225
 expect_text {FOCUS SESSIONS} maximize-return-focuses-sessions 226
@@ -225,13 +312,21 @@ for {set i 1} {$i <= 40} {incr i} {
     send -- "agent-history-$i\r"
 }
 expect_text {agent-history-40} agent-scroll-output 145
+send -- "\033\[?1002h\033\[?1006h"
+after 100
 send -- "\033\[<64;30;10M"
-expect_text {AGENT.*SCROLL \+[1-9][0-9]*} agent-mouse-wheel 146
+expect_text {AGENT.*SCROLL \+[1-9][0-9]*} agent-mouse-wheel-with-child-reporting 146
 send -- "\033\[1;2F"
 after 100
+send -- "\033\[?1002h\033\[?1006h"
+after 100
 send -- "\033\[<0;22;2M"
+send -- "\033\[<32;25;2M"
 send -- "\033\[<0;25;2m"
 expect_text {selection copied} mouse-selection-copy 138
+if {[clipboard_contents] != "agen"} { fail agent-clipboard-content 149 }
+puts "ok agent-clipboard-content"
+flush stdout
 send -- "\017"
 expect_text {FOCUS SHELL 1/1} scroll-shell 139
 send -- "i=1; while \[ \$i -le 40 \]; do echo history-\$i; i=\$((i+1)); done\r"
@@ -244,6 +339,13 @@ send -- "\033\[<64;30;23M"
 expect_text {SCROLL \+[1-9][0-9]*} mouse-wheel 142
 send -- "\033\[1;2F"
 after 100
+send -- "\033\[<0;22;22M"
+send -- "\033\[<32;28;22M"
+send -- "\033\[<0;28;22m"
+expect_text {selection copied · 7 chars} shell-mouse-selection-copy 150
+if {[clipboard_contents] != "history"} { fail shell-clipboard-content 151 }
+puts "ok shell-clipboard-content"
+flush stdout
 send -- "\033\[M`>7"
 expect_text {SCROLL \+[1-9][0-9]*} legacy-mouse-wheel 145
 send -- "\033\[1;2F"

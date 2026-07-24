@@ -428,28 +428,23 @@ fn handle_dialog_key(
 ) -> io::Result<()> {
     match key {
         KeyCode::Esc => app.cancel_dialog(),
+        KeyCode::BackTab => {
+            if let Some(dialog) = &mut app.dialog {
+                dialog.field = toggle_dialog_field(dialog.field);
+                dialog.error = None;
+            }
+        }
         KeyCode::Tab
             if app.dialog.as_ref().is_some_and(|dialog| {
                 dialog.field == DialogField::Cwd
                     && !dialog.cwd_replace_on_input
                     && !dialog.cwd_completion_accepted
+                    && dialog.cwd_cursor == dialog.cwd.chars().count()
                     && !dialog_workspace_completions(dialog, dirs::home_dir().as_deref()).is_empty()
             }) =>
         {
             if let Some(dialog) = &mut app.dialog {
                 accept_workspace_completion(dialog);
-            }
-        }
-        KeyCode::Tab | KeyCode::BackTab => {
-            if let Some(dialog) = &mut app.dialog {
-                dialog.field = cycle_dialog_field(dialog.field, key == KeyCode::BackTab);
-                if dialog.field == DialogField::Cwd {
-                    dialog.cwd_replace_on_input = true;
-                    dialog.cwd_cursor = dialog.cwd.chars().count();
-                    dialog.cwd_completion_index = 0;
-                    dialog.cwd_completion_accepted = false;
-                }
-                dialog.error = None;
             }
         }
         KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l')
@@ -678,10 +673,10 @@ fn accept_workspace_completion(dialog: &mut app::NewSessionDialog) {
     }
 }
 
-fn cycle_dialog_field(field: DialogField, backwards: bool) -> DialogField {
-    match (field, backwards) {
-        (DialogField::Provider, false) | (DialogField::Provider, true) => DialogField::Cwd,
-        (DialogField::Cwd, false) | (DialogField::Cwd, true) => DialogField::Provider,
+fn toggle_dialog_field(field: DialogField) -> DialogField {
+    match field {
+        DialogField::Provider => DialogField::Cwd,
+        DialogField::Cwd => DialogField::Provider,
     }
 }
 
@@ -1482,18 +1477,18 @@ fn draw_new_session_dialog(frame: &mut Frame, dialog: &app::NewSessionDialog) {
     };
     let guidance = if dialog.field == DialogField::Cwd {
         if dialog.cwd_replace_on_input {
-            "type/paste replace · arrows edit · Tab field · Enter start · Esc cancel"
+            "type/paste replace · arrows edit · Shift-Tab provider · Enter start · Esc cancel"
         } else if dialog.cwd_cursor < dialog.cwd.chars().count() {
-            "arrows move · Bksp/Del edit · Tab field · Enter start · Esc cancel"
+            "arrows move · Bksp/Del edit · Shift-Tab provider · Enter start · Esc cancel"
         } else if dialog.cwd_completion_accepted {
-            "Completed · type child or Tab provider · Enter start · Esc cancel"
+            "Completed · type child or Shift-Tab provider · Enter start · Esc cancel"
         } else if !completions.is_empty() {
-            "↑/↓ choose · Tab complete · Enter start · Esc cancel"
+            "↑/↓ choose · Tab complete · Shift-Tab provider · Enter start · Esc cancel"
         } else {
-            "type/paste path · arrows move · Enter validate · Esc cancel"
+            "type/paste path · arrows move · Shift-Tab provider · Enter validate · Esc cancel"
         }
     } else {
-        "Tab/Shift-Tab field · arrows/h/l change · Enter start · Esc cancel"
+        "Shift-Tab workspace · arrows/h/l change · Enter start · Esc cancel"
     };
     let mut workspace_line = vec![Span::styled(
         "workspace ",
@@ -1630,18 +1625,8 @@ mod tests {
 
     #[test]
     fn shift_tab_moves_new_session_fields_backwards() {
-        assert_eq!(
-            cycle_dialog_field(DialogField::Provider, true),
-            DialogField::Cwd
-        );
-        assert_eq!(
-            cycle_dialog_field(DialogField::Cwd, false),
-            DialogField::Provider
-        );
-        assert_eq!(
-            cycle_dialog_field(DialogField::Provider, false),
-            DialogField::Cwd
-        );
+        assert_eq!(toggle_dialog_field(DialogField::Provider), DialogField::Cwd);
+        assert_eq!(toggle_dialog_field(DialogField::Cwd), DialogField::Provider);
     }
 
     #[test]
@@ -2024,7 +2009,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(provider.contains("Tab/Shift-Tab field"));
+        assert!(provider.contains("Shift-Tab workspace"));
         assert!(provider.contains("Enter start"));
         assert!(provider.contains("Esc cancel"));
 
@@ -2037,7 +2022,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(workspace.contains("Tab field"));
+        assert!(workspace.contains("Shift-Tab provider"));
         assert!(workspace.contains("Enter start"));
         assert!(workspace.contains("Esc cancel"));
     }

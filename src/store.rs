@@ -436,6 +436,7 @@ mod tests {
             key: "claude:id".into(),
             provider_session_id: "id".into(),
             name: "repo".into(),
+            search_terms: Vec::new(),
             agent: AgentKind::Claude,
             status: SessionStatus::Idle,
             cwd: "/tmp".into(),

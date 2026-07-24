@@ -1,0 +1,3 @@
+[providers]
+codex = ["/bin/zsh", "tests/e2e/codex_without_hooks.zsh"]
+claude = ["claude"]

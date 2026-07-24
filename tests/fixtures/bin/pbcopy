@@ -1,2 +1,6 @@
 #!/bin/sh
+if [ -n "${AGENT_CONSOLE_STATE_DIR-}" ]; then
+    umask 077
+    exec /bin/cat >"$AGENT_CONSOLE_STATE_DIR/clipboard"
+fi
 exec /bin/cat >/dev/null

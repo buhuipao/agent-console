@@ -195,9 +195,19 @@ Scan `$CODEX_HOME/sessions`, or `~/.codex/sessions` when `CODEX_HOME` is unset,
 for `rollout-*.jsonl` files. Sort by modification time descending and inspect at
 most the newest 60 files. Reuse parsed results while file metadata is unchanged.
 
-Read `session_meta.payload` for `id` and `cwd`. Read only a bounded tail for
+Read the first `session_meta.payload` for the transcript's own `id`; fork
+transcripts may contain a later copy of the parent's metadata. Read `cwd` from
+metadata and turn context. Identify a fork subagent from
+`thread_source = "subagent"` or `source.subagent`. Show it only while its latest
+task lifecycle record is `task_started`; remove it from Sessions after
+`task_complete`, `turn_aborted`, or `stream_error`. Read only a bounded tail for
 recent user, agent, tool, and completion records. The transcript format is an
 observation fallback, not a write interface.
+
+When the newest `$CODEX_HOME/state_<version>.sqlite` is readable, enrich the
+session with the provider's name, extracted title, first user message, and
+preview from its `threads` row. Database enrichment is read-only and optional;
+an absent database or incompatible schema must not hide transcript sessions.
 
 Resume command:
 
@@ -222,8 +232,10 @@ Ignore claude-mem's internal observer sessions whose cwd is
 `~/.claude-mem/observer-sessions`; they summarize another primary session and
 are not user workspaces.
 
-Read `sessionId`, `cwd`, `gitBranch`, user messages, assistant messages, and
-tool results from a bounded tail.
+Read `sessionId`, `cwd`, `gitBranch`, provider/AI/custom titles, first and
+latest prompts, conversation summaries, tags, PR/MR links, user messages,
+assistant messages, and tool results from the bounded transcript head and
+tail.
 
 Resume command:
 
@@ -309,6 +321,8 @@ Entering a workspace:
    totals using the Dashboard status colors. Its `Cdx` and `Cla` labels use the
    same provider colors as the Dashboard.
 3. Render the agent PTY in the upper-right pane.
+   Launch Codex with `--no-alt-screen` so its transcript becomes retained pane
+   history instead of an application-private alternate-screen page.
 4. Render up to three shell PTYs side by side in the lower-right pane and all
    shell identities in a list at the far right.
 5. Resize each visible child PTY to its pane.
@@ -329,8 +343,10 @@ Entering a workspace:
    focus, allowing nested providers to distinguish `Ctrl-Enter` from Enter
    without changing interactive Shell input.
 8. Session-list focus is navigation, not a separate command mode. Up/Down or
-   `j`/`k` selects sessions; Enter activates the selected Agent; `n` opens a
-   new-session dialog using the selected workspace; `s` creates a Shell;
+   `j`/`k` selects sessions; Enter activates the selected Agent; `/` searches
+   sessions live; `a` jumps to the next unread alert; `?` opens the effective
+   Workspace key-binding panel; `n` opens a new-session dialog using the
+   selected workspace; `s` creates a Shell;
    `m` maximizes and focuses the previously selected Shell; `h` starts/resumes,
    maximizes, and focuses the selected Agent. Returning to Session-list focus
    restores the regular Agent/Shell split; `+`/`_`
@@ -344,12 +360,15 @@ Each agent and shell has an independent viewport. `Shift-PageUp` and
 `Shift-PageDown` move it through retained history, `Shift-End` returns to the
 live tail, and the pane title displays the current `SCROLL +N` offset. Ordinary
 child input first returns the focused pane to the live tail. A full-screen
-agent that enables mouse reporting receives its native click, drag, and wheel
-events; ordinary outer drag selection copies immediately, while the terminal's
-mouse-reporting bypass modifier (for example, Option in iTerm2) remains
-available for terminal-native text selection. A full-screen
-agent without mouse reporting receives alternate-screen cursor scroll events,
-matching terminal-emulator behavior used by Claude Code.
+agent that enables mouse reporting receives its native clicks. Its native
+wheel receives events only at the live tail when no retained outer history can
+move; otherwise the wheel scrolls Agent Console's independent viewport. An
+ordinary outer drag is reserved for Agent Console selection and copies on
+release; no separate copy shortcut is required. The terminal's mouse-reporting
+bypass modifier (for example, Option in iTerm2) remains available for
+terminal-native text selection followed by the terminal's normal copy command.
+A full-screen agent without mouse reporting receives alternate-screen cursor
+scroll events, matching terminal-emulator behavior used by Claude Code.
 
 Each outer viewport retains up to 2,000 rows independently of the 128 KiB raw
 daemon replay tail. When a Codex-style partial scroll region has outgrown that
@@ -500,6 +519,9 @@ Ctrl-O/Q/]       Focus cycle / Dashboard / unread alert (all Workspace modes)
 Ctrl-\            Add and focus a Shell (Agent or Shell focus)
 Ctrl-N/X         Next / close Shell (Shell focus only; forwarded in Agent)
 j/k or Up/Down   Select session (FOCUS SESSIONS only)
+/                 Search sessions (FOCUS SESSIONS only)
+a                Jump to next unread alert (FOCUS SESSIONS only)
+?                 Open Workspace key-binding panel (FOCUS SESSIONS only)
 n/s              New session / add Shell (FOCUS SESSIONS only)
 1..9             Select shell (FOCUS SESSIONS only)
 m                Maximize and focus last-selected Shell (FOCUS SESSIONS only)
@@ -535,13 +557,17 @@ blocker. Red/yellow/green borders retain failed/waiting/working meaning. The
 selected card keeps a background and marker so selection remains visible when
 the grid scrolls.
 
-Search matches user alias, summarized task, path, branch, provider session ID,
-provider, workspace, and status. Search filters the session list after every
-typed character or Backspace; the dialog explicitly labels live filtering,
-Enter keeping the current query, and Esc restoring the query and selection
-from before the search dialog opened. The Dashboard session list responds to
-the mouse wheel. In Workspace, the mouse wheel scrolls the independent agent or shell
-viewport under the pointer using either SGR or legacy X10 mouse input.
+Search matches user alias, provider session name, generated title, first and
+latest user prompts, conversation summary, Claude tag and PR/MR metadata,
+workspace name, full cwd, branch, provider session ID, provider, status, and
+active/archived state. Search is available from Dashboard and from the focused
+Workspace Sessions list. It filters the session list after every typed
+character or Backspace; the search UI explicitly labels live filtering, Enter
+fixing the current query without remounting the Workspace, and Esc restoring
+the query and selection from before search opened. The Dashboard session list
+responds to the mouse wheel. In Workspace, the mouse wheel scrolls the
+independent agent or shell viewport under the pointer using either SGR or
+legacy X10 mouse input.
 Aliases and archive state are persistent user metadata. Archive moves a
 session into one dimmed `Archived` group after all active workspace groups.
 Archived sessions remain selectable and `x` restores them to their workspace
@@ -561,20 +587,21 @@ The dialog has two fields in focus order:
 1. provider: toggle with Left/Right or `h`/`l`, values `codex` and `claude`;
 2. workspace: editable text, initialized to the dashboard startup directory.
 
-Tab moves to the next field and Shift-Tab moves to the previous field.
-Focusing workspace selects the whole initial value. The first typed or pasted
-character replaces it; Backspace/Delete clears it. Store a Unicode-scalar
-caret position. Left/Right moves one character, Home/End jumps to the start or
-end, typed input inserts at the caret, Backspace removes the preceding
-character, and Delete removes the following character. Render a visible caret
-and a horizontally cropped long path with ellipses while keeping the caret in
-view.
+Shift-Tab is the sole field-switching key and toggles between provider and
+workspace. Focusing workspace selects the whole initial value. The first typed
+or pasted character replaces it; Backspace/Delete clears it. Store a
+Unicode-scalar caret position. Left/Right moves one character, Home/End jumps
+to the start or end, typed input inserts at the caret, Backspace removes the
+preceding character, and Delete removes the following character. Render a
+visible caret and a horizontally cropped long path with ellipses while keeping
+the caret in view.
 While editing, enumerate matching filesystem directories only. Up/Down changes
-the candidate, Tab completes it with a trailing separator, and the field stays
-active for child-directory completion. Right remains a caret key. The next Tab
-returns to provider. Preserve a leading `~/` in displayed completions. Enter
-validates that cwd is a directory, creates the provider session, closes the
-dialog, selects the session, and immediately enters its native terminal.
+the candidate. Tab accepts the selected candidate with a trailing separator
+and keeps the workspace field active for child-directory completion. Tab has no
+field-switching behavior. Right remains a caret key. Preserve a leading `~/` in
+displayed completions. Enter validates that cwd is a directory, creates the
+provider session, closes the dialog, selects the session, and immediately
+enters its native terminal.
 Validation errors stay in the dialog. Guidance on the last row changes with
 the active field/completion state and always exposes field movement, editing or
 completion, Enter, and Esc. The search and alias dialogs similarly expose live

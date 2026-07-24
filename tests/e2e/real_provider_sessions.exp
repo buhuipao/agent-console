@@ -2,10 +2,15 @@
 
 set timeout 45
 set root [file normalize [file join [file dirname [info script]] ../..]]
-set binary [file join $root target debug agent-console]
+if {[info exists env(AGENT_CONSOLE_TEST_BINARY)]} {
+    set binary $env(AGENT_CONSOLE_TEST_BINARY)
+} else {
+    set binary [file join $root target debug agent-console]
+}
 set state_dir [file join /tmp "agent-console-real-sessions-[pid]"]
 set env(AGENT_CONSOLE_STATE_DIR) $state_dir
 set env(AGENT_CONSOLE_SUMMARIZER) off
+set env(AGENT_CONSOLE_CONFIG) [file join $root tests fixtures real-provider-config.toml]
 log_user 0
 
 proc cleanup {} {
@@ -50,27 +55,31 @@ proc expect_workspace {provider_pattern label code} {
     flush stdout
 }
 
+proc expect_codex_workspace {label code} {
+    expect_workspace {OpenAI Codex|Codex CLI} "$label-provider" $code
+    after 2500
+    puts "ok $label"
+    flush stdout
+}
+
 spawn /bin/sh -c [format {cd "%s"; stty rows 34 columns 140; exec "%s"} $root $binary]
 expect_text {Agent Console} dashboard-ready 180
 
-# Start a real Codex session, refresh discovery, kill the PTY owner, and enter
-# again through the provider resume contract.
+# Start a real Codex session, leave it through Codex's native Ctrl-D command,
+# and enter it again through the provider resume contract.
 send -- "n"
 expect_text {NEW SESSION} codex-new-dialog 181
 send -- "\r"
-expect_workspace {OpenAI Codex|Codex CLI|Hooks need review} codex-new-session 182
-after 1200
-send -- "\021"
-expect_text {Agent Console|SESSION OVERVIEW} codex-back-dashboard 183
-after 2500
-catch {exec $binary pty-daemon-stop [file join $state_dir pty-daemon.sock]}
-after 300
+expect_codex_workspace codex-new-session 182
+send -- "\033\[100;5u"
+expect_text {FOCUS SESSIONS} codex-ctrl-d-back-to-sessions 183
 send -- "\r"
-expect_workspace {OpenAI Codex|Codex CLI|Hooks need review} codex-resume 185
+expect_codex_workspace codex-resume 185
 send -- "\021"
 expect_text {Agent Console|SESSION OVERVIEW} codex-resume-dashboard 186
 
-# Start and resume Claude through the same lifecycle.
+# Claude does not use Codex's native Ctrl-D exit contract. Verify that a
+# retained Claude session still resumes after the daemon owner disappears.
 send -- "n"
 expect_text {NEW SESSION} claude-new-dialog 187
 send -- "\033\[C"
@@ -89,7 +98,7 @@ expect_text {Agent Console|SESSION OVERVIEW} claude-resume-dashboard 192
 send -- "q"
 expect {
     -i $spawn_id eof {
-        puts "E2E passed: real Codex and Claude new-session/resume lifecycle"
+        puts "E2E passed: native Codex Ctrl-D resume and retained Claude resume lifecycle"
         flush stdout
     }
     -i $spawn_id timeout { fail real-provider-quit 193 }

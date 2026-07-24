@@ -57,6 +57,9 @@ const WORKSPACE_ACTIONS: &[&str] = &[
     "close_shell",
     "dashboard",
     "alert",
+    "search",
+    "session_alert",
+    "help",
     "previous_session",
     "next_session",
     "maximize",
@@ -263,6 +266,9 @@ impl AgentConsoleConfig {
                 "WORKSPACE · SESSION LIST",
                 [
                     ("previous_shell", "previous shell"),
+                    ("search", "search sessions"),
+                    ("session_alert", "unread alert"),
+                    ("help", "help"),
                     ("maximize", "focus last shell"),
                     ("hide_shells", "focus agent"),
                     ("grow_shell", "grow shell area"),
@@ -516,6 +522,9 @@ fn default_workspace_keys(action: &str) -> &'static [&'static str] {
         "close_shell" => &["ctrl-x"],
         "dashboard" => &["ctrl-q"],
         "alert" => &["ctrl-]"],
+        "search" => &["/"],
+        "session_alert" => &["a"],
+        "help" => &["?"],
         "previous_session" | "next_session" => &[],
         "maximize" => &["m"],
         "hide_shells" => &["h"],
@@ -737,6 +746,9 @@ mod tests {
         assert_eq!(config.workspace_keys("close_shell"), vec!["ctrl-x"]);
         assert_eq!(config.workspace_keys("dashboard"), vec!["ctrl-q"]);
         assert_eq!(config.workspace_keys("alert"), vec!["ctrl-]"]);
+        assert_eq!(config.workspace_keys("search"), vec!["/"]);
+        assert_eq!(config.workspace_keys("session_alert"), vec!["a"]);
+        assert_eq!(config.workspace_keys("help"), vec!["?"]);
         assert!(config.workspace_keys("previous_session").is_empty());
         assert!(config.workspace_keys("next_session").is_empty());
         assert_eq!(config.workspace_keys("maximize"), vec!["m"]);

@@ -15,8 +15,8 @@ use crate::{
     events::{self, NormalizedEvent},
     model::{AgentKind, Session, SessionStatus, SessionSummary, unix_timestamp},
     pty::{
-        TerminalManager, WorkspaceChrome, WorkspaceExit, WorkspaceFocus, bracketed_paste,
-        staged_shell_text,
+        TerminalManager, WorkspaceChrome, WorkspaceExit, WorkspaceFocus, WorkspaceSearchUpdate,
+        bracketed_paste, staged_shell_text,
     },
     store::StateStore,
     summary::{SummaryBackend, SummaryJob, SummaryWorker},
@@ -436,12 +436,7 @@ impl App {
     }
 
     fn normalize_selection(&mut self) {
-        let order = self.runtime.session_display_order();
-        if !order.contains(&self.runtime.selected)
-            && let Some(first) = order.first()
-        {
-            self.runtime.selected = *first;
-        }
+        self.runtime.normalize_selection();
     }
 
     pub fn create_from_dialog(&mut self) -> Result<(), String> {
@@ -467,6 +462,7 @@ impl App {
                 key,
                 provider_session_id: id,
                 name,
+                search_terms: Vec::new(),
                 agent: dialog.provider,
                 status: SessionStatus::Idle,
                 cwd,
@@ -603,6 +599,12 @@ impl App {
                     self.terminals.set_notice(&session.key, notice);
                     focus = WorkspaceFocus::Sessions;
                 }
+                WorkspaceExit::RefreshSessions => {
+                    if self.selected_session().is_some() {
+                        session = self.prepare_selected_view(current_exe)?;
+                    }
+                    focus = WorkspaceFocus::Sessions;
+                }
                 WorkspaceExit::PreviousSession(next_focus) => {
                     self.select_previous();
                     focus = next_focus;
@@ -655,18 +657,21 @@ impl App {
             .into_iter()
             .collect::<HashSet<_>>();
         let mut pending_rekeys = Vec::new();
-        let result = self
-            .terminals
-            .attach_workspace(session, focus, force_takeover, || {
-                let rekeys = self.runtime.tick(&alive);
-                for (old_key, new_key) in rekeys {
-                    if alive.remove(&old_key) {
-                        alive.insert(new_key.clone());
+        let result =
+            self.terminals
+                .attach_workspace(session, focus, force_takeover, |search_update| {
+                    if let Some(search_update) = search_update {
+                        self.runtime.apply_workspace_search(search_update);
                     }
-                    pending_rekeys.push((old_key, new_key));
-                }
-                self.runtime.workspace_chrome()
-            });
+                    let rekeys = self.runtime.tick(&alive);
+                    for (old_key, new_key) in rekeys {
+                        if alive.remove(&old_key) {
+                            alive.insert(new_key.clone());
+                        }
+                        pending_rekeys.push((old_key, new_key));
+                    }
+                    self.runtime.workspace_chrome()
+                });
         for (old_key, new_key) in pending_rekeys {
             self.terminals.rekey(&old_key, new_key);
         }
@@ -1022,15 +1027,46 @@ impl RuntimeState {
         order
     }
 
+    fn normalize_selection(&mut self) {
+        let order = self.session_display_order();
+        if !order.contains(&self.selected)
+            && let Some(first) = order.first()
+        {
+            self.selected = *first;
+        }
+    }
+
+    fn apply_workspace_search(&mut self, update: WorkspaceSearchUpdate) {
+        match update {
+            WorkspaceSearchUpdate::Preview(query) => {
+                self.filter.query = query.trim().to_lowercase();
+                self.normalize_selection();
+            }
+            WorkspaceSearchUpdate::Cancel {
+                query,
+                selected_session_key,
+            } => {
+                self.filter.query = query;
+                if let Some(index) = selected_session_key
+                    .and_then(|key| self.sessions.iter().position(|session| session.key == key))
+                {
+                    self.selected = index;
+                }
+                self.normalize_selection();
+            }
+        }
+    }
+
     fn session_is_visible(&self, session: &Session) -> bool {
         if self.filter.query.is_empty() {
             return true;
         }
         let alias = self.store.alias(&session.key).unwrap_or_default();
         let haystack = format!(
-            "{alias} {} {} {} {} {} {} {} {}",
+            "{alias} {} {} {} {} {} {} {} {} {}",
             session.summary.task,
             session.name,
+            session.search_terms.join(" "),
             session.cwd.display(),
             session.branch.as_deref().unwrap_or_default(),
             session.provider_session_id,
@@ -1067,7 +1103,9 @@ impl RuntimeState {
         let mut selected_row = 0;
         let mut last_workspace = None;
         let mut archived_group = false;
-        for index in self.session_display_order() {
+        let order = self.session_display_order();
+        let selected_visible = order.contains(&self.selected);
+        for index in order {
             let session = &self.sessions[index];
             let archived = self.store.archived(&session.key);
             if archived && !archived_group {
@@ -1094,9 +1132,9 @@ impl RuntimeState {
                 self.session_title(session)
             ));
         }
-        let preview = self
-            .sessions
-            .get(self.selected)
+        let preview = selected_visible
+            .then(|| self.sessions.get(self.selected))
+            .flatten()
             .map(|session| {
                 let mut preview = vec![
                     format!(
@@ -1126,6 +1164,11 @@ impl RuntimeState {
         WorkspaceChrome {
             sessions: lines,
             selected: selected_row,
+            selected_session_key: selected_visible
+                .then(|| self.sessions.get(self.selected))
+                .flatten()
+                .map(|session| session.key.clone()),
+            search_query: self.filter.query.clone(),
             status_counts: session_status_counts(&self.sessions),
             preview,
             notification: self.active_notification().map(|notification| {
@@ -1506,6 +1549,7 @@ impl App {
             key: "codex:test".into(),
             provider_session_id: "test".into(),
             name: "backend-api".into(),
+            search_terms: Vec::new(),
             agent: AgentKind::Codex,
             status: SessionStatus::Working,
             cwd: "/tmp/backend-api".into(),
@@ -1971,6 +2015,7 @@ mod tests {
         claude.agent = AgentKind::Claude;
         claude.cwd = "/tmp/other".into();
         claude.summary.task = "Investigate API latency".into();
+        claude.search_terms = vec!["OIDC rollout".into(), "pr #4869 deepmap/airflow".into()];
         app.sessions.push(claude);
 
         app.open_search_dialog();
@@ -1979,12 +2024,44 @@ mod tests {
         assert_eq!(app.session_display_order(), vec![1]);
         assert_eq!(app.selected, 1);
 
-        for query in ["claude", "other", "idle"] {
+        for query in [
+            "claude",
+            "other",
+            "idle",
+            "oidc rollout",
+            "pr #4869",
+            "deepmap/airflow",
+        ] {
             app.open_search_dialog();
             app.text_dialog.as_mut().unwrap().value = query.into();
             app.commit_text_dialog().unwrap();
             assert_eq!(app.session_display_order(), vec![1]);
         }
+    }
+
+    #[test]
+    fn workspace_search_preview_and_cancel_restore_the_original_session() {
+        let mut app = App::test_fixture();
+        let original_key = app.sessions[0].key.clone();
+        let mut claude = fixture_session("claude:latency");
+        claude.agent = AgentKind::Claude;
+        claude.summary.task = "Investigate API latency".into();
+        app.sessions.push(claude);
+
+        app.runtime
+            .apply_workspace_search(WorkspaceSearchUpdate::Preview("LATENCY".into()));
+        assert_eq!(app.runtime.filter.query, "latency");
+        assert_eq!(app.session_display_order(), vec![1]);
+        assert_eq!(app.selected, 1);
+
+        app.runtime
+            .apply_workspace_search(WorkspaceSearchUpdate::Cancel {
+                query: String::new(),
+                selected_session_key: Some(original_key),
+            });
+        assert!(app.runtime.filter.query.is_empty());
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.session_display_order(), vec![0, 1]);
     }
 
     #[test]
@@ -2169,6 +2246,7 @@ mod tests {
             key: key.into(),
             provider_session_id: key.split(':').nth(1).unwrap().into(),
             name: key.into(),
+            search_terms: Vec::new(),
             agent: AgentKind::Codex,
             status: SessionStatus::Idle,
             cwd: "/tmp".into(),

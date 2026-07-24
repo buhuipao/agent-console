@@ -1757,6 +1757,7 @@ pub struct SessionTerminals {
     shells: Vec<ShellPane>,
     pub selected_shell: usize,
     selection: Option<TerminalSelection>,
+    pending_agent_click: Option<PendingAgentClick>,
     notice: Option<String>,
     daemon_socket: Option<PathBuf>,
     lease_owner_id: String,
@@ -1794,8 +1795,17 @@ pub enum WorkspaceExit {
     NewSession,
     OpenShell,
     ToggleArchive,
+    RefreshSessions,
     PreviousSession(WorkspaceFocus),
     NextSession(WorkspaceFocus),
+}
+
+pub enum WorkspaceSearchUpdate {
+    Preview(String),
+    Cancel {
+        query: String,
+        selected_session_key: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1811,13 +1821,77 @@ struct TerminalSelection {
     end: TerminalCell,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingAgentClick {
+    event: WorkspaceMouseEvent,
+    cell: TerminalCell,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkspaceChrome {
     pub sessions: Vec<String>,
     pub selected: usize,
+    pub selected_session_key: Option<String>,
+    pub search_query: String,
     pub status_counts: (usize, usize, usize, usize),
     pub preview: Vec<String>,
     pub notification: Option<String>,
+}
+
+struct WorkspaceSearch {
+    value: String,
+    original_query: String,
+    original_selected_session_key: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkspaceSearchInput {
+    Editing,
+    Commit,
+    Cancel,
+}
+
+fn apply_workspace_search_input(
+    search: &mut WorkspaceSearch,
+    input: &[u8],
+) -> (WorkspaceSearchInput, bool) {
+    let mut text = Vec::new();
+    let mut changed = false;
+    let flush_text = |text: &mut Vec<u8>, value: &mut String| {
+        let appended = std::str::from_utf8(text)
+            .ok()
+            .map(|text| {
+                text.chars()
+                    .filter(|character| !character.is_control())
+                    .collect::<String>()
+            })
+            .filter(|text| !text.is_empty());
+        text.clear();
+        if let Some(appended) = appended {
+            value.push_str(&appended);
+            true
+        } else {
+            false
+        }
+    };
+
+    for byte in input {
+        match *byte {
+            0x1b => return (WorkspaceSearchInput::Cancel, changed),
+            b'\r' | b'\n' => {
+                changed |= flush_text(&mut text, &mut search.value);
+                return (WorkspaceSearchInput::Commit, changed);
+            }
+            0x08 | 0x7f => {
+                changed |= flush_text(&mut text, &mut search.value);
+                changed |= search.value.pop().is_some();
+            }
+            byte if byte.is_ascii_control() => {}
+            byte => text.push(byte),
+        }
+    }
+    changed |= flush_text(&mut text, &mut search.value);
+    (WorkspaceSearchInput::Editing, changed)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1835,6 +1909,13 @@ struct WorkspaceLayout {
     shell_panes: Vec<(usize, PaneRect)>,
     shell_list: Option<PaneRect>,
     status_row: u16,
+}
+
+#[derive(Clone, Copy)]
+struct WorkspaceRenderState<'a> {
+    focus: WorkspaceFocus,
+    search: Option<&'a str>,
+    help: bool,
 }
 
 impl WorkspaceLayout {
@@ -2029,6 +2110,8 @@ enum WorkspaceCommand {
     CloseShell,
     Dashboard,
     Alert,
+    Search,
+    Help,
     PreviousSession,
     NextSession,
     SelectShell(usize),
@@ -2060,6 +2143,9 @@ impl WorkspaceBindings {
             ("close_shell", WorkspaceCommand::CloseShell),
             ("dashboard", WorkspaceCommand::Dashboard),
             ("alert", WorkspaceCommand::Alert),
+            ("search", WorkspaceCommand::Search),
+            ("session_alert", WorkspaceCommand::Alert),
+            ("help", WorkspaceCommand::Help),
             ("previous_session", WorkspaceCommand::PreviousSession),
             ("next_session", WorkspaceCommand::NextSession),
             ("maximize", WorkspaceCommand::ToggleMaximize),
@@ -2498,6 +2584,8 @@ fn workspace_command_active(
             focus == WorkspaceFocus::Shell
         }
         WorkspaceCommand::PreviousShell
+        | WorkspaceCommand::Search
+        | WorkspaceCommand::Help
         | WorkspaceCommand::SelectShell(_)
         | WorkspaceCommand::ToggleMaximize
         | WorkspaceCommand::ToggleShellArea
@@ -2636,19 +2724,76 @@ impl SessionTerminals {
         let Some((pane, cell)) = pane_at(layout, col, row) else {
             return Ok(());
         };
+        let button = event.button & !(4 | 8 | 16 | 32);
+        let dragging = event.button & 32 != 0;
         if pane == PaneTarget::Agent
-            && event.button & 4 == 0
+            && matches!(button, 64 | 65)
             && let Some(terminal) = self.terminal(pane)
         {
-            let (mode, encoding) = terminal.mouse_protocol();
-            if mode != vt100::MouseProtocolMode::None
-                && let Some(bytes) = encoded_child_mouse_event(event, cell, encoding)
-            {
-                terminal.write(&bytes)?;
+            let before = terminal.scrollback_offset();
+            let amount = if button == 64 { 3 } else { -3 };
+            let after = terminal.scroll_viewport(amount);
+            if before > 0 || after > 0 {
                 return Ok(());
             }
         }
-        let button = event.button & !(4 | 8 | 16 | 32);
+        if pane == PaneTarget::Agent && event.button & 4 == 0 {
+            let mouse_protocol = self.terminal(pane).map(ManagedTerminal::mouse_protocol);
+            if let Some((mode, encoding)) = mouse_protocol
+                && mode != vt100::MouseProtocolMode::None
+            {
+                if button == 0 && event.pressed && !dragging {
+                    self.selection = None;
+                    self.pending_agent_click = Some(PendingAgentClick { event, cell });
+                    return Ok(());
+                }
+                if button == 0 && event.pressed && dragging {
+                    if let Some(pending) = self.pending_agent_click.take() {
+                        self.selection = Some(TerminalSelection {
+                            pane,
+                            start: pending.cell,
+                            end: cell,
+                        });
+                        return Ok(());
+                    }
+                    if let Some(selection) = &mut self.selection
+                        && selection.pane == pane
+                    {
+                        selection.end = cell;
+                        return Ok(());
+                    }
+                }
+                if button == 0 && !event.pressed {
+                    if let Some(selection) = &mut self.selection
+                        && selection.pane == pane
+                    {
+                        selection.end = cell;
+                        self.pending_agent_click = None;
+                        self.copy_selection_to_clipboard();
+                        return Ok(());
+                    }
+                    if let Some(pending) = self.pending_agent_click.take() {
+                        if let Some(terminal) = self.terminal(pane) {
+                            if let Some(bytes) =
+                                encoded_child_mouse_event(pending.event, pending.cell, encoding)
+                            {
+                                terminal.write(&bytes)?;
+                            }
+                            if let Some(bytes) = encoded_child_mouse_event(event, cell, encoding) {
+                                terminal.write(&bytes)?;
+                            }
+                        }
+                        return Ok(());
+                    }
+                }
+                if let Some(bytes) = encoded_child_mouse_event(event, cell, encoding)
+                    && let Some(terminal) = self.terminal(pane)
+                {
+                    terminal.write(&bytes)?;
+                    return Ok(());
+                }
+            }
+        }
         match button {
             64 | 65 => {
                 if let Some(terminal) = self.terminal(pane)
@@ -2684,19 +2829,24 @@ impl SessionTerminals {
                 {
                     selection.end = cell;
                 }
-                self.notice = match self.selected_text() {
-                    Some(text) => match clipboard::copy(&text) {
-                        Ok(()) => {
-                            Some(format!("selection copied · {} chars", text.chars().count()))
-                        }
-                        Err(error) => Some(format!("copy failed: {error}")),
-                    },
-                    None => Some("nothing selected".into()),
-                };
+                self.copy_selection_to_clipboard();
             }
             _ => {}
         }
         Ok(())
+    }
+
+    fn copy_selection_to_clipboard(&mut self) {
+        self.notice = match self.selected_text() {
+            Some(text) => match clipboard::copy(&text) {
+                Ok(()) => Some(format!(
+                    "selection copied · {} chars · paste directly; Option-drag uses iTerm selection",
+                    text.chars().count()
+                )),
+                Err(error) => Some(format!("copy failed: {error}")),
+            },
+            None => Some("nothing selected".into()),
+        };
     }
 
     fn terminal(&self, pane: PaneTarget) -> Option<&ManagedTerminal> {
@@ -2722,7 +2872,7 @@ impl SessionTerminals {
         mut validate_lease: G,
     ) -> io::Result<WorkspaceExit>
     where
-        F: FnMut() -> WorkspaceChrome,
+        F: FnMut(Option<WorkspaceSearchUpdate>) -> WorkspaceChrome,
         G: FnMut() -> io::Result<()>,
     {
         let mut size = normalized_size(crossterm::terminal::size().unwrap_or((120, 40)));
@@ -2742,7 +2892,9 @@ impl SessionTerminals {
             let mut last_signature = Vec::new();
             let mut last_layout_key = None;
             let mut clear_next_frame = true;
-            let mut chrome = observe();
+            let mut search = None;
+            let mut help_open = false;
+            let mut chrome = observe(None);
             'workspace: loop {
                 validate_lease()?;
                 if focus == WorkspaceFocus::Agent {
@@ -2767,7 +2919,7 @@ impl SessionTerminals {
                     }
                 }
                 sync_keyboard_enhancement(&mut stdout, &mut keyboard_enhancement_enabled, focus)?;
-                let next_chrome = observe();
+                let next_chrome = observe(None);
                 if next_chrome != chrome {
                     chrome = next_chrome;
                     last_signature.clear();
@@ -2814,7 +2966,13 @@ impl SessionTerminals {
                         self,
                         &chrome,
                         &layout,
-                        focus,
+                        WorkspaceRenderState {
+                            focus,
+                            search: search
+                                .as_ref()
+                                .map(|search: &WorkspaceSearch| search.value.as_str()),
+                            help: help_open,
+                        },
                         &render_bindings,
                         clear_next_frame,
                     )?;
@@ -2832,6 +2990,48 @@ impl SessionTerminals {
                     PolledTerminalInput::EndOfFile => break,
                     PolledTerminalInput::Bytes(input) => input,
                 };
+                if help_open {
+                    if input == b"\x1b"
+                        || render_bindings.command(&input) == Some(WorkspaceCommand::Help)
+                    {
+                        help_open = false;
+                    }
+                    last_signature.clear();
+                    continue 'workspace;
+                }
+                if let Some(active_search) = search.as_mut() {
+                    let (search_input, changed) =
+                        apply_workspace_search_input(active_search, &input);
+                    match search_input {
+                        WorkspaceSearchInput::Cancel => {
+                            let update = WorkspaceSearchUpdate::Cancel {
+                                query: active_search.original_query.clone(),
+                                selected_session_key: active_search
+                                    .original_selected_session_key
+                                    .clone(),
+                            };
+                            let _ = observe(Some(update));
+                            exit = WorkspaceExit::RefreshSessions;
+                            break 'workspace;
+                        }
+                        WorkspaceSearchInput::Commit => {
+                            if changed {
+                                chrome = observe(Some(WorkspaceSearchUpdate::Preview(
+                                    active_search.value.clone(),
+                                )));
+                            }
+                            search = None;
+                        }
+                        WorkspaceSearchInput::Editing if changed => {
+                            chrome = observe(Some(WorkspaceSearchUpdate::Preview(
+                                active_search.value.clone(),
+                            )));
+                        }
+                        WorkspaceSearchInput::Editing => {}
+                    }
+                    last_signature.clear();
+                    continue 'workspace;
+                }
                 for routed in input_router.route(&input, focus) {
                     if let WorkspaceInput::Mouse(event) = routed {
                         self.handle_mouse(&layout, event)?;
@@ -2885,6 +3085,16 @@ impl SessionTerminals {
                         WorkspaceCommand::Alert => {
                             exit = WorkspaceExit::Alert;
                             break 'workspace;
+                        }
+                        WorkspaceCommand::Search => {
+                            search = Some(WorkspaceSearch {
+                                value: chrome.search_query.clone(),
+                                original_query: chrome.search_query.clone(),
+                                original_selected_session_key: chrome.selected_session_key.clone(),
+                            });
+                        }
+                        WorkspaceCommand::Help => {
+                            help_open = true;
                         }
                         WorkspaceCommand::PreviousSession => {
                             exit = WorkspaceExit::PreviousSession(focus);
@@ -3185,7 +3395,11 @@ fn render_workspace(
         terminals,
         chrome,
         layout,
-        focus,
+        WorkspaceRenderState {
+            focus,
+            search: None,
+            help: false,
+        },
         &WorkspaceBindings::from_config(&AgentConsoleConfig::default()),
         clear,
     )
@@ -3196,10 +3410,15 @@ fn render_workspace_with_bindings(
     terminals: &SessionTerminals,
     chrome: &WorkspaceChrome,
     layout: &WorkspaceLayout,
-    focus: WorkspaceFocus,
+    state: WorkspaceRenderState<'_>,
     bindings: &WorkspaceBindings,
     clear: bool,
 ) -> io::Result<()> {
+    let WorkspaceRenderState {
+        focus,
+        search,
+        help,
+    } = state;
     if clear {
         stdout.write_all(b"\x1b[0m\x1b[?25l\x1b[H\x1b[2J")?;
     } else {
@@ -3326,47 +3545,85 @@ fn render_workspace_with_bindings(
         }
     }
 
-    let focus_name = match focus {
-        WorkspaceFocus::Sessions => "FOCUS SESSIONS".to_owned(),
-        WorkspaceFocus::Agent => "FOCUS AGENT".to_owned(),
-        WorkspaceFocus::Shell => format!(
-            "FOCUS SHELL {}/{}",
-            terminals.selected_shell.saturating_add(1),
-            terminals.shells.len()
-        ),
-    };
-    let badge = format!(" {focus_name} ");
-    let controls_text = if let Some(notification) = &chrome.notification {
-        format!(
-            "  ALERT · {notification}  ·  {} jump  {} dashboard",
-            bindings.label("alert"),
-            bindings.label("dashboard")
+    if help {
+        render_workspace_help(stdout, layout, bindings)?;
+    }
+
+    let (badge, controls_text) = if help {
+        (
+            " WORKSPACE HELP ".to_owned(),
+            format!("  {} or Esc close", bindings.label("help")),
+        )
+    } else if let Some(query) = search {
+        (
+            " SEARCH SESSIONS ".to_owned(),
+            format!(
+                "  {} {query}█  ·  Enter keep  Esc cancel  Backspace edit",
+                bindings.label("search")
+            ),
         )
     } else {
-        let shortcuts = match focus {
-            WorkspaceFocus::Sessions => format!(
-                "{} dashboard  {} focus  ↑↓/j/k select  Enter agent  {} agent  {} shell  n new  s +shell  x archive",
-                bindings.label("dashboard"),
-                bindings.label("focus"),
-                bindings.label("hide_shells"),
-                bindings.label("maximize")
-            ),
-            WorkspaceFocus::Agent => format!(
-                "{} dashboard  {} focus  {} new shell  ·  keys pass through  ·  Shift-PageUp/Down scroll",
-                bindings.label("dashboard"),
-                bindings.label("focus"),
-                bindings.label("new_shell")
-            ),
+        let search_label = if chrome.search_query.is_empty() {
+            format!("{} search", bindings.label("search"))
+        } else {
+            format!(
+                "{} search={}",
+                bindings.label("search"),
+                chrome.search_query
+            )
+        };
+        let focus_name = match focus {
+            WorkspaceFocus::Sessions => "FOCUS SESSIONS".to_owned(),
+            WorkspaceFocus::Agent => "FOCUS AGENT".to_owned(),
             WorkspaceFocus::Shell => format!(
-                "{} dashboard  {} focus  {} new  {} next  {} close  ·  Shift-PageUp/Down scroll",
-                bindings.label("dashboard"),
-                bindings.label("focus"),
-                bindings.label("new_shell"),
-                bindings.label("next_shell"),
-                bindings.label("close_shell")
+                "FOCUS SHELL {}/{}",
+                terminals.selected_shell.saturating_add(1),
+                terminals.shells.len()
             ),
         };
-        terminals.notice.as_deref().map_or_else(
+        let badge = format!(" {focus_name} ");
+        let controls_text = if let Some(notification) = &chrome.notification {
+            let alert = if focus == WorkspaceFocus::Sessions {
+                format!(
+                    "{}/{}",
+                    bindings.label("alert"),
+                    bindings.label("session_alert")
+                )
+            } else {
+                bindings.label("alert").to_owned()
+            };
+            format!(
+                "  ALERT · {notification}  ·  {} jump  {} dashboard",
+                alert,
+                bindings.label("dashboard")
+            )
+        } else {
+            let shortcuts = match focus {
+                WorkspaceFocus::Sessions => format!(
+                    "{} dashboard  {} focus  {search_label}  {} alert  {} help  ↑↓/j/k select  Enter agent  {} agent  {} shell  n new  s +shell  x archive",
+                    bindings.label("dashboard"),
+                    bindings.label("focus"),
+                    bindings.label("session_alert"),
+                    bindings.label("help"),
+                    bindings.label("hide_shells"),
+                    bindings.label("maximize")
+                ),
+                WorkspaceFocus::Agent => format!(
+                    "{} dashboard  {} focus  {} new shell  ·  keys pass through  ·  Shift-PageUp/Down scroll",
+                    bindings.label("dashboard"),
+                    bindings.label("focus"),
+                    bindings.label("new_shell")
+                ),
+                WorkspaceFocus::Shell => format!(
+                    "{} dashboard  {} focus  {} new  {} next  {} close  ·  Shift-PageUp/Down scroll",
+                    bindings.label("dashboard"),
+                    bindings.label("focus"),
+                    bindings.label("new_shell"),
+                    bindings.label("next_shell"),
+                    bindings.label("close_shell")
+                ),
+            };
+            terminals.notice.as_deref().map_or_else(
             || format!("  {shortcuts}"),
             |notice| {
                 let essentials = match focus {
@@ -3395,6 +3652,8 @@ fn render_workspace_with_bindings(
                 format!("  {essentials}  ·  {notice}")
             },
         )
+        };
+        (badge, controls_text)
     };
     let controls = fit_text(
         &controls_text,
@@ -3412,6 +3671,102 @@ fn render_workspace_with_bindings(
     )?;
     position_workspace_cursor(stdout, terminals, layout, focus)?;
     stdout.flush()
+}
+
+fn render_workspace_help(
+    stdout: &mut impl Write,
+    layout: &WorkspaceLayout,
+    bindings: &WorkspaceBindings,
+) -> io::Result<()> {
+    let left = layout.agent.left;
+    let width = layout.agent.width;
+    for row in 0..layout.status_row {
+        write_at(stdout, row, left, fit_text("", width).as_bytes())?;
+    }
+    write_at(
+        stdout,
+        0,
+        left,
+        format!(
+            "\x1b[30;46;1m{}\x1b[0m",
+            fit_text(" WORKSPACE KEY BINDINGS ", width)
+        )
+        .as_bytes(),
+    )?;
+    for (offset, line) in workspace_help_lines(bindings)
+        .into_iter()
+        .take(usize::from(layout.status_row.saturating_sub(2)))
+        .enumerate()
+    {
+        let style = if line.starts_with("WORKSPACE ·") {
+            "\x1b[1;36m"
+        } else {
+            "\x1b[0m"
+        };
+        write_at(
+            stdout,
+            offset as u16 + 2,
+            left + 1,
+            format!("{style}{}\x1b[0m", fit_text(&line, width.saturating_sub(2))).as_bytes(),
+        )?;
+    }
+    Ok(())
+}
+
+fn workspace_help_lines(bindings: &WorkspaceBindings) -> Vec<String> {
+    vec![
+        "WORKSPACE · DIRECT".into(),
+        format!("{:<24} {}", "cycle focus", bindings.label("focus")),
+        format!("{:<24} {}", "new shell", bindings.label("new_shell")),
+        format!("{:<24} {}", "next shell", bindings.label("next_shell")),
+        format!("{:<24} {}", "close shell", bindings.label("close_shell")),
+        format!("{:<24} {}", "dashboard", bindings.label("dashboard")),
+        format!("{:<24} {}", "next unread alert", bindings.label("alert")),
+        String::new(),
+        "WORKSPACE · SESSIONS".into(),
+        format!("{:<24} {}", "select session", "↑/↓, J/K"),
+        format!("{:<24} {}", "open agent", "Enter"),
+        format!("{:<24} {}", "search sessions", bindings.label("search")),
+        format!(
+            "{:<24} {}",
+            "next unread alert",
+            bindings.label("session_alert")
+        ),
+        format!("{:<24} {}", "new session / shell", "N / S"),
+        format!("{:<24} {}", "archive / restore", "X"),
+        format!("{:<24} {}", "focus agent", bindings.label("hide_shells")),
+        format!("{:<24} {}", "focus last shell", bindings.label("maximize")),
+        format!(
+            "{:<24} {} / {}",
+            "resize shell area",
+            bindings.label("grow_shell"),
+            bindings.label("shrink_shell")
+        ),
+        format!(
+            "{:<24} {}",
+            "copy command output",
+            bindings.label("copy_command")
+        ),
+        format!(
+            "{:<24} {}…9",
+            "focus numbered shell",
+            bindings.label("select_shell_1")
+        ),
+        String::new(),
+        "WORKSPACE · CHILD VIEWPORT".into(),
+        format!(
+            "{:<24} {} / {}",
+            "scroll viewport",
+            bindings.label("scroll_up"),
+            bindings.label("scroll_down")
+        ),
+        format!(
+            "{:<24} {}",
+            "return to live tail",
+            bindings.label("live_tail")
+        ),
+        format!("{:<24} {} / Esc", "close help", bindings.label("help")),
+    ]
 }
 
 fn pane_label_with_scrollback(label: &str, terminal: Option<&ManagedTerminal>) -> String {
@@ -3937,7 +4292,7 @@ impl TerminalManager {
         observe: F,
     ) -> io::Result<WorkspaceExit>
     where
-        F: FnMut() -> WorkspaceChrome,
+        F: FnMut(Option<WorkspaceSearchUpdate>) -> WorkspaceChrome,
     {
         let bindings = WorkspaceBindings::from_config(&self.config);
         let needs_lease = focus != WorkspaceFocus::Sessions;
@@ -4078,7 +4433,10 @@ pub fn agent_command(
             if !new_session {
                 spec = spec.arg("resume");
             }
-            spec = spec.arg("-C").arg(session.cwd.as_os_str());
+            spec = spec
+                .arg("--no-alt-screen")
+                .arg("-C")
+                .arg(session.cwd.as_os_str());
             if !new_session {
                 spec = spec.arg(&session.provider_session_id);
             }
@@ -4259,6 +4617,7 @@ mod tests {
             key: Session::stable_key(agent, "id"),
             provider_session_id: "id".into(),
             name: "repo".into(),
+            search_terms: Vec::new(),
             agent,
             status: SessionStatus::Idle,
             cwd: cwd.to_owned(),
@@ -4300,6 +4659,7 @@ mod tests {
         assert_eq!(codex.program, "codex");
         assert_eq!(codex.args[0], "resume");
         assert!(codex.args.iter().any(|arg| arg == "id"));
+        assert!(codex.args.iter().any(|arg| arg == "--no-alt-screen"));
 
         let claude = agent_command(&config, &session(AgentKind::Claude, cwd), executable, false);
         assert_eq!(claude.program, "claude");
@@ -4838,6 +5198,16 @@ mod tests {
                 .as_slice(),
             [WorkspaceInput::Command(WorkspaceCommand::NewShell)]
         ));
+
+        for focus in [WorkspaceFocus::Agent, WorkspaceFocus::Shell] {
+            for input in [b"/".as_slice(), b"a".as_slice(), b"?".as_slice()] {
+                let mut router = WorkspaceInputRouter::default();
+                assert!(matches!(
+                    router.route(input, focus).as_slice(),
+                    [WorkspaceInput::Forward(bytes)] if bytes == input
+                ));
+            }
+        }
     }
 
     #[test]
@@ -4933,6 +5303,46 @@ mod tests {
             String::from_utf8_lossy(&agent.screen_view().rows[0]).contains("oldest"),
             "the line removed by Codex's partial scroll region should remain visible"
         );
+    }
+
+    #[test]
+    fn mouse_wheel_prefers_outer_history_when_agent_requests_mouse_reporting() {
+        let root = tempdir().unwrap();
+        let agent = ManagedTerminal::spawn(
+            &CommandSpec::new("/bin/sh", root.path()).arg("-c").arg(
+                "printf 'oldest\\r\\nsecond\\r\\nthird\\r\\nfourth'; \
+                 printf '\\033[1;4r\\033[4;1H\\r\\nnewest'; \
+                 printf '\\033[?1000h\\033[?1006h'; sleep 2",
+            ),
+            (30, 6),
+        )
+        .unwrap();
+        agent.wait_for_first_output(Duration::from_secs(1));
+        let start = Instant::now();
+        while agent.mouse_protocol().0 == vt100::MouseProtocolMode::None
+            && start.elapsed() < Duration::from_secs(1)
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let mut terminals = SessionTerminals {
+            agent: Some(agent),
+            ..SessionTerminals::default()
+        };
+        let layout = WorkspaceLayout::new(120, 30, 0, 0);
+
+        terminals
+            .handle_mouse(
+                &layout,
+                WorkspaceMouseEvent {
+                    button: 64,
+                    col: layout.agent.left + 1,
+                    row: layout.agent.top + 1,
+                    pressed: true,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(terminals.agent.as_ref().unwrap().scrollback_offset(), 1);
     }
 
     #[test]
@@ -5034,7 +5444,7 @@ mod tests {
         let root = tempdir().unwrap();
         let agent = ManagedTerminal::spawn(
             &CommandSpec::new("/bin/sh", root.path()).arg("-c").arg(
-                r"stty raw -echo; printf '\033[?1000h\033[?1006h'; dd bs=1 count=9 2>/dev/null | od -An -tx1; sleep 1",
+                r"stty raw -echo; printf '\033[?1000h\033[?1006h'; dd bs=1 count=18 2>/dev/null | od -An -tx1; sleep 1",
             ),
             (80, 24),
         )
@@ -5063,15 +5473,75 @@ mod tests {
                 },
             )
             .unwrap();
+        terminals
+            .handle_mouse(
+                &layout,
+                WorkspaceMouseEvent {
+                    button: 0,
+                    col: layout.agent.left + 2,
+                    row: 3,
+                    pressed: false,
+                },
+            )
+            .unwrap();
         let output = wait_for_capture(
             terminals.agent.as_ref().unwrap(),
-            "1b 5b 3c 30 3b 32 3b 32 4d",
+            "1b 5b 3c 30 3b 32 3b 32 4d 1b 5b 3c 30 3b 32 3b 32 6d",
         );
         let compact = output.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            compact.contains("1b 5b 3c 30 3b 32 3b 32 4d"),
+            compact.contains("1b 5b 3c 30 3b 32 3b 32 4d 1b 5b 3c 30 3b 32 3b 32 6d"),
             "agent received: {output:?}"
         );
+    }
+
+    #[test]
+    fn ordinary_drag_selects_text_even_when_agent_requested_mouse_reporting() {
+        let root = tempdir().unwrap();
+        let agent = ManagedTerminal::spawn(
+            &CommandSpec::new("/bin/sh", root.path())
+                .arg("-c")
+                .arg("printf 'select-me\\033[?1002h\\033[?1006h'; sleep 2"),
+            (20, 3),
+        )
+        .unwrap();
+        agent.wait_for_first_output(Duration::from_secs(1));
+        let start = Instant::now();
+        while agent.mouse_protocol().0 == vt100::MouseProtocolMode::None
+            && start.elapsed() < Duration::from_secs(1)
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let mut terminals = SessionTerminals {
+            agent: Some(agent),
+            ..SessionTerminals::default()
+        };
+        let layout = WorkspaceLayout::new(120, 30, 0, 0);
+
+        terminals
+            .handle_mouse(
+                &layout,
+                WorkspaceMouseEvent {
+                    button: 0,
+                    col: layout.agent.left + 1,
+                    row: layout.agent.top + 1,
+                    pressed: true,
+                },
+            )
+            .unwrap();
+        terminals
+            .handle_mouse(
+                &layout,
+                WorkspaceMouseEvent {
+                    button: 32,
+                    col: layout.agent.left + 6,
+                    row: layout.agent.top + 1,
+                    pressed: true,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(terminals.selected_text().as_deref(), Some("select"));
     }
 
     #[test]
@@ -5200,6 +5670,8 @@ mod tests {
         let chrome = WorkspaceChrome {
             sessions: vec!["▾ repo".into(), "○ Cdx select output".into()],
             selected: 1,
+            selected_session_key: None,
+            search_query: String::new(),
             status_counts: (0, 0, 1, 0),
             preview: vec!["preview".into()],
             notification: None,
@@ -5218,6 +5690,56 @@ mod tests {
             String::from_utf8_lossy(&output).contains("\x1b[7mselect\x1b[0m"),
             "selected cells should be visibly highlighted"
         );
+    }
+
+    #[test]
+    fn ordinary_drag_selects_text_in_a_shell_pane() {
+        let root = tempdir().unwrap();
+        let shell = ManagedTerminal::spawn(
+            &CommandSpec::new("/bin/sh", root.path())
+                .arg("-c")
+                .arg("printf 'shell-copy\\n'; sleep 2"),
+            (20, 3),
+        )
+        .unwrap();
+        shell.wait_for_first_output(Duration::from_secs(1));
+        let content_row = shell
+            .screen_view()
+            .rows
+            .iter()
+            .position(|row| String::from_utf8_lossy(row).contains("shell-copy"))
+            .unwrap() as u16;
+        let mut terminals = SessionTerminals {
+            shells: vec![ShellPane::new(shell, "shell 1".into())],
+            ..SessionTerminals::default()
+        };
+        let layout = WorkspaceLayout::new(120, 30, 1, 0);
+        let shell_rect = layout.shell_panes[0].1;
+
+        terminals
+            .handle_mouse(
+                &layout,
+                WorkspaceMouseEvent {
+                    button: 0,
+                    col: shell_rect.left + 1,
+                    row: shell_rect.top + 2 + content_row,
+                    pressed: true,
+                },
+            )
+            .unwrap();
+        terminals
+            .handle_mouse(
+                &layout,
+                WorkspaceMouseEvent {
+                    button: 32,
+                    col: shell_rect.left + 6,
+                    row: shell_rect.top + 2 + content_row,
+                    pressed: true,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(terminals.selected_text().as_deref(), Some("shell-"));
     }
 
     #[test]
@@ -5417,6 +5939,9 @@ mod tests {
 
     #[test]
     fn focused_session_list_accepts_navigation_and_creation_actions() {
+        assert_eq!(workspace_command(b"/"), Some(WorkspaceCommand::Search));
+        assert_eq!(workspace_command(b"a"), Some(WorkspaceCommand::Alert));
+        assert_eq!(workspace_command(b"?"), Some(WorkspaceCommand::Help));
         assert_eq!(
             session_list_input(b"\x1b[A"),
             Some(SessionListInput::Previous)
@@ -5434,11 +5959,28 @@ mod tests {
     }
 
     #[test]
+    fn workspace_search_handles_batched_editing_and_commit_input() {
+        let mut search = WorkspaceSearch {
+            value: "old".into(),
+            original_query: String::new(),
+            original_selected_session_key: None,
+        };
+
+        let (input, changed) = apply_workspace_search_input(&mut search, b"\x7f\x7f\x7fnew\r");
+
+        assert_eq!(input, WorkspaceSearchInput::Commit);
+        assert!(changed);
+        assert_eq!(search.value, "new");
+    }
+
+    #[test]
     fn subsequent_workspace_frame_does_not_clear_the_screen() {
         let terminals = SessionTerminals::default();
         let chrome = WorkspaceChrome {
             sessions: vec!["repo  codex".into()],
             selected: 0,
+            selected_session_key: None,
+            search_query: String::new(),
             status_counts: (0, 0, 1, 0),
             preview: vec!["preview".into()],
             notification: None,
@@ -5464,6 +6006,8 @@ mod tests {
         let chrome = WorkspaceChrome {
             sessions: vec!["▾ repo".into(), "○ Cdx current task".into()],
             selected: 1,
+            selected_session_key: None,
+            search_query: String::new(),
             status_counts: (0, 0, 1, 0),
             preview: vec!["preview".into()],
             notification: None,
@@ -5489,6 +6033,8 @@ mod tests {
         let chrome = WorkspaceChrome {
             sessions: vec!["▾ repo".into(), "○ Cdx current task".into()],
             selected: 1,
+            selected_session_key: None,
+            search_query: String::new(),
             status_counts: (2, 1, 18, 3),
             preview: vec!["preview".into()],
             notification: None,
@@ -5644,6 +6190,8 @@ mod tests {
         let chrome = WorkspaceChrome {
             sessions: vec!["▾ repo".into(), "Cdx fix focus".into()],
             selected: 1,
+            selected_session_key: None,
+            search_query: String::new(),
             status_counts: (0, 0, 1, 0),
             preview: vec!["preview".into()],
             notification: None,
@@ -5688,6 +6236,8 @@ mod tests {
         let chrome = WorkspaceChrome {
             sessions: vec!["▾ repo".into(), "○ Cdx inspect shell".into()],
             selected: 1,
+            selected_session_key: None,
+            search_query: String::new(),
             status_counts: (0, 0, 1, 0),
             preview: vec!["preview".into()],
             notification: None,
@@ -5724,6 +6274,8 @@ mod tests {
         let chrome = WorkspaceChrome {
             sessions: vec!["▾ repo".into(), "○ Cdx inspect session".into()],
             selected: 1,
+            selected_session_key: None,
+            search_query: String::new(),
             status_counts: (0, 0, 1, 0),
             preview: vec!["preview".into()],
             notification: None,
@@ -5754,6 +6306,115 @@ mod tests {
     }
 
     #[test]
+    fn focused_session_list_footer_shows_search_alert_and_help() {
+        let terminals = SessionTerminals::default();
+        let chrome = WorkspaceChrome {
+            sessions: vec!["▾ repo".into(), "○ Cdx inspect session".into()],
+            selected: 1,
+            selected_session_key: None,
+            search_query: String::new(),
+            status_counts: (0, 0, 1, 0),
+            preview: vec!["preview".into()],
+            notification: None,
+        };
+        let layout = WorkspaceLayout::new(120, 40, 0, 0);
+        let mut output = Vec::new();
+
+        render_workspace(
+            &mut output,
+            &terminals,
+            &chrome,
+            &layout,
+            WorkspaceFocus::Sessions,
+            false,
+        )
+        .unwrap();
+        let output = String::from_utf8_lossy(&output);
+
+        assert!(output.contains("/ search"));
+        assert!(output.contains("a alert"));
+        assert!(output.contains("? help"));
+    }
+
+    #[test]
+    fn workspace_search_renders_live_query_and_controls() {
+        let terminals = SessionTerminals::default();
+        let chrome = WorkspaceChrome {
+            sessions: vec!["▾ repo".into(), "○ Cla latency".into()],
+            selected: 1,
+            selected_session_key: Some("claude:latency".into()),
+            search_query: "latency".into(),
+            status_counts: (0, 0, 1, 0),
+            preview: vec!["preview".into()],
+            notification: None,
+        };
+        let layout = WorkspaceLayout::new(120, 40, 0, 0);
+        let mut output = Vec::new();
+
+        render_workspace_with_bindings(
+            &mut output,
+            &terminals,
+            &chrome,
+            &layout,
+            WorkspaceRenderState {
+                focus: WorkspaceFocus::Sessions,
+                search: Some("latency"),
+                help: false,
+            },
+            &WorkspaceBindings::from_config(&AgentConsoleConfig::default()),
+            false,
+        )
+        .unwrap();
+        let output = String::from_utf8_lossy(&output);
+
+        assert!(output.contains("SEARCH SESSIONS"));
+        assert!(output.contains("/ latency"));
+        assert!(output.contains("Enter keep"));
+        assert!(output.contains("Esc cancel"));
+        assert!(output.contains("Backspace edit"));
+    }
+
+    #[test]
+    fn workspace_help_renders_contextual_session_shortcuts() {
+        let terminals = SessionTerminals::default();
+        let chrome = WorkspaceChrome {
+            sessions: vec!["▾ repo".into(), "○ Cla latency".into()],
+            selected: 1,
+            selected_session_key: Some("claude:latency".into()),
+            search_query: String::new(),
+            status_counts: (0, 0, 1, 0),
+            preview: vec!["preview".into()],
+            notification: None,
+        };
+        let layout = WorkspaceLayout::new(120, 40, 0, 0);
+        let mut output = Vec::new();
+
+        render_workspace_with_bindings(
+            &mut output,
+            &terminals,
+            &chrome,
+            &layout,
+            WorkspaceRenderState {
+                focus: WorkspaceFocus::Sessions,
+                search: None,
+                help: true,
+            },
+            &WorkspaceBindings::from_config(&AgentConsoleConfig::default()),
+            false,
+        )
+        .unwrap();
+        let output = String::from_utf8_lossy(&output);
+
+        assert!(output.contains("WORKSPACE KEY BINDINGS"));
+        assert!(output.contains("WORKSPACE · DIRECT"));
+        assert!(output.contains("WORKSPACE · SESSIONS"));
+        assert!(output.contains("search sessions"));
+        assert!(output.contains("next unread alert"));
+        assert!(output.contains("WORKSPACE HELP"));
+        assert!(output.contains("? or Esc close"));
+    }
+
+    #[test]
     fn maximized_agent_renders_the_live_pty_instead_of_the_session_preview() {
         let root = tempdir().unwrap();
         let agent = ManagedTerminal::spawn(
@@ -5772,6 +6433,8 @@ mod tests {
         let chrome = WorkspaceChrome {
             sessions: vec!["▾ repo".into(), "Cdx current task".into()],
             selected: 1,
+            selected_session_key: None,
+            search_query: String::new(),
             status_counts: (0, 0, 1, 0),
             preview: vec!["STALE SESSION PREVIEW".into()],
             notification: None,
@@ -5815,6 +6478,8 @@ mod tests {
         let chrome = WorkspaceChrome {
             sessions: vec!["▾ repo".into(), "○ Cdx inspect history".into()],
             selected: 1,
+            selected_session_key: None,
+            search_query: String::new(),
             status_counts: (0, 0, 1, 0),
             preview: vec!["preview".into()],
             notification: None,
@@ -5904,6 +6569,8 @@ mod tests {
                 "! Cla claude task".into(),
             ],
             selected: 1,
+            selected_session_key: None,
+            search_query: String::new(),
             status_counts: (0, 1, 1, 0),
             preview: vec!["preview".into()],
             notification: None,
