@@ -3788,6 +3788,10 @@ fn render_sidebar(
     write_at(stdout, 0, 0, format!("\x1b[1;36m{title}\x1b[0m").as_bytes())?;
     render_sidebar_status_summary(stdout, chrome.status_counts, layout.sidebar_width)?;
     let list_top = 3;
+    let blank = fit_text("", layout.sidebar_width);
+    for row in list_top..layout.status_row {
+        write_at(stdout, row, 0, blank.as_bytes())?;
+    }
     let visible = usize::from(layout.status_row.saturating_sub(list_top));
     let first = chrome.selected.saturating_add(1).saturating_sub(visible);
     for (row, (index, session)) in chrome
@@ -6372,6 +6376,68 @@ mod tests {
         assert!(output.contains("Enter keep"));
         assert!(output.contains("Esc cancel"));
         assert!(output.contains("Backspace edit"));
+    }
+
+    #[test]
+    fn workspace_search_clears_sidebar_rows_removed_by_live_filter() {
+        let terminals = SessionTerminals::default();
+        let layout = WorkspaceLayout::new(120, 40, 0, 0);
+        let bindings = WorkspaceBindings::from_config(&AgentConsoleConfig::default());
+        let mut parser = vt100::Parser::new(40, 120, 0);
+        let mut output = Vec::new();
+
+        let unfiltered = WorkspaceChrome {
+            sessions: vec!["▾ repo".into(), "○ Cdx KEEP".into(), "○ Cdx DROP".into()],
+            selected: 1,
+            selected_session_key: Some("codex:keep".into()),
+            search_query: String::new(),
+            status_counts: (0, 0, 2, 0),
+            preview: vec!["preview".into()],
+            notification: None,
+        };
+        render_workspace_with_bindings(
+            &mut output,
+            &terminals,
+            &unfiltered,
+            &layout,
+            WorkspaceRenderState {
+                focus: WorkspaceFocus::Sessions,
+                search: None,
+                help: false,
+            },
+            &bindings,
+            false,
+        )
+        .unwrap();
+        parser.process(&output);
+        assert!(parser.screen().contents().contains("DROP"));
+
+        output.clear();
+        let filtered = WorkspaceChrome {
+            sessions: vec!["▾ repo".into(), "○ Cdx KEEP".into()],
+            search_query: "keep".into(),
+            status_counts: (0, 0, 1, 0),
+            ..unfiltered
+        };
+        render_workspace_with_bindings(
+            &mut output,
+            &terminals,
+            &filtered,
+            &layout,
+            WorkspaceRenderState {
+                focus: WorkspaceFocus::Sessions,
+                search: Some("keep"),
+                help: false,
+            },
+            &bindings,
+            false,
+        )
+        .unwrap();
+        parser.process(&output);
+
+        let screen = parser.screen().contents();
+        assert!(screen.contains("KEEP"));
+        assert!(!screen.contains("DROP"));
     }
 
     #[test]
