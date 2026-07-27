@@ -189,6 +189,25 @@ archived
 
 ## 7. Discovery
 
+Every provider contributes one adapter: its transcript root, the filter that
+recognizes its transcripts, the parser that turns one transcript into a
+session, and any provider-specific enrichment. Discovery iterates that table;
+it must not branch on the provider anywhere else. Adding, repointing, or
+retiring a provider is one table entry.
+
+Provider transcript layouts are undocumented and change with provider releases,
+so the table is narrowable at runtime. `AGENT_CONSOLE_PROVIDERS` holds a
+comma-separated, case-insensitive allow list of provider labels:
+
+```sh
+AGENT_CONSOLE_PROVIDERS=codex agent-console
+```
+
+Omitted providers are not scanned, not summarized, and not reported by
+`doctor`. An unset, empty, or unrecognized value enables every provider and
+records the reason in diagnostics: a typo must never produce a silently empty
+dashboard.
+
 ### 7.1 Codex
 
 Scan `$CODEX_HOME/sessions`, or `~/.codex/sessions` when `CODEX_HOME` is unset,

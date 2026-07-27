@@ -6,6 +6,7 @@ mod discovery;
 mod doctor;
 mod events;
 mod model;
+mod providers;
 mod pty;
 mod store;
 mod summary;
@@ -134,7 +135,16 @@ fn run_doctor() -> io::Result<()> {
     let discovery = discovery::DiscoveryPaths::from_environment();
     let mut providers = 0;
     let mut failures = 0;
-    for provider in [AgentKind::Codex, AgentKind::Claude] {
+    let enabled = crate::providers::enabled();
+    println!(
+        "ok   providers enabled: {}",
+        enabled
+            .iter()
+            .map(|adapter| adapter.kind.label())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    for provider in enabled.iter().map(|adapter| adapter.kind) {
         let name = provider.label();
         match doctor::check_configured_provider(&config, provider) {
             doctor::ProviderStatus::Available(version) => {
@@ -167,24 +177,28 @@ fn run_doctor() -> io::Result<()> {
         }
     }
     if let Some(paths) = discovery {
-        println!(
-            "{} Codex sessions: {}",
-            if paths.codex_sessions.is_dir() {
-                "ok  "
-            } else {
-                "info"
-            },
-            paths.codex_sessions.display()
-        );
-        println!(
-            "{} Claude projects: {}",
-            if paths.claude_projects.is_dir() {
-                "ok  "
-            } else {
-                "info"
-            },
-            paths.claude_projects.display()
-        );
+        if crate::providers::is_enabled(AgentKind::Codex) {
+            println!(
+                "{} Codex sessions: {}",
+                if paths.codex_sessions.is_dir() {
+                    "ok  "
+                } else {
+                    "info"
+                },
+                paths.codex_sessions.display()
+            );
+        }
+        if crate::providers::is_enabled(AgentKind::Claude) {
+            println!(
+                "{} Claude projects: {}",
+                if paths.claude_projects.is_dir() {
+                    "ok  "
+                } else {
+                    "info"
+                },
+                paths.claude_projects.display()
+            );
+        }
     }
     let state = store::state_dir()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "cannot resolve state directory"))?;

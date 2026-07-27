@@ -8,9 +8,11 @@ use std::{
 
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
-use uuid::Uuid;
 
-use crate::model::{AgentKind, Session, SessionStatus, SessionSummary};
+use crate::{
+    model::{AgentKind, Session, SessionStatus, SessionSummary},
+    providers::{self, ProviderAdapter},
+};
 
 const MAX_PROVIDER_FILES: usize = 60;
 const MAX_VISIBLE_SESSIONS: usize = 50;
@@ -47,6 +49,13 @@ impl DiscoveryPaths {
             claude_projects: home.join(".claude/projects"),
         })
     }
+
+    pub fn root(&self, provider: AgentKind) -> &Path {
+        match provider {
+            AgentKind::Codex => &self.codex_sessions,
+            AgentKind::Claude => &self.claude_projects,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -56,27 +65,40 @@ pub fn discover(paths: &DiscoveryPaths) -> Vec<Session> {
 
 pub fn discover_cached(paths: &DiscoveryPaths, cache: &mut DiscoveryCache) -> Vec<Session> {
     let mut sessions = Vec::new();
-    let codex_files = provider_files(&paths.codex_sessions, |path| {
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+    let mut seen = HashSet::new();
+    for adapter in providers::enabled() {
+        let root = paths.root(adapter.kind);
+        let files = provider_files(root, adapter.accepts);
+        seen.extend(files.iter().cloned());
+        let mut parsed = parse_cached_files(files, adapter, cache);
+        if let Some(enrich) = adapter.enrich {
+            enrich(root, &mut parsed);
+        }
+        sessions.extend(parsed);
+    }
+    cache.entries.retain(|path, _| seen.contains(path));
+    sessions.sort_by(|left, right| {
+        right
+            .transcript_modified_at
+            .cmp(&left.transcript_modified_at)
+            .then_with(|| left.key.cmp(&right.key))
     });
-    let claude_files = provider_files(&paths.claude_projects, |path| {
-        let Some(stem) = path.file_stem().and_then(|name| name.to_str()) else {
-            return false;
-        };
-        path.extension().and_then(|value| value.to_str()) == Some("jsonl")
-            && Uuid::parse_str(stem).is_ok()
-    });
-    let seen = codex_files
-        .iter()
-        .chain(&claude_files)
-        .cloned()
-        .collect::<HashSet<_>>();
-    let mut codex_sessions = parse_cached_files(codex_files, AgentKind::Codex, cache);
-    let codex_metadata = load_codex_thread_metadata(&paths.codex_sessions);
-    for session in &mut codex_sessions {
-        let Some(metadata) = codex_metadata.get(&session.provider_session_id) else {
+    let cutoff = crate::model::unix_timestamp().saturating_sub(RECENT_SESSION_SECONDS);
+    sessions.retain(|session| session.transcript_modified_at >= cutoff);
+    sessions.truncate(MAX_VISIBLE_SESSIONS);
+    sessions
+}
+
+/// Apply the optional Codex thread database over parsed Codex sessions. The
+/// database is read-only enrichment; an absent or incompatible one must not
+/// hide transcript sessions.
+pub(crate) fn enrich_codex(sessions_root: &Path, sessions: &mut [Session]) {
+    let metadata = load_codex_thread_metadata(sessions_root);
+    if metadata.is_empty() {
+        return;
+    }
+    for session in sessions {
+        let Some(metadata) = metadata.get(&session.provider_session_id) else {
             continue;
         };
         if let Some(name) = metadata
@@ -90,19 +112,6 @@ pub fn discover_cached(paths: &DiscoveryPaths, cache: &mut DiscoveryCache) -> Ve
             push_search_term(&mut session.search_terms, term.clone());
         }
     }
-    sessions.extend(codex_sessions);
-    sessions.extend(parse_cached_files(claude_files, AgentKind::Claude, cache));
-    cache.entries.retain(|path, _| seen.contains(path));
-    sessions.sort_by(|left, right| {
-        right
-            .transcript_modified_at
-            .cmp(&left.transcript_modified_at)
-            .then_with(|| left.key.cmp(&right.key))
-    });
-    let cutoff = crate::model::unix_timestamp().saturating_sub(RECENT_SESSION_SECONDS);
-    sessions.retain(|session| session.transcript_modified_at >= cutoff);
-    sessions.truncate(MAX_VISIBLE_SESSIONS);
-    sessions
 }
 
 fn load_codex_thread_metadata(sessions_root: &Path) -> HashMap<String, CodexThreadMetadata> {
@@ -169,14 +178,11 @@ fn load_codex_thread_metadata(sessions_root: &Path) -> HashMap<String, CodexThre
 
 #[cfg(test)]
 fn discover_codex(root: &Path) -> Vec<Session> {
-    provider_files(root, |path| {
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
-    })
-    .into_iter()
-    .filter_map(|path| parse_codex(&path).ok().flatten())
-    .collect()
+    let adapter = providers::adapter(AgentKind::Codex);
+    provider_files(root, adapter.accepts)
+        .into_iter()
+        .filter_map(|path| (adapter.parse)(&path).ok().flatten())
+        .collect()
 }
 
 fn provider_files(root: &Path, accept: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
@@ -189,7 +195,7 @@ fn provider_files(root: &Path, accept: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
 
 fn parse_cached_files(
     files: Vec<PathBuf>,
-    provider: AgentKind,
+    adapter: &ProviderAdapter,
     cache: &mut DiscoveryCache,
 ) -> Vec<Session> {
     files
@@ -201,12 +207,7 @@ fn parse_cached_files(
             {
                 return Some(session.clone());
             }
-            let parsed = match provider {
-                AgentKind::Codex => parse_codex(&path),
-                AgentKind::Claude => parse_claude(&path),
-            }
-            .ok()
-            .flatten()?;
+            let parsed = (adapter.parse)(&path).ok().flatten()?;
             cache.entries.insert(path, (fingerprint, parsed.clone()));
             Some(parsed)
         })
@@ -241,7 +242,7 @@ fn collect_files(root: &Path, accept: &impl Fn(&Path) -> bool, output: &mut Vec<
     }
 }
 
-fn parse_codex(path: &Path) -> io::Result<Option<Session>> {
+pub(crate) fn parse_codex(path: &Path) -> io::Result<Option<Session>> {
     let (lines, fingerprint, modified_at) = bounded_jsonl(path)?;
     let mut id = None;
     let mut cwd = None;
@@ -405,7 +406,7 @@ fn parse_codex(path: &Path) -> io::Result<Option<Session>> {
     }))
 }
 
-fn parse_claude(path: &Path) -> io::Result<Option<Session>> {
+pub(crate) fn parse_claude(path: &Path) -> io::Result<Option<Session>> {
     let (lines, fingerprint, modified_at) = bounded_jsonl(path)?;
     let mut id = path
         .file_stem()
@@ -742,6 +743,7 @@ mod tests {
     use std::io::Write;
 
     use tempfile::tempdir;
+    use uuid::Uuid;
 
     use super::*;
 

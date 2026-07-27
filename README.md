@@ -84,6 +84,16 @@ Missing entries use `codex` or `claude` directly. The configured command is
 also used by that provider's isolated summarizer. Set
 `AGENT_CONSOLE_CONFIG=/path/to/config.toml` to use another file.
 
+Limit Agent Console to a subset of providers with a comma-separated
+`AGENT_CONSOLE_PROVIDERS`:
+
+```sh
+AGENT_CONSOLE_PROVIDERS=codex agent-console
+```
+
+Omitted providers are not scanned and are left out of `doctor`. An unset or
+unrecognized value keeps every provider enabled.
+
 ## Controls
 
 Dashboard:
