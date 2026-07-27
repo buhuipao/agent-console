@@ -2,7 +2,13 @@
 name = "agent-console"
 version = "0.0.11"
 edition = "2024"
-publish = false
+description = "Local terminal dashboard for Codex and Claude Code sessions."
+repository = "https://github.com/buhuipao/agent-console"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["cli", "tui", "codex", "claude", "agent"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = ["docs/assets/*", "tests/fixtures/*", "target/*"]
 
 [dependencies]
 crossterm = "0.29"

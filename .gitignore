@@ -2,3 +2,5 @@
 /tests/fixtures/e2e-home/.zsh_history
 *.p12
 AuthKey_*.p8
+/docs/PR-LAUNCH-KIT.md
+/docs/COMMERCIAL-VIABILITY.md
