@@ -4,7 +4,13 @@ Agent Console is a local terminal dashboard for Codex and Claude Code. It
 discovers recent sessions, shows their current state, resumes the native agent
 UI, and keeps same-workspace shells beside each agent.
 
-![Agent Console dashboard](docs/assets/dashboard.png)
+![Agent Console: 20 Codex and Claude Code sessions in one dashboard, jumping to
+the session waiting on an approval, searching across workspaces, and opening a
+shell in the session's own directory](docs/assets/demo.gif)
+
+Twenty sessions across seven workspaces, both providers in one list. A session
+stops for an approval, the dashboard raises an alert, and `a` jumps straight to
+it. `s` opens a shell in that session's own directory, beside the agent.
 
 ## What it provides
 
