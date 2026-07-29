@@ -313,6 +313,45 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  crates-io:
+    if: needs.prepare.outputs.publish == 'true'
+    needs: [prepare, quality, build]
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.source_ref }}
+      - name: Install Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+      # crates.io versions are permanent. Re-running a release must not fail the
+      # workflow just because the version is already there.
+      - name: Publish to crates.io
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$CARGO_REGISTRY_TOKEN"
+
+          published="$(
+            curl -fsSL \
+              -H 'User-Agent: agent-console-release (github actions)' \
+              "https://crates.io/api/v1/crates/agent-console/versions" \
+              | python3 -c 'import json,sys; print(" ".join(v["num"] for v in json.load(sys.stdin)["versions"]))'
+          )"
+          for version in $published; do
+            if [[ "$version" == "$VERSION" ]]; then
+              echo "agent-console $VERSION is already on crates.io; nothing to publish"
+              exit 0
+            fi
+          done
+
+          cargo publish --locked
+
   release:
     if: needs.prepare.outputs.publish == 'true'
     needs: [prepare, quality, build]
