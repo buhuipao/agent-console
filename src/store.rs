@@ -131,7 +131,15 @@ impl StateStore {
         let Some(cached) = self.state.sessions.get(&session.key) else {
             return;
         };
+        let discovered_task = std::mem::take(&mut session.summary.task);
         session.summary.clone_from(&cached.summary);
+        // Caches written before provider command wrappers were filtered still
+        // carry one as the task; the parsed prompt wins over it.
+        if session.summary.task.trim().is_empty()
+            || crate::discovery::is_internal_context(&session.summary.task)
+        {
+            session.summary.task = discovered_task;
+        }
         session
             .summary_fingerprint
             .clone_from(&cached.summary_fingerprint);
@@ -437,6 +445,7 @@ mod tests {
             provider_session_id: "id".into(),
             name: "repo".into(),
             search_terms: Vec::new(),
+            first_prompt: None,
             agent: AgentKind::Claude,
             status: SessionStatus::Idle,
             cwd: "/tmp".into(),

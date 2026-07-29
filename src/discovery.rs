@@ -363,7 +363,7 @@ pub(crate) fn parse_codex(path: &Path) -> io::Result<Option<Session>> {
     if let Some(value) = provider_name.clone() {
         push_search_term(&mut search_terms, value);
     }
-    if let Some(value) = first_prompt {
+    if let Some(value) = first_prompt.clone() {
         push_search_term(&mut search_terms, value);
     }
     let name = provider_name
@@ -386,6 +386,7 @@ pub(crate) fn parse_codex(path: &Path) -> io::Result<Option<Session>> {
         provider_session_id: id,
         name,
         search_terms,
+        first_prompt,
         agent: AgentKind::Codex,
         status,
         cwd: cwd.clone(),
@@ -472,7 +473,11 @@ pub(crate) fn parse_claude(path: &Path) -> io::Result<Option<Session>> {
                 .and_then(Value::as_array)
                 .is_some_and(|items| item_type_present(items, "tool_result"));
             let tools = tool_names(content);
-            if record_type == "user" && !has_tool_result && !text.is_empty() {
+            if record_type == "user"
+                && !has_tool_result
+                && !text.is_empty()
+                && !is_internal_context(&text)
+            {
                 first_prompt.get_or_insert_with(|| text.clone());
                 latest_prompt = Some(text.clone());
                 task.clone_from(&text);
@@ -506,7 +511,7 @@ pub(crate) fn parse_claude(path: &Path) -> io::Result<Option<Session>> {
         agent_name.clone(),
         custom_title.clone(),
         ai_title.clone(),
-        first_prompt,
+        first_prompt.clone(),
         latest_prompt,
         conversation_summary,
         tag,
@@ -544,6 +549,7 @@ pub(crate) fn parse_claude(path: &Path) -> io::Result<Option<Session>> {
         provider_session_id: id,
         name,
         search_terms,
+        first_prompt,
         agent: AgentKind::Claude,
         status,
         cwd: cwd.clone(),
@@ -680,7 +686,8 @@ fn clean_text(value: &str) -> String {
     output
 }
 
-fn is_internal_context(value: &str) -> bool {
+pub(crate) fn is_internal_context(value: &str) -> bool {
+    let value = value.trim_start();
     [
         "<environment_context>",
         "<permissions instructions>",
@@ -688,6 +695,20 @@ fn is_internal_context(value: &str) -> bool {
         "<skills_instructions>",
         "<apps_instructions>",
         "<plugins_instructions>",
+        "<subagent_notification>",
+        "<turn_aborted>",
+        "<user_shell_command>",
+        "<observed_from_primary_session>",
+        "<system-reminder>",
+        "<command-name>",
+        "<command-message>",
+        "<command-args>",
+        "<local-command-caveat>",
+        "<local-command-stdout>",
+        "<local-command-stderr>",
+        "<bash-input>",
+        "<bash-stdout>",
+        "<bash-stderr>",
     ]
     .iter()
     .any(|prefix| value.starts_with(prefix))
@@ -922,6 +943,12 @@ mod tests {
             .unwrap();
         assert_eq!(session.name, "OIDC rollout");
         assert_eq!(session.summary.task, "Ship the final migration");
+        assert_eq!(
+            session.first_prompt.as_deref(),
+            Some("Design the authentication flow"),
+            "the title must stay the first prompt while the task follows the latest one"
+        );
+        assert_eq!(session.list_title(), "Design the authentication flow");
         for term in [
             "OIDC rollout",
             "Design the authentication flow",
@@ -1049,6 +1076,56 @@ mod tests {
             "<environment_context> <cwd>/tmp</cwd> </environment_context>"
         ));
         assert!(!is_internal_context("Implement the login flow"));
+    }
+
+    #[test]
+    fn provider_command_wrappers_are_not_treated_as_a_user_task() {
+        for value in [
+            "<command-name>/clear</command-name>",
+            "<local-command-caveat>Caveat: the messages below were generated",
+            "<local-command-stdout>Set model to Opus 5",
+            "<bash-input>pwd</bash-input>",
+            "<observed_from_primary_session>\n  <what_happened>Read",
+            "<user_shell_command>\n<command>\ngit status\n</command>",
+            "<subagent_notification>\n{\"agent_path\":\"019f\"}",
+            "<turn_aborted>\nThe user interrupted the previous turn",
+        ] {
+            assert!(is_internal_context(value), "{value}");
+        }
+    }
+
+    #[test]
+    fn claude_command_wrappers_keep_the_last_real_prompt_as_the_task() {
+        let root = tempdir().unwrap();
+        let codex = root.path().join("codex");
+        let claude = root.path().join("claude/project");
+        fs::create_dir_all(&codex).unwrap();
+        fs::create_dir_all(&claude).unwrap();
+        let cwd = root.path().join("repo");
+        fs::create_dir(&cwd).unwrap();
+        let claude_id = Uuid::new_v4().to_string();
+        let mut transcript = fs::File::create(claude.join(format!("{claude_id}.jsonl"))).unwrap();
+        for content in [
+            "Check the keybinding conflicts",
+            "<command-name>/model</command-name>\n<command-message>model</command-message>",
+            "<local-command-stdout>Set model to Opus 5 (1M context)</local-command-stdout>",
+        ] {
+            let record = serde_json::json!({
+                "type":"user","sessionId":claude_id,"cwd":cwd,
+                "message":{"role":"user","content":content}
+            });
+            writeln!(transcript, "{record}").unwrap();
+        }
+
+        let sessions = discover(&DiscoveryPaths {
+            codex_sessions: codex,
+            claude_projects: root.path().join("claude"),
+        });
+        let session = sessions
+            .iter()
+            .find(|session| session.provider_session_id == claude_id)
+            .unwrap();
+        assert_eq!(session.summary.task, "Check the keybinding conflicts");
     }
 
     #[test]

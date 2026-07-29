@@ -40,7 +40,7 @@ relevant PTY E2E tests passed.
   versions.
 - [x] Compatibility fixtures and smoke tests for real supported Codex and
   Claude Code versions.
-- [x] Three-way `Ctrl-O` focus cycle across session list, agent, and shells;
+- [x] Three-way `Ctrl-\` focus cycle across session list, agent, and shells;
   list navigation previews the selected transcript and retained shells without
   leaving Workspace or starting a provider.
 - [x] Persist managed transcript fingerprints; restart stale idle/failed

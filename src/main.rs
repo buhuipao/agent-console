@@ -1654,18 +1654,18 @@ mod tests {
     }
 
     #[test]
-    fn session_list_groups_workspaces_and_uses_task_titles() {
+    fn session_list_groups_workspaces_and_uses_first_prompt_titles() {
         let mut app = App::test_fixture();
-        app.sessions[0].summary.task = "refresh tokens".into();
+        app.sessions[0].first_prompt = Some("refresh tokens".into());
         let mut same_workspace = app.sessions[0].clone();
         same_workspace.key = "claude:timeout".into();
         same_workspace.agent = AgentKind::Claude;
-        same_workspace.summary.task = "fix timeout".into();
+        same_workspace.first_prompt = Some("fix timeout".into());
         let mut other_workspace = app.sessions[0].clone();
         other_workspace.key = "codex:frontend".into();
         other_workspace.name = "frontend".into();
         other_workspace.cwd = "/tmp/frontend".into();
-        other_workspace.summary.task = "update navbar".into();
+        other_workspace.first_prompt = Some("update navbar".into());
         app.sessions = vec![app.sessions[0].clone(), same_workspace, other_workspace];
         app.selected = 1;
         app.toggle_selected_archive().unwrap();
@@ -1755,7 +1755,7 @@ mod tests {
         let backend = TestBackend::new(160, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::test_fixture();
-        app.sessions[0].summary.task = "FOCUS-KEY-INFO".into();
+        app.sessions[0].first_prompt = Some("FOCUS-KEY-INFO".into());
         app.sessions[0].status = SessionStatus::Working;
         app.sessions[0].summary.current_action = "running the focused regression".into();
         app.sessions[0].summary.next_step = "verify the real terminal".into();

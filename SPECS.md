@@ -125,7 +125,7 @@ circuit_cooldown_seconds = 300
 help = ["?"]
 
 [keys.workspace]
-focus = ["ctrl-o"]
+focus = ["ctrl-\\"]
 dashboard = ["ctrl-q"]
 ```
 
@@ -144,7 +144,11 @@ key labels, empty action arrays, and duplicate effective sequences before the
 TUI starts. Workspace printable-key actions are active only in `FOCUS SESSIONS`;
 the same bytes in agent/shell focus are forwarded. Focus, Dashboard, alert, and
 new-Shell chords are global. Next-Shell and close-Shell chords are active only
-in Shell focus and are forwarded in Agent focus. The input router and all
+in Shell focus and are forwarded in Agent focus. A chord that stays reachable
+while a child owns the focus must avoid the keys Codex and Claude Code bind for
+themselves; `ctrl-\`, `ctrl-^`, and `ctrl-q` are the only free ones, so `alert`
+and `live_tail` ship unbound and rely on Session-list `a` and ordinary child
+input. The input router and all
 displayed control hints use the same resolved binding map. The `help` action
 opens a three-column panel that lists all effective Dashboard and direct
 Workspace bindings, fixed and configurable Session-list controls,
@@ -348,15 +352,20 @@ Entering a workspace:
 6. Forward raw stdin only to the focused agent or shell. When the session list
    has focus, Up/Down or `j`/`k` changes the selected session and immediately
    rebinds the right side to its latest transcript preview and retained shells
-   without starting a provider. The selected item owns the focus highlight;
+   without starting a provider. That preview carries the title, workspace path,
+   branch, the first user prompt, the rolling summary's task/current action/next
+   step/first blocker, any stale-summary reason, and the recent transcript. The
+   summary lives here rather than in the title, so periodic resummarizing changes
+   what the session is doing now without changing what it is. The selected item owns the focus highlight;
    workspace group headings and the `SESSIONS` heading are never selectable.
    Enter explicitly starts/resumes and focuses its agent.
-7. `Ctrl-O` cycles Agent -> Shell -> Sessions -> Agent, creating the first
-   shell when needed. `Ctrl-Q` returns to the Dashboard and `Ctrl-]` jumps to a
-   background waiting/failed alert. `Ctrl-\` adds a Shell directly from Agent
+7. `Ctrl-\` cycles Agent -> Shell -> Sessions -> Agent, creating the first
+   shell when needed. `Ctrl-Q` returns to the Dashboard. `Ctrl-^` adds a Shell
+   directly from Agent
    or Shell focus. In Shell focus, `Ctrl-N` selects the next Shell and `Ctrl-X`
    closes it immediately. `Ctrl-N` and
-   `Ctrl-X` are forwarded in Agent focus. `Ctrl-T`, `Ctrl-Enter`, `Esc`,
+   `Ctrl-X` are forwarded in Agent focus. `Ctrl-O`, `Ctrl-]`, `Shift-End`,
+   `Ctrl-T`, `Ctrl-Enter`, `Esc`,
    printable input, unrelated Ctrl keys, Alt keys, and function keys remain
    child input. Modified-key reporting is enabled only while the Agent has
    focus, allowing nested providers to distinguish `Ctrl-Enter` from Enter
@@ -376,8 +385,8 @@ Entering a workspace:
    Workspace does not leave the alternate screen.
 
 Each agent and shell has an independent viewport. `Shift-PageUp` and
-`Shift-PageDown` move it through retained history, `Shift-End` returns to the
-live tail, and the pane title displays the current `SCROLL +N` offset. Ordinary
+`Shift-PageDown` move it through retained history and the pane title displays
+the current `SCROLL +N` offset. Ordinary
 child input first returns the focused pane to the live tail. A full-screen
 agent that enables mouse reporting receives its native clicks. Its native
 wheel receives events only at the live tail when no retained outer history can
@@ -508,19 +517,30 @@ Codex summary command uses an empty neutral working directory:
 
 ```text
 codex exec --ephemeral --sandbox read-only --ignore-user-config
-  --skip-git-repo-check --output-schema <schema-file> -
+  --skip-git-repo-check --output-schema <schema-file> <prompt>
 ```
 
 Claude summary command uses an empty neutral working directory:
 
 ```text
 claude --safe-mode --print --tools "" --no-session-persistence
-  --output-format json --json-schema <schema-json>
+  --output-format json --json-schema <schema-json> <prompt>
 ```
 
-Parse only the structured final result. Save the previous summary on timeout,
-non-zero exit, malformed JSON, or schema mismatch. Display the error as
-`summary stale: <short reason>`.
+Pass the prompt as the final argument and give the summarizer no stdin. A
+configured Provider Command may wrap the provider in a terminal automation tool
+that hands the child a PTY, and a PTY stdin never delivers a piped prompt, so a
+stdin prompt fails or hangs for every such user. Drain stdout and stderr
+concurrently while the child runs; a wrapper merges the provider's own chrome
+into both, and either one can exceed its pipe buffer.
+
+Recover the summary from the last line of the captured stream that is a JSON
+object, after removing ANSI sequences. A wrapper also surfaces provider banners,
+warnings, token counts, and cursor escapes, so the stream is not JSON on its own.
+Save the previous summary on timeout, non-zero exit, missing JSON, or schema
+mismatch. Display the error as `summary stale: <short reason>` and record it in
+the rotating diagnostics log, because most sessions never reach a status that
+shows the error on screen.
 
 ## 12. Dashboard interaction
 
@@ -530,12 +550,13 @@ Enter            Open workspace focused on the selected agent
 s                Add shell and open workspace focused on it
 n                Open new-session dialog
 a                Jump to the next unread waiting/failed alert
+r                Retry the selected session's summary, clearing backoff
 /                Search sessions by metadata, provider, workspace, or status
 x                Archive the selected session, or restore an archived one
 ?                 Open the effective key-binding panel
 q or Esc         Quit (Esc closes a dialog first)
-Ctrl-O/Q/]       Focus cycle / Dashboard / unread alert (all Workspace modes)
-Ctrl-\            Add and focus a Shell (Agent or Shell focus)
+Ctrl-\ / Ctrl-Q  Focus cycle / Dashboard (all Workspace modes)
+Ctrl-^            Add and focus a Shell (Agent or Shell focus)
 Ctrl-N/X         Next / close Shell (Shell focus only; forwarded in Agent)
 j/k or Up/Down   Select session (FOCUS SESSIONS only)
 /                 Search sessions (FOCUS SESSIONS only)
@@ -565,9 +586,12 @@ A notification is created only when a background session transitions into
 the session task and pending decision or failure reason.
 
 The left list is grouped by exact workspace path. Each session row shows its
-provider, status/age, and summarized task (falling back to branch or a short
-session ID). The right side begins with a full-width selected-session focus
-panel: full task, `NEEDS YOU`/`BLOCKER`/`NOW`/`LAST` priority, next step, and
+provider, status/age, and title. The title is the session's first user prompt,
+falling back to branch or a short session ID. It never follows the latest prompt
+or the rolling summary, so a session keeps one stable identity for its whole
+life and slash commands or shell echoes cannot rename it. The right side begins
+with a full-width selected-session focus
+panel: full title, `NEEDS YOU`/`BLOCKER`/`NOW`/`LAST` priority, next step, and
 full workspace context. Below it is an adaptive session-card grid with no more
 than three cards per row. Card titles stay short (provider/status/age/shells),
 while a bright body `TASK` row carries the identity. The priority row always

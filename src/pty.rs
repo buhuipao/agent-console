@@ -2196,7 +2196,11 @@ impl WorkspaceBindings {
     }
 
     fn label(&self, action: &str) -> &str {
-        self.labels.get(action).map_or("unbound", String::as_str)
+        self.label_opt(action).unwrap_or("unbound")
+    }
+
+    fn label_opt(&self, action: &str) -> Option<&str> {
+        self.labels.get(action).map(String::as_str)
     }
 }
 
@@ -3122,14 +3126,19 @@ impl SessionTerminals {
                                 continue;
                             }
                             self.maximized = Some(PaneTarget::Shell(self.selected_shell));
-                            self.notice =
-                                Some("shell maximized · Ctrl-O returns to sessions".into());
+                            self.notice = Some(format!(
+                                "shell maximized · {} returns to sessions",
+                                render_bindings.label("focus")
+                            ));
                             exit = WorkspaceExit::FocusShell;
                             break 'workspace;
                         }
                         WorkspaceCommand::ToggleShellArea => {
                             self.maximized = Some(PaneTarget::Agent);
-                            self.notice = Some("agent maximized · Ctrl-O changes focus".into());
+                            self.notice = Some(format!(
+                                "agent maximized · {} changes focus",
+                                render_bindings.label("focus")
+                            ));
                             exit = WorkspaceExit::ActivateSession;
                             break 'workspace;
                         }
@@ -3583,14 +3592,17 @@ fn render_workspace_with_bindings(
         };
         let badge = format!(" {focus_name} ");
         let controls_text = if let Some(notification) = &chrome.notification {
-            let alert = if focus == WorkspaceFocus::Sessions {
-                format!(
-                    "{}/{}",
-                    bindings.label("alert"),
+            let alert = match (bindings.label_opt("alert"), focus) {
+                (Some(direct), WorkspaceFocus::Sessions) => {
+                    format!("{direct}/{}", bindings.label("session_alert"))
+                }
+                (Some(direct), _) => direct.to_owned(),
+                (None, WorkspaceFocus::Sessions) => bindings.label("session_alert").to_owned(),
+                (None, _) => format!(
+                    "{} then {}",
+                    bindings.label("focus"),
                     bindings.label("session_alert")
-                )
-            } else {
-                bindings.label("alert").to_owned()
+                ),
             };
             format!(
                 "  ALERT · {notification}  ·  {} jump  {} dashboard",
@@ -3714,14 +3726,23 @@ fn render_workspace_help(
 }
 
 fn workspace_help_lines(bindings: &WorkspaceBindings) -> Vec<String> {
-    vec![
+    let direct_alert = bindings
+        .label_opt("alert")
+        .map(|label| format!("{:<24} {}", "next unread alert", label));
+    let live_tail = bindings.label_opt("live_tail").map_or_else(
+        || format!("{:<24} {}", "return to live tail", "any key"),
+        |label| format!("{:<24} {label}", "return to live tail"),
+    );
+    let mut lines = vec![
         "WORKSPACE · DIRECT".into(),
         format!("{:<24} {}", "cycle focus", bindings.label("focus")),
         format!("{:<24} {}", "new shell", bindings.label("new_shell")),
         format!("{:<24} {}", "next shell", bindings.label("next_shell")),
         format!("{:<24} {}", "close shell", bindings.label("close_shell")),
         format!("{:<24} {}", "dashboard", bindings.label("dashboard")),
-        format!("{:<24} {}", "next unread alert", bindings.label("alert")),
+    ];
+    lines.extend(direct_alert);
+    lines.extend([
         String::new(),
         "WORKSPACE · SESSIONS".into(),
         format!("{:<24} {}", "select session", "↑/↓, J/K"),
@@ -3760,13 +3781,10 @@ fn workspace_help_lines(bindings: &WorkspaceBindings) -> Vec<String> {
             bindings.label("scroll_up"),
             bindings.label("scroll_down")
         ),
-        format!(
-            "{:<24} {}",
-            "return to live tail",
-            bindings.label("live_tail")
-        ),
+        live_tail,
         format!("{:<24} {} / Esc", "close help", bindings.label("help")),
-    ]
+    ]);
+    lines
 }
 
 fn pane_label_with_scrollback(label: &str, terminal: Option<&ManagedTerminal>) -> String {
@@ -4622,6 +4640,7 @@ mod tests {
             provider_session_id: "id".into(),
             name: "repo".into(),
             search_terms: Vec::new(),
+            first_prompt: None,
             agent,
             status: SessionStatus::Idle,
             cwd: cwd.to_owned(),
@@ -5081,13 +5100,13 @@ mod tests {
     fn every_workspace_shortcut_routes_in_its_allowed_focus() {
         let cases: &[(&[u8], WorkspaceCommand, WorkspaceFocus)] = &[
             (
-                b"\x0f",
+                b"\x1c",
                 WorkspaceCommand::ToggleFocus,
                 WorkspaceFocus::Agent,
             ),
             (b"\x11", WorkspaceCommand::Dashboard, WorkspaceFocus::Shell),
-            (b"\x1d", WorkspaceCommand::Alert, WorkspaceFocus::Agent),
-            (b"\x1c", WorkspaceCommand::NewShell, WorkspaceFocus::Agent),
+            (b"a", WorkspaceCommand::Alert, WorkspaceFocus::Sessions),
+            (b"\x1e", WorkspaceCommand::NewShell, WorkspaceFocus::Agent),
             (b"\x0e", WorkspaceCommand::NextShell, WorkspaceFocus::Shell),
             (b"\x18", WorkspaceCommand::CloseShell, WorkspaceFocus::Shell),
             (
@@ -5147,10 +5166,9 @@ mod tests {
             workspace_command(b"\x1b[6;2~"),
             Some(WorkspaceCommand::ScrollDown)
         ));
-        assert!(matches!(
-            workspace_command(b"\x1b[1;2F"),
-            Some(WorkspaceCommand::LiveTail)
-        ));
+        // Shift-End stays free for Claude Code's selection:extendLineEnd; child
+        // input already returns the pane to the live tail.
+        assert!(workspace_command(b"\x1b[1;2F").is_none());
     }
 
     #[test]
@@ -5775,8 +5793,8 @@ mod tests {
 
     #[test]
     fn only_documented_control_bytes_are_reserved_in_child_focus() {
-        let agent_reserved = [0x0f, 0x11, 0x1c, 0x1d];
-        let shell_reserved = [0x0e, 0x0f, 0x11, 0x18, 0x1c, 0x1d];
+        let agent_reserved = [0x11, 0x1c, 0x1e];
+        let shell_reserved = [0x0e, 0x11, 0x18, 0x1c, 0x1e];
 
         for (focus, reserved) in [
             (WorkspaceFocus::Agent, agent_reserved.as_slice()),
@@ -5820,6 +5838,11 @@ mod tests {
                 b"\x14".as_slice(),
                 b"\x1b[A".as_slice(),
                 b"\x1b[B".as_slice(),
+                // Claude Code's app:toggleTranscript, app:openArtifact, and
+                // selection:extendLineEnd must reach the child untouched.
+                b"\x0f".as_slice(),
+                b"\x1d".as_slice(),
+                b"\x1b[1;2F".as_slice(),
             ] {
                 let mut router = WorkspaceInputRouter::default();
                 assert!(matches!(
@@ -5835,7 +5858,7 @@ mod tests {
         for focus in [WorkspaceFocus::Agent, WorkspaceFocus::Shell] {
             let mut router = WorkspaceInputRouter::default();
             assert!(matches!(
-                router.route(b"\x1c", focus).as_slice(),
+                router.route(b"\x1e", focus).as_slice(),
                 [WorkspaceInput::Command(WorkspaceCommand::NewShell)]
             ));
         }
@@ -5861,10 +5884,9 @@ mod tests {
     #[test]
     fn enhanced_control_sequences_keep_workspace_shortcuts_working() {
         for (sequence, command) in [
-            (b"\x1b[111;5u".as_slice(), WorkspaceCommand::ToggleFocus),
-            (b"\x1b[92;5u".as_slice(), WorkspaceCommand::NewShell),
+            (b"\x1b[92;5u".as_slice(), WorkspaceCommand::ToggleFocus),
+            (b"\x1b[94;5u".as_slice(), WorkspaceCommand::NewShell),
             (b"\x1b[113;5u".as_slice(), WorkspaceCommand::Dashboard),
-            (b"\x1b[93;5u".as_slice(), WorkspaceCommand::Alert),
         ] {
             let mut router = WorkspaceInputRouter::default();
             assert!(matches!(
@@ -6216,8 +6238,8 @@ mod tests {
         let output = String::from_utf8_lossy(&output);
         assert!(output.contains("AGENT · Cdx fix focus"));
         assert!(output.contains("Ctrl-Q dashboard"));
-        assert!(output.contains("Ctrl-\\ new shell"));
-        assert!(output.contains("Ctrl-O focus"));
+        assert!(output.contains("Ctrl-^ new shell"));
+        assert!(output.contains("Ctrl-\\ focus"));
         assert!(output.contains("Shift-PageUp/Down scroll"));
         assert!(output.contains("FOCUS AGENT"));
     }
@@ -6262,8 +6284,8 @@ mod tests {
 
         assert!(output.contains("FOCUS SHELL 1/1"));
         assert!(output.contains("Ctrl-Q dashboard"));
-        assert!(output.contains("Ctrl-O focus"));
-        assert!(output.contains("Ctrl-\\ new"));
+        assert!(output.contains("Ctrl-\\ focus"));
+        assert!(output.contains("Ctrl-^ new"));
         assert!(output.contains("Ctrl-N next"));
         assert!(output.contains("Ctrl-X close"));
         assert!(output.contains("Shift-PageUp/Down scroll"));

@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::{
     clipboard,
     config::AgentConsoleConfig,
+    diagnostics,
     discovery::{self, DiscoveryCache, DiscoveryPaths},
     events::{self, NormalizedEvent},
     model::{AgentKind, Session, SessionStatus, SessionSummary, unix_timestamp},
@@ -463,6 +464,7 @@ impl App {
                 provider_session_id: id,
                 name,
                 search_terms: Vec::new(),
+                first_prompt: None,
                 agent: dialog.provider,
                 status: SessionStatus::Idle,
                 cwd,
@@ -938,7 +940,11 @@ impl RuntimeState {
                 let changed = previous.transcript_fingerprint != session.transcript_fingerprint;
                 let discovered_task = std::mem::take(&mut session.summary.task);
                 session.summary = previous.summary;
-                if session.summary.task.trim().is_empty() {
+                // Caches written before provider command wrappers were filtered
+                // still carry one as the task; the parsed prompt wins over it.
+                if session.summary.task.trim().is_empty()
+                    || discovery::is_internal_context(&session.summary.task)
+                {
                     session.summary.task = discovered_task;
                 }
                 session
@@ -1146,9 +1152,15 @@ impl RuntimeState {
                     format!("path  {}", session.cwd.display()),
                     format!("git   {}", session.branch.as_deref().unwrap_or("no branch")),
                 ];
-                if !session.summary.task.trim().is_empty() {
-                    preview.push(format!("task  {}", session.summary.task.trim()));
+                if let Some(prompt) = session
+                    .first_prompt
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    preview.push(format!("asked {prompt}"));
                 }
+                preview.extend(summary_preview_lines(session));
                 preview.push(String::new());
                 preview.push("RECENT TRANSCRIPT".into());
                 if session.recent_activity.is_empty() {
@@ -1467,6 +1479,9 @@ impl RuntimeState {
                     true
                 }
                 Err(error) => {
+                    diagnostics::record(&format!(
+                        "summary failed for {session_key} ({provider:?}): {error}"
+                    ));
                     self.sessions[index].summary_error = Some(error);
                     false
                 }
@@ -1520,6 +1535,35 @@ impl RuntimeState {
     }
 }
 
+/// The rolling summary belongs in the preview, not in the session title, so the
+/// title stays the first prompt while this tracks what the agent is doing now.
+fn summary_preview_lines(session: &Session) -> Vec<String> {
+    let summary = &session.summary;
+    let mut lines = Vec::new();
+    for (label, value) in [
+        ("task ", summary.task.as_str()),
+        ("now  ", summary.current_action.as_str()),
+        ("next ", summary.next_step.as_str()),
+    ] {
+        let value = value.trim();
+        if !value.is_empty() {
+            lines.push(format!("{label} {value}"));
+        }
+    }
+    if let Some(blocker) = summary
+        .blockers
+        .first()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!("block {blocker}"));
+    }
+    if let Some(error) = session.summary_error.as_deref() {
+        lines.push(format!("summary stale: {error}"));
+    }
+    lines
+}
+
 fn session_status_counts(sessions: &[Session]) -> (usize, usize, usize, usize) {
     sessions.iter().fold((0, 0, 0, 0), |mut counts, session| {
         match session.status {
@@ -1550,6 +1594,7 @@ impl App {
             provider_session_id: "test".into(),
             name: "backend-api".into(),
             search_terms: Vec::new(),
+            first_prompt: None,
             agent: AgentKind::Codex,
             status: SessionStatus::Working,
             cwd: "/tmp/backend-api".into(),
@@ -1767,21 +1812,21 @@ mod tests {
     }
 
     #[test]
-    fn workspace_sidebar_groups_sessions_and_uses_task_titles() {
+    fn workspace_sidebar_groups_sessions_and_uses_first_prompt_titles() {
         let mut app = App::test_fixture();
-        app.sessions[0].summary.task = "refresh tokens".into();
+        app.sessions[0].first_prompt = Some("refresh tokens".into());
         app.sessions[0].status = SessionStatus::Working;
         let mut same_workspace = app.sessions[0].clone();
         same_workspace.key = "claude:timeout".into();
         same_workspace.agent = AgentKind::Claude;
         same_workspace.status = SessionStatus::Waiting;
-        same_workspace.summary.task = "fix timeout".into();
+        same_workspace.first_prompt = Some("fix timeout".into());
         let mut other_workspace = app.sessions[0].clone();
         other_workspace.key = "codex:frontend".into();
         other_workspace.name = "frontend".into();
         other_workspace.cwd = "/tmp/frontend".into();
         other_workspace.status = SessionStatus::Failed;
-        other_workspace.summary.task = "update navbar".into();
+        other_workspace.first_prompt = Some("update navbar".into());
         app.sessions = vec![app.sessions[0].clone(), same_workspace, other_workspace];
 
         let chrome = app.workspace_chrome();
@@ -1798,6 +1843,35 @@ mod tests {
         );
         assert_eq!(chrome.selected, 1);
         assert_eq!(chrome.status_counts, (1, 1, 0, 1));
+    }
+
+    #[test]
+    fn the_preview_carries_the_first_prompt_and_the_rolling_summary() {
+        let mut app = App::test_fixture();
+        app.sessions[0].first_prompt = Some("Add signed releases".into());
+        app.sessions[0].summary.task = "Rework the notarization step".into();
+        app.sessions[0].summary.current_action = "Stapling the ticket".into();
+        app.sessions[0].summary.next_step = "Re-run the release job".into();
+        app.sessions[0].summary.blockers = vec!["Apple service is rate limiting".into()];
+        app.selected = 0;
+
+        let preview = app.workspace_chrome().preview.join("\n");
+
+        assert!(preview.contains("asked Add signed releases"), "{preview}");
+        assert!(
+            preview.contains("Rework the notarization step"),
+            "{preview}"
+        );
+        assert!(preview.contains("Stapling the ticket"), "{preview}");
+        assert!(preview.contains("Re-run the release job"), "{preview}");
+        assert!(
+            preview.contains("Apple service is rate limiting"),
+            "{preview}"
+        );
+        assert!(
+            preview.starts_with("Add signed releases · "),
+            "the preview header keeps the title: {preview}"
+        );
     }
 
     #[test]
@@ -2241,12 +2315,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_cached_command_wrapper_title_is_replaced_by_the_parsed_prompt() {
+        let root = tempdir().unwrap();
+        let codex_sessions = root.path().join("codex");
+        fs::create_dir_all(&codex_sessions).unwrap();
+        fs::write(
+            codex_sessions.join("rollout-wrapped.jsonl"),
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"actual-id\",\"cwd\":\"/tmp\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Audit the keybindings\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let mut app = App::test_fixture();
+        let mut cached = fixture_session("codex:actual-id");
+        // Written by a build that still accepted provider command wrappers.
+        cached.summary.task = "<user_shell_command>\n<command>\ngit status\n</command>".into();
+        cached.transcript_fingerprint = "stale".into();
+        app.runtime.sessions = vec![cached];
+        app.runtime.selected = 0;
+        app.runtime.discovery_paths = DiscoveryPaths {
+            codex_sessions,
+            claude_projects: root.path().join("claude"),
+        };
+
+        app.runtime.refresh_now(&HashSet::new());
+
+        assert_eq!(
+            app.session_title(&app.runtime.sessions[0]),
+            "Audit the keybindings",
+            "a cached wrapper title must not survive a refresh"
+        );
+    }
+
     fn fixture_session(key: &str) -> Session {
         Session {
             key: key.into(),
             provider_session_id: key.split(':').nth(1).unwrap().into(),
             name: key.into(),
             search_terms: Vec::new(),
+            first_prompt: None,
             agent: AgentKind::Codex,
             status: SessionStatus::Idle,
             cwd: "/tmp".into(),

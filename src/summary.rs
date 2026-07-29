@@ -1,6 +1,6 @@
 use std::{
     env, fs,
-    io::{self, Read, Write},
+    io::{self, Read},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -181,8 +181,12 @@ fn command_for(
     provider: AgentKind,
     neutral_cwd: &Path,
     schema_path: &Path,
+    prompt: &str,
 ) -> SummaryCommand {
-    let args = match provider {
+    // The prompt is an argument, never stdin. A configured provider command may
+    // wrap the provider in a terminal automation tool that hands the child a PTY,
+    // and a PTY stdin never delivers a piped prompt.
+    let mut args = match provider {
         AgentKind::Codex => vec![
             "exec".into(),
             "--ephemeral".into(),
@@ -192,7 +196,6 @@ fn command_for(
             "--skip-git-repo-check".into(),
             "--output-schema".into(),
             schema_path.display().to_string(),
-            "-".into(),
         ],
         AgentKind::Claude => vec![
             "--safe-mode".into(),
@@ -206,6 +209,7 @@ fn command_for(
             summary_schema().to_string(),
         ],
     };
+    args.push(prompt.to_owned());
     let command = config.provider_command(provider, args);
     SummaryCommand {
         program: command.program.to_string_lossy().into_owned(),
@@ -229,25 +233,18 @@ fn run_job(
     let provider = backend
         .provider_for(job.provider)
         .ok_or_else(|| "summaries are disabled".to_owned())?;
-    let command = command_for(config, provider, state_dir, schema_path);
     let prompt = build_prompt(&job.previous, &job.records);
-    let output = run_with_timeout(&command, prompt.as_bytes(), SUMMARY_TIMEOUT, cancel)?;
+    let command = command_for(config, provider, state_dir, schema_path, &prompt);
+    let output = run_with_timeout(&command, SUMMARY_TIMEOUT, cancel)?;
     parse_output(provider, &output)
 }
 
 fn run_with_timeout(
     spec: &SummaryCommand,
-    input: &[u8],
     timeout: Duration,
     cancel: &AtomicBool,
 ) -> Result<Vec<u8>, String> {
     let mut child = spawn_summary_process(spec)?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| "summarizer stdin unavailable".to_owned())?
-        .write_all(input)
-        .map_err(|error| format!("cannot send summary input: {error}"))?;
     let mut stdout = child
         .stdout
         .take()
@@ -317,7 +314,7 @@ fn spawn_summary_process(spec: &SummaryCommand) -> Result<Child, String> {
     command
         .args(&spec.args)
         .current_dir(&spec.cwd)
-        .stdin(Stdio::piped())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
@@ -342,8 +339,8 @@ fn spawn_summary_process(spec: &SummaryCommand) -> Result<Child, String> {
 }
 
 fn parse_output(provider: AgentKind, bytes: &[u8]) -> Result<SessionSummary, String> {
-    let value: Value = serde_json::from_slice(bytes)
-        .map_err(|error| format!("summarizer returned invalid JSON: {error}"))?;
+    let value =
+        structured_value(bytes).ok_or_else(|| "summarizer returned no JSON object".to_owned())?;
     let structured = match provider {
         AgentKind::Codex => value,
         AgentKind::Claude => {
@@ -363,6 +360,23 @@ fn parse_output(provider: AgentKind, bytes: &[u8]) -> Result<SessionSummary, Str
     };
     serde_json::from_value(structured)
         .map_err(|error| format!("summary does not match the schema: {error}"))
+}
+
+/// A configured provider command may run the provider behind a PTY wrapper, so
+/// the captured stream also carries the provider's own banners, warnings, and
+/// cursor escapes. Take the last line that is a JSON object on its own.
+fn structured_value(bytes: &[u8]) -> Option<Value> {
+    let text = strip_ansi(&String::from_utf8_lossy(bytes));
+    if let Ok(value @ Value::Object(_)) = serde_json::from_str::<Value>(text.trim()) {
+        return Some(value);
+    }
+    text.lines().rev().find_map(|line| {
+        let line = line.trim();
+        line.starts_with('{')
+            .then(|| serde_json::from_str::<Value>(line).ok())
+            .flatten()
+            .filter(|value| value.is_object())
+    })
 }
 
 pub fn ensure_schema(path: &Path) -> io::Result<()> {
@@ -486,12 +500,65 @@ mod tests {
         let root = Path::new("/tmp/neutral");
         let schema = root.join("schema.json");
         let config = AgentConsoleConfig::default();
-        let codex = command_for(&config, AgentKind::Codex, root, &schema);
+        let codex = command_for(&config, AgentKind::Codex, root, &schema, "p");
         assert!(codex.args.contains(&"--ephemeral".into()));
         assert!(codex.args.contains(&"read-only".into()));
-        let claude = command_for(&config, AgentKind::Claude, root, &schema);
+        let claude = command_for(&config, AgentKind::Claude, root, &schema, "p");
         assert!(claude.args.contains(&"--safe-mode".into()));
         assert!(claude.args.contains(&"--no-session-persistence".into()));
+    }
+
+    #[test]
+    fn the_prompt_is_an_argument_so_a_tty_wrapper_cannot_swallow_it() {
+        let root = Path::new("/tmp/neutral");
+        let schema = root.join("schema.json");
+        let config = AgentConsoleConfig::default();
+        for provider in [AgentKind::Codex, AgentKind::Claude] {
+            let command = command_for(&config, provider, root, &schema, "summarize this");
+            assert_eq!(
+                command.args.last().map(String::as_str),
+                Some("summarize this"),
+                "{provider:?} must receive the prompt as its final argument"
+            );
+            assert!(
+                !command.args.iter().any(|argument| argument == "-"),
+                "{provider:?} must not read the prompt from stdin"
+            );
+        }
+    }
+
+    #[test]
+    fn structured_output_survives_wrapper_banners_and_ansi_noise() {
+        let summary = serde_json::json!({
+            "task": "audit keybindings",
+            "status": "idle",
+            "progress": [],
+            "current_action": "",
+            "next_step": "",
+            "needs_user": [],
+            "blockers": []
+        });
+        // A TTY wrapper merges the provider's own chrome into the captured stream.
+        let codex = format!(
+            ": invalid value for `approval_policy`\n\u{1b}[35m\u{1b}[3mcodex\u{1b}[0m\u{1b}[0m\n{summary}\n\u{1b}[2mtokens used\u{1b}[0m\n18,087\n"
+        );
+        assert_eq!(
+            parse_output(AgentKind::Codex, codex.as_bytes())
+                .unwrap()
+                .task,
+            "audit keybindings"
+        );
+
+        let claude = format!(
+            "{}\n\u{1b}[?25h",
+            serde_json::json!({ "structured_output": summary })
+        );
+        assert_eq!(
+            parse_output(AgentKind::Claude, claude.as_bytes())
+                .unwrap()
+                .task,
+            "audit keybindings"
+        );
     }
 
     #[test]
@@ -502,7 +569,13 @@ mod tests {
         )
         .unwrap();
         let root = Path::new("/tmp/neutral");
-        let command = command_for(&config, AgentKind::Claude, root, &root.join("schema.json"));
+        let command = command_for(
+            &config,
+            AgentKind::Claude,
+            root,
+            &root.join("schema.json"),
+            "p",
+        );
 
         assert_eq!(command.program, "env");
         assert_eq!(command.args[0], "HTTPS_PROXY=http://127.0.0.1:7890");
@@ -519,7 +592,13 @@ mod tests {
         )
         .unwrap();
         let root = Path::new("/tmp/neutral");
-        let command = command_for(&config, AgentKind::Claude, root, &root.join("schema.json"));
+        let command = command_for(
+            &config,
+            AgentKind::Claude,
+            root,
+            &root.join("schema.json"),
+            "p",
+        );
 
         assert_eq!(command.args[0], "-ic");
         assert_eq!(command.args[1], format!(r#"{alias} "$@""#));
@@ -544,6 +623,37 @@ mod tests {
         let _ = child.wait();
 
         assert_eq!(session, pid, "summary child inherited the parent session");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_output_larger_than_the_pipe_buffer_does_not_deadlock() {
+        const BYTES: usize = 1024 * 1024;
+        // A wrapper merges the provider's chrome into the captured stream, so both
+        // pipes can exceed their buffer. Draining only one of them first blocks the
+        // child on the other, and the timeout never runs.
+        let command = SummaryCommand {
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                format!(
+                    "head -c {BYTES} /dev/zero | tr '\\000' 'x' >&2; head -c {BYTES} /dev/zero | tr '\\000' 'x'"
+                ),
+            ],
+            cwd: PathBuf::from("/tmp"),
+        };
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let cancel = AtomicBool::new(false);
+            let outcome = run_with_timeout(&command, Duration::from_secs(20), &cancel);
+            let _ = tx.send(outcome.map(|output| output.len()));
+        });
+
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(Ok(length)) => assert_eq!(length, BYTES),
+            Ok(Err(error)) => panic!("summary run failed: {error}"),
+            Err(_) => panic!("run_with_timeout deadlocked on output larger than the pipe buffer"),
+        }
     }
 
     #[test]

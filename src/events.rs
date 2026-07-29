@@ -463,6 +463,7 @@ mod tests {
             provider_session_id: "abc".into(),
             name: "repo".into(),
             search_terms: Vec::new(),
+            first_prompt: None,
             agent: AgentKind::Claude,
             status: SessionStatus::Idle,
             cwd: "/tmp".into(),

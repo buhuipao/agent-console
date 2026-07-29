@@ -79,6 +79,7 @@ pub struct Session {
     pub provider_session_id: String,
     pub name: String,
     pub search_terms: Vec<String>,
+    pub first_prompt: Option<String>,
     pub agent: AgentKind,
     pub status: SessionStatus,
     pub cwd: PathBuf,
@@ -131,9 +132,16 @@ impl Session {
         }
     }
 
+    /// The first thing the user asked for. It identifies the session for its
+    /// whole life, so it never follows the latest prompt or the rolling summary.
     pub fn list_title(&self) -> String {
-        if !self.summary.task.trim().is_empty() {
-            return self.summary.task.trim().to_owned();
+        if let Some(prompt) = self
+            .first_prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return prompt.to_owned();
         }
         if let Some(branch) = self.branch.as_deref().filter(|value| !value.is_empty()) {
             return branch.to_owned();
@@ -162,6 +170,7 @@ mod tests {
             provider_session_id: "one".into(),
             name: "demo".into(),
             search_terms: Vec::new(),
+            first_prompt: None,
             agent: AgentKind::Codex,
             status: SessionStatus::Idle,
             cwd: "/tmp".into(),
@@ -180,6 +189,21 @@ mod tests {
             unavailable_reason: None,
             discovered_after_startup: false,
         }
+    }
+
+    #[test]
+    fn the_title_is_the_first_prompt_and_ignores_later_work() {
+        let mut value = session();
+        value.branch = Some("feat/oidc".into());
+        value.first_prompt = Some("  Add signed releases  ".into());
+        value.summary.task = "Rewrote the notarization step".into();
+        assert_eq!(value.list_title(), "Add signed releases");
+
+        value.first_prompt = None;
+        assert_eq!(value.list_title(), "feat/oidc");
+
+        value.branch = None;
+        assert_eq!(value.list_title(), "session one");
     }
 
     #[test]

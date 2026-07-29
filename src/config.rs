@@ -504,7 +504,7 @@ fn default_dashboard_keys(action: &str) -> &'static [&'static str] {
         "copy" | "stage" => &[],
         "new" => &["n"],
         "alert" => &["a"],
-        "retry_summary" => &[],
+        "retry_summary" => &["r"],
         "search" => &["/"],
         "alias" => &[],
         "archive" => &["x"],
@@ -515,13 +515,16 @@ fn default_dashboard_keys(action: &str) -> &'static [&'static str] {
 
 fn default_workspace_keys(action: &str) -> &'static [&'static str] {
     match action {
-        "focus" => &["ctrl-o"],
-        "new_shell" => &["ctrl-\\"],
+        // Global Workspace keys must stay clear of the bindings Codex and Claude
+        // Code claim for themselves; ctrl-\, ctrl-^, and ctrl-q are the only free
+        // ones left, so `alert` and `live_tail` rely on their Sessions-focus keys.
+        "focus" => &["ctrl-\\"],
+        "new_shell" => &["ctrl-^"],
         "previous_shell" => &[],
         "next_shell" => &["ctrl-n"],
         "close_shell" => &["ctrl-x"],
         "dashboard" => &["ctrl-q"],
-        "alert" => &["ctrl-]"],
+        "alert" => &[],
         "search" => &["/"],
         "session_alert" => &["a"],
         "help" => &["?"],
@@ -533,7 +536,7 @@ fn default_workspace_keys(action: &str) -> &'static [&'static str] {
         "copy_command" => &["y"],
         "scroll_up" => &["shift-pageup"],
         "scroll_down" => &["shift-pagedown"],
-        "live_tail" => &["shift-end"],
+        "live_tail" => &[],
         "select_shell_1" => &["1"],
         "select_shell_2" => &["2"],
         "select_shell_3" => &["3"],
@@ -739,13 +742,13 @@ mod tests {
     fn workspace_defaults_use_direct_contextual_controls() {
         let config = AgentConsoleConfig::default();
 
-        assert_eq!(config.workspace_keys("focus"), vec!["ctrl-o"]);
-        assert_eq!(config.workspace_keys("new_shell"), vec!["ctrl-\\"]);
+        assert_eq!(config.workspace_keys("focus"), vec!["ctrl-\\"]);
+        assert_eq!(config.workspace_keys("new_shell"), vec!["ctrl-^"]);
         assert!(config.workspace_keys("previous_shell").is_empty());
         assert_eq!(config.workspace_keys("next_shell"), vec!["ctrl-n"]);
         assert_eq!(config.workspace_keys("close_shell"), vec!["ctrl-x"]);
         assert_eq!(config.workspace_keys("dashboard"), vec!["ctrl-q"]);
-        assert_eq!(config.workspace_keys("alert"), vec!["ctrl-]"]);
+        assert!(config.workspace_keys("alert").is_empty());
         assert_eq!(config.workspace_keys("search"), vec!["/"]);
         assert_eq!(config.workspace_keys("session_alert"), vec!["a"]);
         assert_eq!(config.workspace_keys("help"), vec!["?"]);
@@ -759,15 +762,64 @@ mod tests {
     }
 
     #[test]
+    fn workspace_keys_reachable_from_a_child_avoid_provider_bindings() {
+        let config = AgentConsoleConfig::default();
+        // Keys Codex and Claude Code claim for themselves. Workspace actions that
+        // stay active while a provider owns the focus must leave these alone, or
+        // the provider never sees them.
+        const PROVIDER_KEYS: &[&str] = &[
+            "ctrl-a",
+            "ctrl-b",
+            "ctrl-c",
+            "ctrl-d",
+            "ctrl-e",
+            "ctrl-f",
+            "ctrl-g",
+            "ctrl-j",
+            "ctrl-k",
+            "ctrl-l",
+            "ctrl-n",
+            "ctrl-o",
+            "ctrl-p",
+            "ctrl-r",
+            "ctrl-s",
+            "ctrl-t",
+            "ctrl-u",
+            "ctrl-v",
+            "ctrl-w",
+            "ctrl-x",
+            "ctrl-y",
+            "ctrl-z",
+            "ctrl-]",
+            "shift-end",
+        ];
+        for action in [
+            "focus",
+            "new_shell",
+            "dashboard",
+            "alert",
+            "live_tail",
+            "scroll_up",
+            "scroll_down",
+        ] {
+            for key in config.workspace_keys(action) {
+                assert!(
+                    !PROVIDER_KEYS.contains(&key.as_str()),
+                    "{action} claims {key} from the focused provider"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn dashboard_defaults_expose_archive_and_contextual_takeover_without_a_menu() {
         let config = AgentConsoleConfig::default();
 
         assert_eq!(config.dashboard_action("x"), Some("archive"));
         assert_eq!(config.dashboard_action("t"), Some("takeover"));
+        assert_eq!(config.dashboard_action("r"), Some("retry_summary"));
         assert_eq!(config.dashboard_action(":"), None);
-        for key in [
-            "y", "i", "u", "m", "e", "f", "g", "w", "c", "v", "p", "o", "r",
-        ] {
+        for key in ["y", "i", "u", "m", "e", "f", "g", "w", "c", "v", "p", "o"] {
             assert_eq!(
                 config.dashboard_action(key),
                 None,

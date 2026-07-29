@@ -113,6 +113,7 @@ Dashboard:
 | `/` | Search sessions as you type |
 | `x` | Archive or restore |
 | `a` | Jump to the next alert |
+| `r` | Retry the selected session's summary now |
 | `?` | Show all active controls |
 | `q`, `Esc` | Quit |
 
@@ -123,19 +124,18 @@ Inside a session workspace:
 
 | Key | Action |
 | --- | --- |
-| `Ctrl-O` | Cycle Agent → Shell → Sessions focus |
-| `Ctrl-\` | Create and focus a shell |
+| `Ctrl-\` | Cycle Agent → Shell → Sessions focus |
+| `Ctrl-^` | Create and focus a shell |
 | `Ctrl-N` | Focus the next shell while Shell has focus |
 | `Ctrl-X` | Close the focused shell |
 | `Ctrl-Q` | Return to the dashboard |
-| `Ctrl-]` | Jump to the session behind an alert |
 
 With the Sessions list focused:
 
 | Key | Action |
 | --- | --- |
 | `↑` / `↓`, `j` / `k` | Select a session |
-| `Enter`, `Ctrl-O` | Open/resume and focus its agent |
+| `Enter`, `Ctrl-\` | Open/resume and focus its agent |
 | `/` | Search sessions as you type |
 | `a` | Jump to the next unread alert |
 | `?` | Show the Workspace key bindings |
@@ -148,7 +148,7 @@ With the Sessions list focused:
 | `y` | Copy the latest shell command output |
 | `1` … `9` | Focus a numbered shell |
 
-After `h` or `m`, use `Ctrl-O` until focus returns to Sessions; the normal split
+After `h` or `m`, use `Ctrl-\` until focus returns to Sessions; the normal split
 layout is restored automatically.
 
 Agent and shell viewport controls:
@@ -156,7 +156,7 @@ Agent and shell viewport controls:
 | Input | Action |
 | --- | --- |
 | `Shift-PageUp` / `Shift-PageDown` | Scroll one viewport |
-| `Shift-End` | Return to live output |
+| Any key sent to the child | Return to live output |
 | Mouse wheel | Scroll the pane under the pointer |
 | Drag | Select and copy immediately; do not press `Cmd-C` afterward |
 | Terminal bypass modifier + drag | Use native selection, then copy normally (`Option`-drag in iTerm2; commonly `Shift`-drag elsewhere) |
@@ -171,15 +171,25 @@ titles, first/latest prompts, conversation summaries, Claude tags and PR/MR
 metadata, workspace names and paths, branches, provider session IDs, providers,
 statuses, and active/archived state.
 
-Agent Console does not reserve `Ctrl-T`, `Ctrl-Enter`, `Esc`, function keys, or
-unrelated Ctrl combinations from the focused Codex, Claude, or shell process.
-Press `?` for the authoritative context-sensitive key list, including any
-bindings overridden in the configuration file.
+The three globally reserved chords — `Ctrl-\`, `Ctrl-^`, and `Ctrl-Q` — are the
+only Ctrl combinations Codex and Claude Code leave free, so everything those
+tools bind reaches them untouched: `Ctrl-O` (Claude's transcript toggle, Codex's
+copy-response), `Ctrl-]`, `Shift-End`, `Ctrl-T`, `Ctrl-Enter`, `Esc`, function
+keys, and every other Ctrl or Alt combination. `Ctrl-N` and `Ctrl-X` are
+reserved only while a shell has focus and are forwarded in Agent focus. Press
+`?` for the authoritative context-sensitive key list, including any bindings
+overridden in the configuration file.
 
 ## Notes
 
+- A session is titled by its first user prompt and keeps that title for life.
+  Later prompts and summaries never rename it. Bind the `alias` action in
+  `[keys.dashboard]` to set your own title instead.
 - Summaries use the session's own provider and run outside the coding
-  conversation. Disable them with `AGENT_CONSOLE_SUMMARIZER=off`.
+  conversation, and appear in the session preview beside the first prompt rather
+  than in the title. Disable them with `AGENT_CONSOLE_SUMMARIZER=off`.
+- The summary command reuses your configured provider command, prompt included
+  as an argument, so a wrapper that gives the provider a terminal still works.
 - Agent Console can reconnect only to processes it launched and owns. Existing
   sessions from other terminal tabs are resumed from their saved transcript.
 - Managed Codex sessions run with `--no-alt-screen`, allowing the Workspace
