@@ -2705,13 +2705,7 @@ impl SessionTerminals {
         focus: WorkspaceFocus,
     ) -> io::Result<WorkspaceFocus> {
         Ok(match focus {
-            WorkspaceFocus::Agent if self.shells.is_empty() => {
-                let name = self.next_shell_name();
-                self.shells
-                    .push(ShellPane::new(self.spawn_shell(session, (80, 12))?, name));
-                self.selected_shell = 0;
-                WorkspaceFocus::Shell
-            }
+            WorkspaceFocus::Agent if self.shells.is_empty() => WorkspaceFocus::Sessions,
             WorkspaceFocus::Agent => WorkspaceFocus::Shell,
             WorkspaceFocus::Shell => WorkspaceFocus::Sessions,
             WorkspaceFocus::Sessions => WorkspaceFocus::Agent,
@@ -5932,19 +5926,37 @@ mod tests {
         let session = session(AgentKind::Codex, root.path());
         let mut terminals = SessionTerminals::default();
 
-        let shell = terminals
+        // No shells: Agent -> Sessions (no shell spawned)
+        let sessions = terminals
             .toggle_workspace_focus(&session, WorkspaceFocus::Agent)
             .unwrap();
-        let sessions = terminals.toggle_workspace_focus(&session, shell).unwrap();
+        assert_eq!(sessions, WorkspaceFocus::Sessions);
+        assert_eq!(terminals.shells.len(), 0);
+
+        // Sessions -> Agent
         let agent = terminals
             .toggle_workspace_focus(&session, sessions)
             .unwrap();
-
-        assert_eq!(shell, WorkspaceFocus::Shell);
-        assert_eq!(sessions, WorkspaceFocus::Sessions);
         assert_eq!(agent, WorkspaceFocus::Agent);
-        assert_eq!(terminals.shells.len(), 1);
-        assert_eq!(terminals.selected_shell, 0);
+
+        // With a shell present: Agent -> Shell -> Sessions -> Agent
+        terminals
+            .shells
+            .push(ShellPane::new(terminals.spawn_shell(&session, (80, 12)).unwrap(), "1".into()));
+        terminals.selected_shell = 0;
+
+        let shell = terminals
+            .toggle_workspace_focus(&session, WorkspaceFocus::Agent)
+            .unwrap();
+        assert_eq!(shell, WorkspaceFocus::Shell);
+
+        let sessions2 = terminals.toggle_workspace_focus(&session, shell).unwrap();
+        assert_eq!(sessions2, WorkspaceFocus::Sessions);
+
+        let agent2 = terminals
+            .toggle_workspace_focus(&session, sessions2)
+            .unwrap();
+        assert_eq!(agent2, WorkspaceFocus::Agent);
     }
 
     #[test]
