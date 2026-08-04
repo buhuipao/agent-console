@@ -2701,7 +2701,7 @@ impl SessionTerminals {
 
     fn toggle_workspace_focus(
         &mut self,
-        session: &Session,
+        _session: &Session,
         focus: WorkspaceFocus,
     ) -> io::Result<WorkspaceFocus> {
         Ok(match focus {
@@ -4762,7 +4762,9 @@ mod tests {
         std::fs::create_dir_all(&worktree).unwrap();
 
         // Transcript is stored under the project dir encoding
-        let transcript_dir = root.path().join(project.to_string_lossy().replace('/', "-"));
+        let transcript_dir = root
+            .path()
+            .join(project.to_string_lossy().replace('/', "-"));
         std::fs::create_dir_all(&transcript_dir).unwrap();
         let transcript = transcript_dir.join("abc.jsonl");
         std::fs::write(&transcript, "").unwrap();
@@ -4771,7 +4773,10 @@ mod tests {
         s.transcript_path = Some(transcript);
 
         let resume = claude_resume_cwd(&s);
-        assert_eq!(resume, project, "should walk up from worktree to project root");
+        assert_eq!(
+            resume, project,
+            "should walk up from worktree to project root"
+        );
     }
 
     #[test]
@@ -4781,7 +4786,9 @@ mod tests {
         let project = root.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
 
-        let transcript_dir = root.path().join(project.to_string_lossy().replace('/', "-"));
+        let transcript_dir = root
+            .path()
+            .join(project.to_string_lossy().replace('/', "-"));
         std::fs::create_dir_all(&transcript_dir).unwrap();
         let transcript = transcript_dir.join("abc.jsonl");
         std::fs::write(&transcript, "").unwrap();
@@ -4790,7 +4797,10 @@ mod tests {
         s.transcript_path = Some(transcript);
 
         let resume = claude_resume_cwd(&s);
-        assert_eq!(resume, project, "should return cwd unchanged when already correct");
+        assert_eq!(
+            resume, project,
+            "should return cwd unchanged when already correct"
+        );
     }
 
     #[test]
@@ -6023,9 +6033,10 @@ mod tests {
         assert_eq!(agent, WorkspaceFocus::Agent);
 
         // With a shell present: Agent -> Shell -> Sessions -> Agent
-        terminals
-            .shells
-            .push(ShellPane::new(terminals.spawn_shell(&session, (80, 12)).unwrap(), "1".into()));
+        terminals.shells.push(ShellPane::new(
+            terminals.spawn_shell(&session, (80, 12)).unwrap(),
+            "1".into(),
+        ));
         terminals.selected_shell = 0;
 
         let shell = terminals
