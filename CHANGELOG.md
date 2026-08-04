@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.0.14] - 2026-08-04
+
+### Fixed
+- Fix `claude --resume` failing with "No conversation found" for sessions that entered a git worktree mid-run. Resume now walks up from `session.cwd` to find the ancestor directory matching the session's project root, instead of passing the worktree path to `claude --resume`.
+
 ## [0.0.13] - 2026-07-31
 
 ### Fixed

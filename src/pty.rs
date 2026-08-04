@@ -4473,7 +4473,17 @@ pub fn agent_command(
         }
         AgentKind::Claude => {
             let hooks = claude_hook_settings(&hook_command);
-            let mut spec = CommandSpec::new("claude", &session.cwd)
+            // For resume, claude looks up the session in the project dir derived from cwd
+            // (replacing '/' with '-'). If the session entered a worktree mid-run, session.cwd
+            // reflects the worktree path, not the project root where the JSONL was created.
+            // Walk up from session.cwd until we find the ancestor that encodes to the same
+            // project dir as the transcript file, so --resume finds the session.
+            let resume_cwd = if new_session {
+                session.cwd.clone()
+            } else {
+                claude_resume_cwd(session)
+            };
+            let mut spec = CommandSpec::new("claude", &resume_cwd)
                 .arg("--settings")
                 .arg(hooks);
             if new_session {
@@ -4580,6 +4590,38 @@ fn plain_text(bytes: &[u8]) -> String {
         output = output[start..].to_owned();
     }
     output
+}
+
+/// Find the cwd to use for `claude --resume` for a Claude session.
+///
+/// `claude --resume <id>` searches for the session in the project directory derived from
+/// the current working directory (path with '/' replaced by '-'). If session.cwd is a
+/// worktree or subdirectory entered mid-session, it won't match the project dir where the
+/// JSONL was created. Walk up from session.cwd to find the ancestor that encodes to the
+/// same project dir as the transcript file.
+fn claude_resume_cwd(session: &crate::model::Session) -> std::path::PathBuf {
+    let project_dir_name = session
+        .transcript_path
+        .as_deref()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .map(str::to_owned);
+
+    if let Some(project_dir) = project_dir_name {
+        let mut candidate = session.cwd.as_path();
+        loop {
+            let encoded = candidate.to_string_lossy().replace('/', "-");
+            if encoded == project_dir {
+                return candidate.to_path_buf();
+            }
+            match candidate.parent() {
+                Some(parent) if parent != candidate => candidate = parent,
+                _ => break,
+            }
+        }
+    }
+    session.cwd.clone()
 }
 
 fn claude_hook_settings(command: &str) -> String {
@@ -4708,6 +4750,47 @@ mod tests {
         assert_eq!(command.args[2], "work");
         assert_eq!(command.args[3], "resume");
         assert!(command.args.iter().any(|arg| arg == "id"));
+    }
+
+    #[test]
+    fn claude_resume_cwd_walks_up_to_project_root_when_in_worktree() {
+        use tempfile::tempdir;
+        let root = tempdir().unwrap();
+        // Simulate: session created in /project, then entered worktree at /project/worktrees/branch
+        let project = root.path().join("project");
+        let worktree = root.path().join("project/worktrees/branch");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        // Transcript is stored under the project dir encoding
+        let transcript_dir = root.path().join(project.to_string_lossy().replace('/', "-"));
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        let transcript = transcript_dir.join("abc.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+
+        let mut s = session(AgentKind::Claude, &worktree);
+        s.transcript_path = Some(transcript);
+
+        let resume = claude_resume_cwd(&s);
+        assert_eq!(resume, project, "should walk up from worktree to project root");
+    }
+
+    #[test]
+    fn claude_resume_cwd_returns_cwd_when_no_worktree() {
+        use tempfile::tempdir;
+        let root = tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let transcript_dir = root.path().join(project.to_string_lossy().replace('/', "-"));
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        let transcript = transcript_dir.join("abc.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+
+        let mut s = session(AgentKind::Claude, &project);
+        s.transcript_path = Some(transcript);
+
+        let resume = claude_resume_cwd(&s);
+        assert_eq!(resume, project, "should return cwd unchanged when already correct");
     }
 
     #[test]
