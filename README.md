@@ -42,6 +42,13 @@ Download the package for your platform from
 - Linux ARM64: `agent-console-v<version>-aarch64-unknown-linux-gnu.tar.gz`
 - Windows Intel: `agent-console-v<version>-x86_64-pc-windows-msvc.zip`
 
+With a Rust toolchain installed, you can instead build and install the
+[published crate](https://crates.io/crates/agent-console):
+
+```sh
+cargo install agent-console
+```
+
 Extract the archive and place `agent-console` (`agent-console.exe` on Windows)
 in a directory on `PATH`. On macOS, install and upgrade it with an atomic
 rename so the kernel never reuses a cached signature from the old inode:
@@ -212,6 +219,14 @@ cargo clippy --locked --all-targets -- -D warnings
 
 Provider compatibility details are in
 [docs/compatibility.md](docs/compatibility.md).
+
+## Feedback
+
+Please use [GitHub Issues](https://github.com/buhuipao/agent-console/issues) for
+reproducible bugs and workflow feedback. Include your operating system,
+terminal, Codex or Claude Code version, and redacted `agent-console doctor`
+output when they are relevant. Do not post tokens, private prompts, unredacted
+paths, or full environment variables.
 
 ## License
 
