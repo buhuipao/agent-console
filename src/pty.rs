@@ -20,6 +20,7 @@ use std::os::unix::{
     process::CommandExt,
 };
 
+use crossterm::SynchronizedUpdate;
 #[cfg(not(unix))]
 use crossterm::event;
 #[cfg(any(not(unix), test))]
@@ -43,6 +44,9 @@ const SCROLLBACK_LINES: usize = 2_000;
 const CAPTURE_BYTES: usize = 16 * 1024;
 const RAW_CAPTURE_BYTES: usize = 128 * 1024;
 const LEASE_STALE_AFTER: Duration = Duration::from_millis(500);
+const ALTERNATE_REPAINT_SETTLE: Duration = Duration::from_millis(120);
+const ALTERNATE_SCROLL_TIMEOUT: Duration = Duration::from_millis(350);
+const ALTERNATE_SCROLL_QUEUE_LIMIT: usize = 4;
 const ENABLE_MOUSE_REPORTING: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 const DISABLE_MOUSE_REPORTING: &[u8] =
     b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l";
@@ -340,6 +344,7 @@ fn terminal_screen_view(
         .unwrap_or(live_rows);
     ScreenView {
         rows,
+        size: screen.size(),
         cursor: screen.cursor_position(),
         hide_cursor: screen.hide_cursor()
             || screen.scrollback() > 0
@@ -347,56 +352,193 @@ fn terminal_screen_view(
     }
 }
 
-fn terminal_selected_rows(
-    parser: &vt100::Parser,
+fn terminal_history_len(
+    parser: &mut vt100::Parser,
     status_bar_scrollback: &StatusBarScrollback,
-    first: TerminalCell,
-    second: TerminalCell,
-) -> Vec<(TerminalCell, String)> {
-    let screen = parser.screen();
-    let (rows, cols) = screen.size();
+) -> usize {
+    if !status_bar_scrollback.rows.is_empty() {
+        return status_bar_scrollback.rows.len();
+    }
+    let screen = parser.screen_mut();
+    let original = screen.scrollback();
+    screen.set_scrollback(usize::MAX);
+    let history_len = screen.scrollback();
+    screen.set_scrollback(original);
+    history_len
+}
+
+fn terminal_buffer_cell(
+    parser: &mut vt100::Parser,
+    status_bar_scrollback: &StatusBarScrollback,
+    cell: TerminalCell,
+) -> Option<TerminalBufferCell> {
+    let (rows, cols) = parser.screen().size();
     if rows == 0 || cols == 0 {
+        return None;
+    }
+    let cell = cell.clamped(rows, cols);
+    let history_len = terminal_history_len(parser, status_bar_scrollback);
+    let offset = if status_bar_scrollback.rows.is_empty() {
+        parser.screen().scrollback()
+    } else {
+        status_bar_scrollback.offset
+    };
+    Some(TerminalBufferCell {
+        row: history_len
+            .saturating_sub(offset)
+            .saturating_add(usize::from(cell.row)),
+        col: cell.col,
+    })
+}
+
+fn terminal_retained_rows(
+    parser: &mut vt100::Parser,
+    status_bar_scrollback: &StatusBarScrollback,
+) -> Vec<Vec<u8>> {
+    let (height, cols) = parser.screen().size();
+    if height == 0 || cols == 0 {
         return Vec::new();
+    }
+    if !status_bar_scrollback.rows.is_empty() {
+        let screen = parser.screen_mut();
+        let original = screen.scrollback();
+        screen.set_scrollback(0);
+        let live_rows = screen.rows_formatted(0, cols).collect::<Vec<_>>();
+        screen.set_scrollback(original);
+        return status_bar_scrollback
+            .rows
+            .iter()
+            .cloned()
+            .chain(live_rows)
+            .collect();
+    }
+
+    let screen = parser.screen_mut();
+    let original = screen.scrollback();
+    screen.set_scrollback(usize::MAX);
+    let history_len = screen.scrollback();
+    let total = history_len.saturating_add(usize::from(height));
+    let mut rows = Vec::with_capacity(total);
+    let mut next = 0;
+    // vt100 exposes only one viewport at a time. Walk the retained grid in viewport-sized
+    // windows, accounting for the overlap when the history length is not a multiple of height.
+    while next < total {
+        let offset = history_len.saturating_sub(next.min(history_len));
+        screen.set_scrollback(offset);
+        let view_top = history_len.saturating_sub(offset);
+        let skip = next.saturating_sub(view_top);
+        let take = usize::from(height)
+            .saturating_sub(skip)
+            .min(total.saturating_sub(next));
+        rows.extend(screen.rows_formatted(0, cols).skip(skip).take(take));
+        next = next.saturating_add(take);
+    }
+    screen.set_scrollback(original);
+    rows
+}
+
+fn selected_row_text(formatted: Option<&[u8]>, cols: u16, first: u16, last: u16) -> String {
+    let width = last - first + 1;
+    let mut row_parser = vt100::Parser::new(1, cols, 0);
+    if let Some(formatted) = formatted {
+        row_parser.process(formatted);
+    }
+    let text = row_parser
+        .screen()
+        .contents_between(0, first, 0, last.saturating_add(1));
+    fit_text(&text, width)
+}
+
+fn normalized_buffer_selection(
+    first: TerminalBufferCell,
+    second: TerminalBufferCell,
+    rows: usize,
+    cols: u16,
+) -> Option<(TerminalBufferCell, TerminalBufferCell)> {
+    if rows == 0 || cols == 0 {
+        return None;
     }
     let mut start = first.clamped(rows, cols);
     let mut end = second.clamped(rows, cols);
     if (start.row, start.col) > (end.row, end.col) {
         std::mem::swap(&mut start, &mut end);
     }
+    Some((start, end))
+}
+
+fn terminal_selected_rows(
+    parser: &mut vt100::Parser,
+    status_bar_scrollback: &StatusBarScrollback,
+    first: TerminalBufferCell,
+    second: TerminalBufferCell,
+) -> Vec<(TerminalCell, String)> {
+    let (height, cols) = parser.screen().size();
+    let history_len = terminal_history_len(parser, status_bar_scrollback);
+    let total_rows = history_len.saturating_add(usize::from(height));
+    let Some((start, end)) = normalized_buffer_selection(first, second, total_rows, cols) else {
+        return Vec::new();
+    };
+    let offset = if status_bar_scrollback.rows.is_empty() {
+        parser.screen().scrollback()
+    } else {
+        status_bar_scrollback.offset
+    };
+    let view_top = history_len.saturating_sub(offset);
+    let view_end = view_top.saturating_add(usize::from(height));
+    let visible_start = start.row.max(view_top);
+    let visible_end = end.row.min(view_end.saturating_sub(1));
+    if visible_start > visible_end {
+        return Vec::new();
+    }
     let view = terminal_screen_view(parser, status_bar_scrollback);
-    (start.row..=end.row)
-        .map(|row| {
-            let first_col = if row == start.row { start.col } else { 0 };
-            let last_col = if row == end.row { end.col } else { cols - 1 };
-            let width = last_col - first_col + 1;
-            let mut row_parser = vt100::Parser::new(1, cols, 0);
-            if let Some(formatted) = view.rows.get(usize::from(row)) {
-                row_parser.process(formatted);
-            }
-            let text =
-                row_parser
-                    .screen()
-                    .contents_between(0, first_col, 0, last_col.saturating_add(1));
+    (visible_start..=visible_end)
+        .map(|buffer_row| {
+            let row = u16::try_from(buffer_row.saturating_sub(view_top)).unwrap_or(u16::MAX);
+            let first_col = if buffer_row == start.row {
+                start.col
+            } else {
+                0
+            };
+            let last_col = if buffer_row == end.row {
+                end.col
+            } else {
+                cols - 1
+            };
             (
                 TerminalCell {
                     row,
                     col: first_col,
                 },
-                fit_text(&text, width),
+                selected_row_text(
+                    view.rows.get(usize::from(row)).map(Vec::as_slice),
+                    cols,
+                    first_col,
+                    last_col,
+                ),
             )
         })
         .collect()
 }
 
 fn terminal_selected_text(
-    parser: &vt100::Parser,
+    parser: &mut vt100::Parser,
     status_bar_scrollback: &StatusBarScrollback,
-    first: TerminalCell,
-    second: TerminalCell,
+    first: TerminalBufferCell,
+    second: TerminalBufferCell,
 ) -> String {
-    terminal_selected_rows(parser, status_bar_scrollback, first, second)
-        .into_iter()
-        .map(|(_, text)| text.trim_end().to_owned())
+    let (_, cols) = parser.screen().size();
+    let rows = terminal_retained_rows(parser, status_bar_scrollback);
+    let Some((start, end)) = normalized_buffer_selection(first, second, rows.len(), cols) else {
+        return String::new();
+    };
+    (start.row..=end.row)
+        .map(|row| {
+            let first_col = if row == start.row { start.col } else { 0 };
+            let last_col = if row == end.row { end.col } else { cols - 1 };
+            selected_row_text(rows.get(row).map(Vec::as_slice), cols, first_col, last_col)
+                .trim_end()
+                .to_owned()
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -644,20 +786,26 @@ impl LocalTerminal {
         self.parser.lock().unwrap().screen().alternate_screen()
     }
 
-    fn selected_text(&self, first: TerminalCell, second: TerminalCell) -> String {
-        let parser = self.parser.lock().unwrap();
+    fn selection_cell(&self, cell: TerminalCell) -> Option<TerminalBufferCell> {
+        let mut parser = self.parser.lock().unwrap();
         let scrollback = self.status_bar_scrollback.lock().unwrap();
-        terminal_selected_text(&parser, &scrollback, first, second)
+        terminal_buffer_cell(&mut parser, &scrollback, cell)
+    }
+
+    fn selected_text(&self, first: TerminalBufferCell, second: TerminalBufferCell) -> String {
+        let mut parser = self.parser.lock().unwrap();
+        let scrollback = self.status_bar_scrollback.lock().unwrap();
+        terminal_selected_text(&mut parser, &scrollback, first, second)
     }
 
     fn selected_rows(
         &self,
-        first: TerminalCell,
-        second: TerminalCell,
+        first: TerminalBufferCell,
+        second: TerminalBufferCell,
     ) -> Vec<(TerminalCell, String)> {
-        let parser = self.parser.lock().unwrap();
+        let mut parser = self.parser.lock().unwrap();
         let scrollback = self.status_bar_scrollback.lock().unwrap();
-        terminal_selected_rows(&parser, &scrollback, first, second)
+        terminal_selected_rows(&mut parser, &scrollback, first, second)
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
@@ -717,8 +865,10 @@ impl LocalTerminal {
     }
 }
 
+#[derive(Clone, Debug)]
 struct ScreenView {
     rows: Vec<Vec<u8>>,
+    size: (u16, u16),
     cursor: (u16, u16),
     hide_cursor: bool,
 }
@@ -731,6 +881,22 @@ struct TerminalCell {
 
 impl TerminalCell {
     fn clamped(self, rows: u16, cols: u16) -> Self {
+        Self {
+            row: self.row.min(rows.saturating_sub(1)),
+            col: self.col.min(cols.saturating_sub(1)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TerminalBufferCell {
+    // Physical row counted from the oldest row still retained by this terminal.
+    row: usize,
+    col: u16,
+}
+
+impl TerminalBufferCell {
+    fn clamped(self, rows: usize, cols: u16) -> Self {
         Self {
             row: self.row.min(rows.saturating_sub(1)),
             col: self.col.min(cols.saturating_sub(1)),
@@ -1497,20 +1663,29 @@ impl RemoteTerminal {
         self.parser.lock().unwrap().screen().alternate_screen()
     }
 
-    fn selected_text(&self, first: TerminalCell, second: TerminalCell) -> String {
-        let parser = self.parser.lock().unwrap();
+    fn selection_cell(&self, cell: TerminalCell) -> Option<TerminalBufferCell> {
+        let _ = self.sync();
+        let mut parser = self.parser.lock().unwrap();
         let scrollback = self.status_bar_scrollback.lock().unwrap();
-        terminal_selected_text(&parser, &scrollback, first, second)
+        terminal_buffer_cell(&mut parser, &scrollback, cell)
+    }
+
+    fn selected_text(&self, first: TerminalBufferCell, second: TerminalBufferCell) -> String {
+        let _ = self.sync();
+        let mut parser = self.parser.lock().unwrap();
+        let scrollback = self.status_bar_scrollback.lock().unwrap();
+        terminal_selected_text(&mut parser, &scrollback, first, second)
     }
 
     fn selected_rows(
         &self,
-        first: TerminalCell,
-        second: TerminalCell,
+        first: TerminalBufferCell,
+        second: TerminalBufferCell,
     ) -> Vec<(TerminalCell, String)> {
-        let parser = self.parser.lock().unwrap();
+        let _ = self.sync();
+        let mut parser = self.parser.lock().unwrap();
         let scrollback = self.status_bar_scrollback.lock().unwrap();
-        terminal_selected_rows(&parser, &scrollback, first, second)
+        terminal_selected_rows(&mut parser, &scrollback, first, second)
     }
 
     fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
@@ -1676,7 +1851,14 @@ impl ManagedTerminal {
         }
     }
 
-    fn selected_text(&self, first: TerminalCell, second: TerminalCell) -> String {
+    fn selection_cell(&self, cell: TerminalCell) -> Option<TerminalBufferCell> {
+        match &self.backend {
+            TerminalBackend::Local(terminal) => terminal.selection_cell(cell),
+            TerminalBackend::Remote(terminal) => terminal.selection_cell(cell),
+        }
+    }
+
+    fn selected_text(&self, first: TerminalBufferCell, second: TerminalBufferCell) -> String {
         match &self.backend {
             TerminalBackend::Local(terminal) => terminal.selected_text(first, second),
             TerminalBackend::Remote(terminal) => terminal.selected_text(first, second),
@@ -1685,8 +1867,8 @@ impl ManagedTerminal {
 
     fn selected_rows(
         &self,
-        first: TerminalCell,
-        second: TerminalCell,
+        first: TerminalBufferCell,
+        second: TerminalBufferCell,
     ) -> Vec<(TerminalCell, String)> {
         match &self.backend {
             TerminalBackend::Local(terminal) => terminal.selected_rows(first, second),
@@ -1757,6 +1939,9 @@ pub struct SessionTerminals {
     shells: Vec<ShellPane>,
     pub selected_shell: usize,
     selection: Option<TerminalSelection>,
+    alternate_selection: Option<AlternateSelectionBuffer>,
+    pending_alternate_copy: Option<PendingAlternateCopy>,
+    suppressed_mouse_buttons: u8,
     pending_agent_click: Option<PendingAgentClick>,
     notice: Option<String>,
     daemon_socket: Option<PathBuf>,
@@ -1815,15 +2000,718 @@ enum PaneTarget {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AlternateScrollDirection {
+    Older,
+    Newer,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AlternateScrollRequest {
+    direction: AlternateScrollDirection,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct AlternateViewCandidate {
+    generation: u64,
+    stable_since: Instant,
+    view: ScreenView,
+}
+
+#[derive(Debug)]
+struct PendingAlternateScroll {
+    direction: AlternateScrollDirection,
+    generation: u64,
+    started_at: Instant,
+    candidate: Option<AlternateViewCandidate>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct BufferEdit {
+    old_positions: Vec<usize>,
+}
+
+#[derive(Debug)]
+struct AlternateSelectionBuffer {
+    pane: PaneTarget,
+    rows: Vec<Vec<u8>>,
+    viewport_rows: Vec<Vec<u8>>,
+    viewport_positions: Vec<usize>,
+    chrome_prefix: usize,
+    chrome_suffix: usize,
+    cols: u16,
+    pending_scroll: Option<PendingAlternateScroll>,
+    queued_scrolls: VecDeque<AlternateScrollRequest>,
+}
+
+impl AlternateSelectionBuffer {
+    fn new(pane: PaneTarget, view: ScreenView) -> Option<Self> {
+        let (_, cols) = view.size;
+        if view.rows.is_empty() || view.rows.len() > SCROLLBACK_LINES || cols == 0 {
+            return None;
+        }
+        let viewport_positions = (0..view.rows.len()).collect();
+        Some(Self {
+            pane,
+            rows: view.rows.clone(),
+            viewport_rows: view.rows,
+            viewport_positions,
+            chrome_prefix: 0,
+            chrome_suffix: 0,
+            cols,
+            pending_scroll: None,
+            queued_scrolls: VecDeque::new(),
+        })
+    }
+
+    fn cell(&self, cell: TerminalCell) -> TerminalBufferCell {
+        let row = usize::from(cell.row).min(self.viewport_rows.len().saturating_sub(1));
+        TerminalBufferCell {
+            row: self.viewport_positions.get(row).copied().unwrap_or(0),
+            col: cell.col.min(self.cols.saturating_sub(1)),
+        }
+    }
+
+    fn queue_scroll(
+        &mut self,
+        request: AlternateScrollRequest,
+        generation: u64,
+    ) -> Option<Vec<u8>> {
+        if self.pending_scroll.is_some() {
+            if self
+                .queued_scrolls
+                .back()
+                .is_some_and(|queued| queued.direction != request.direction)
+            {
+                self.queued_scrolls.pop_back();
+                return None;
+            }
+            if self.queued_scrolls.len() == ALTERNATE_SCROLL_QUEUE_LIMIT {
+                self.queued_scrolls.pop_front();
+            }
+            self.queued_scrolls.push_back(request);
+            return None;
+        }
+        let bytes = request.bytes;
+        self.pending_scroll = Some(PendingAlternateScroll {
+            direction: request.direction,
+            generation,
+            started_at: Instant::now(),
+            candidate: None,
+        });
+        Some(bytes)
+    }
+
+    fn begin_next_scroll(&mut self, generation: u64) -> Option<Vec<u8>> {
+        let request = self.queued_scrolls.pop_front()?;
+        let bytes = request.bytes;
+        self.pending_scroll = Some(PendingAlternateScroll {
+            direction: request.direction,
+            generation,
+            started_at: Instant::now(),
+            candidate: None,
+        });
+        Some(bytes)
+    }
+
+    fn view_matches(&self, view: &ScreenView) -> bool {
+        view.size.1 == self.cols
+            && alternate_row_keys(&view.rows, self.cols)
+                == alternate_row_keys(&self.viewport_rows, self.cols)
+    }
+
+    fn replace_current_view(&mut self, view: ScreenView) {
+        for (offset, row) in view.rows.iter().enumerate() {
+            if let Some(buffer_row) = self
+                .viewport_positions
+                .get(offset)
+                .and_then(|position| self.rows.get_mut(*position))
+            {
+                buffer_row.clone_from(row);
+            }
+        }
+        self.viewport_rows = view.rows;
+    }
+
+    fn replace_chrome_update(
+        &mut self,
+        view: ScreenView,
+        direction: AlternateScrollDirection,
+    ) -> bool {
+        if view.rows.len() != self.viewport_rows.len() || view.size.1 != self.cols {
+            return false;
+        }
+        let (prefix, suffix) = infer_alternate_chrome(
+            &self.viewport_rows,
+            &view.rows,
+            self.cols,
+            self.chrome_prefix,
+            self.chrome_suffix,
+            direction,
+        );
+        if prefix + suffix == 0 {
+            return false;
+        }
+        let old_keys = alternate_row_keys(&self.viewport_rows, self.cols);
+        let new_keys = alternate_row_keys(&view.rows, self.cols);
+        let changed = old_keys
+            .iter()
+            .zip(&new_keys)
+            .enumerate()
+            .filter_map(|(row, (old, new))| (old != new).then_some(row))
+            .collect::<Vec<_>>();
+        if changed.is_empty()
+            || changed
+                .iter()
+                .any(|row| *row >= prefix && *row < new_keys.len().saturating_sub(suffix))
+        {
+            return false;
+        }
+        self.replace_current_view(view);
+        true
+    }
+
+    fn merge_view(&mut self, view: ScreenView) -> Option<BufferEdit> {
+        let pending = self.pending_scroll.take()?;
+        if view.rows.is_empty() || view.size.1 != self.cols {
+            return None;
+        }
+        let (chrome_prefix, chrome_suffix) = infer_alternate_chrome(
+            &self.viewport_rows,
+            &view.rows,
+            self.cols,
+            self.chrome_prefix,
+            self.chrome_suffix,
+            pending.direction,
+        );
+        let mut merged = directional_row_merge(
+            &self.rows,
+            &self.viewport_positions,
+            &view.rows,
+            self.cols,
+            AlternateChrome {
+                prefix: self.chrome_prefix,
+                suffix: self.chrome_suffix,
+            },
+            AlternateChrome {
+                prefix: chrome_prefix,
+                suffix: chrome_suffix,
+            },
+            pending.direction,
+        );
+        bound_alternate_row_merge(&mut merged, pending.direction);
+        self.rows = merged.rows;
+        self.viewport_rows = view.rows;
+        self.viewport_positions = merged.new_positions;
+        self.chrome_prefix = chrome_prefix;
+        self.chrome_suffix = chrome_suffix;
+        Some(BufferEdit {
+            old_positions: merged.old_positions,
+        })
+    }
+
+    fn selected_text(&self, first: TerminalBufferCell, second: TerminalBufferCell) -> String {
+        let Some((start, end)) =
+            normalized_buffer_selection(first, second, self.rows.len(), self.cols)
+        else {
+            return String::new();
+        };
+        (start.row..=end.row)
+            .map(|row| {
+                let first_col = if row == start.row { start.col } else { 0 };
+                let last_col = if row == end.row {
+                    end.col
+                } else {
+                    self.cols - 1
+                };
+                selected_row_text(
+                    self.rows.get(row).map(Vec::as_slice),
+                    self.cols,
+                    first_col,
+                    last_col,
+                )
+                .trim_end()
+                .to_owned()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn selected_rows(
+        &self,
+        first: TerminalBufferCell,
+        second: TerminalBufferCell,
+    ) -> Vec<(TerminalCell, String)> {
+        let Some((start, end)) =
+            normalized_buffer_selection(first, second, self.rows.len(), self.cols)
+        else {
+            return Vec::new();
+        };
+        self.viewport_positions
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, buffer_row)| (start.row..=end.row).contains(buffer_row))
+            .map(|(screen_row, buffer_row)| {
+                let row = u16::try_from(screen_row).unwrap_or(u16::MAX);
+                let first_col = if buffer_row == start.row {
+                    start.col
+                } else {
+                    0
+                };
+                let last_col = if buffer_row == end.row {
+                    end.col
+                } else {
+                    self.cols - 1
+                };
+                (
+                    TerminalCell {
+                        row,
+                        col: first_col,
+                    },
+                    selected_row_text(
+                        self.viewport_rows.get(usize::from(row)).map(Vec::as_slice),
+                        self.cols,
+                        first_col,
+                        last_col,
+                    ),
+                )
+            })
+            .collect()
+    }
+}
+
+fn alternate_row_keys(rows: &[Vec<u8>], cols: u16) -> Vec<String> {
+    rows.iter()
+        .map(|row| {
+            selected_row_text(Some(row), cols, 0, cols.saturating_sub(1))
+                .trim_end()
+                .to_owned()
+        })
+        .collect()
+}
+
+#[derive(Debug)]
+struct AlternateRowMerge {
+    rows: Vec<Vec<u8>>,
+    old_positions: Vec<usize>,
+    new_positions: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct AlternateChrome {
+    prefix: usize,
+    suffix: usize,
+}
+
+fn infer_alternate_chrome(
+    old_view: &[Vec<u8>],
+    new_view: &[Vec<u8>],
+    cols: u16,
+    known_prefix: usize,
+    known_suffix: usize,
+    direction: AlternateScrollDirection,
+) -> (usize, usize) {
+    let len = old_view.len().min(new_view.len());
+    if len < 2 {
+        return (0, 0);
+    }
+    let old_keys = alternate_row_keys(&old_view[..len], cols);
+    let new_keys = alternate_row_keys(&new_view[..len], cols);
+    let edge_limit = len.saturating_sub(1) / 2;
+    let common_prefix = old_keys
+        .iter()
+        .zip(&new_keys)
+        .take(edge_limit)
+        .take_while(|(old, new)| old == new)
+        .count();
+    let common_suffix = old_keys
+        .iter()
+        .rev()
+        .zip(new_keys.iter().rev())
+        .take(edge_limit)
+        .take_while(|(old, new)| old == new)
+        .count();
+    let trusted_prefix = known_prefix.min(edge_limit);
+    let trusted_suffix = known_suffix
+        .min(edge_limit)
+        .min(len.saturating_sub(trusted_prefix + 1));
+    let mut best: Option<(usize, usize, usize, usize, usize, usize)> = None;
+    for prefix in trusted_prefix..=edge_limit {
+        let max_suffix = edge_limit.min(len.saturating_sub(prefix + 1));
+        for suffix in trusted_suffix..=max_suffix {
+            let overlap = directional_boundary_overlap(
+                &old_keys[prefix..len - suffix],
+                &new_keys[prefix..len - suffix],
+                direction,
+            );
+            if overlap == 0 {
+                continue;
+            }
+            let unsupported = prefix.saturating_sub(common_prefix.max(trusted_prefix))
+                + suffix.saturating_sub(common_suffix.max(trusted_suffix));
+            let candidate = (
+                usize::MAX - unsupported,
+                overlap,
+                usize::MAX - prefix - suffix,
+                usize::MAX - prefix,
+                prefix,
+                suffix,
+            );
+            if best.is_none_or(|current| candidate > current) {
+                best = Some(candidate);
+            }
+        }
+    }
+    if let Some((_, _, _, _, prefix, suffix)) = best {
+        return (prefix, suffix);
+    }
+    if known_prefix + known_suffix > 0 {
+        return (trusted_prefix, trusted_suffix);
+    }
+    if common_prefix > 0 && common_suffix > 0 && common_prefix + common_suffix < len {
+        return (common_prefix, common_suffix);
+    }
+    (0, 0)
+}
+
+fn directional_boundary_overlap(
+    old_keys: &[String],
+    new_keys: &[String],
+    direction: AlternateScrollDirection,
+) -> usize {
+    let max = old_keys.len().min(new_keys.len());
+    (1..=max)
+        .rev()
+        .find(|overlap| {
+            let (old, new) = match direction {
+                AlternateScrollDirection::Older => {
+                    (&old_keys[..*overlap], &new_keys[new_keys.len() - overlap..])
+                }
+                AlternateScrollDirection::Newer => {
+                    (&old_keys[old_keys.len() - overlap..], &new_keys[..*overlap])
+                }
+            };
+            old == new && overlap_has_text(new)
+        })
+        .unwrap_or(0)
+}
+
+fn directional_row_merge(
+    old_rows: &[Vec<u8>],
+    old_view_positions: &[usize],
+    new_rows: &[Vec<u8>],
+    cols: u16,
+    old_chrome: AlternateChrome,
+    new_chrome: AlternateChrome,
+    direction: AlternateScrollDirection,
+) -> AlternateRowMerge {
+    let prefix = old_chrome
+        .prefix
+        .max(new_chrome.prefix)
+        .min(old_rows.len())
+        .min(new_rows.len());
+    let suffix = old_chrome
+        .suffix
+        .max(new_chrome.suffix)
+        .min(old_rows.len().saturating_sub(prefix))
+        .min(new_rows.len().saturating_sub(prefix));
+    let old_content_end = old_rows.len().saturating_sub(suffix);
+    let new_content_end = new_rows.len().saturating_sub(suffix);
+    let old_content = &old_rows[prefix..old_content_end];
+    let new_content = &new_rows[prefix..new_content_end];
+    let current_positions = old_view_positions
+        .get(prefix..old_view_positions.len().saturating_sub(suffix))
+        .unwrap_or_default()
+        .iter()
+        .map(|position| position.saturating_sub(prefix))
+        .collect::<Vec<_>>();
+    let content = directional_content_merge(
+        old_content,
+        &current_positions,
+        new_content,
+        cols,
+        direction,
+    );
+    let content_rows_len = content.rows.len();
+
+    let mut rows = Vec::with_capacity(prefix + content_rows_len + suffix);
+    rows.extend_from_slice(&new_rows[..prefix]);
+    rows.extend(content.rows);
+    rows.extend_from_slice(&new_rows[new_content_end..]);
+
+    let mut old_positions = vec![0; old_rows.len()];
+    for (position, mapped) in old_positions.iter_mut().take(prefix).enumerate() {
+        *mapped = position.min(rows.len().saturating_sub(1));
+    }
+    for (position, mapped) in content.old_positions.into_iter().enumerate() {
+        old_positions[prefix + position] = prefix + mapped;
+    }
+    let suffix_start = prefix + content_rows_len;
+    for position in 0..suffix {
+        old_positions[old_content_end + position] = suffix_start + position;
+    }
+
+    let mut new_positions = Vec::with_capacity(new_rows.len());
+    new_positions.extend(0..prefix);
+    new_positions.extend(
+        content
+            .new_positions
+            .into_iter()
+            .map(|position| prefix + position),
+    );
+    new_positions.extend(suffix_start..suffix_start + suffix);
+    AlternateRowMerge {
+        rows,
+        old_positions,
+        new_positions,
+    }
+}
+
+fn directional_content_merge(
+    old_rows: &[Vec<u8>],
+    current_positions: &[usize],
+    new_rows: &[Vec<u8>],
+    cols: u16,
+    direction: AlternateScrollDirection,
+) -> AlternateRowMerge {
+    let old_keys = alternate_row_keys(old_rows, cols);
+    let new_keys = alternate_row_keys(new_rows, cols);
+    let current_keys = current_positions
+        .iter()
+        .filter_map(|position| old_keys.get(*position).cloned())
+        .collect::<Vec<_>>();
+    let mut matched_start = 0;
+    let mut matched = 0;
+    match direction {
+        AlternateScrollDirection::Newer => {
+            for overlap in (1..=current_keys.len().min(new_keys.len())).rev() {
+                if current_keys[current_keys.len() - overlap..] == new_keys[..overlap]
+                    && overlap_has_text(&new_keys[..overlap])
+                {
+                    matched_start = current_positions[current_positions.len() - overlap];
+                    matched = overlap;
+                    while matched < new_keys.len()
+                        && matched_start + matched < old_keys.len()
+                        && old_keys[matched_start + matched] == new_keys[matched]
+                    {
+                        matched += 1;
+                    }
+                    break;
+                }
+            }
+            if matched == 0 {
+                let first = current_positions
+                    .last()
+                    .copied()
+                    .map_or(0, |position| position.saturating_add(1));
+                for start in first..old_keys.len() {
+                    let overlap = matching_prefix(&old_keys[start..], &new_keys);
+                    if overlap > matched && overlap_is_strong(&new_keys[..overlap]) {
+                        matched_start = start;
+                        matched = overlap;
+                    }
+                }
+            }
+        }
+        AlternateScrollDirection::Older => {
+            for overlap in (1..=current_keys.len().min(new_keys.len())).rev() {
+                if new_keys[new_keys.len() - overlap..] == current_keys[..overlap]
+                    && overlap_has_text(&new_keys[new_keys.len() - overlap..])
+                {
+                    matched_start = current_positions[0];
+                    matched = overlap;
+                    while matched < new_keys.len()
+                        && matched_start > 0
+                        && new_keys.len() > matched
+                        && old_keys[matched_start - 1] == new_keys[new_keys.len() - matched - 1]
+                    {
+                        matched_start -= 1;
+                        matched += 1;
+                    }
+                    break;
+                }
+            }
+            if matched == 0 {
+                let end = current_positions.first().copied().unwrap_or(old_keys.len());
+                for candidate_end in (1..=end.min(old_keys.len())).rev() {
+                    let overlap = matching_suffix(&old_keys[..candidate_end], &new_keys);
+                    if overlap > matched && overlap_is_strong(&new_keys[new_keys.len() - overlap..])
+                    {
+                        matched_start = candidate_end - overlap;
+                        matched = overlap;
+                    }
+                }
+            }
+        }
+    }
+
+    let (insertion, inserted_rows, mut new_positions) = match direction {
+        AlternateScrollDirection::Newer => {
+            let insertion = if matched > 0 {
+                matched_start + matched
+            } else {
+                current_positions
+                    .last()
+                    .copied()
+                    .map_or(old_rows.len(), |position| position + 1)
+            }
+            .min(old_rows.len());
+            let inserted = new_rows[matched..].to_vec();
+            let positions = (0..new_rows.len())
+                .map(|position| matched_start + position)
+                .collect::<Vec<_>>();
+            (insertion, inserted, positions)
+        }
+        AlternateScrollDirection::Older => {
+            let new_prefix = new_rows.len().saturating_sub(matched);
+            let insertion = if matched > 0 {
+                matched_start
+            } else {
+                current_positions.first().copied().unwrap_or(0)
+            }
+            .min(old_rows.len());
+            let inserted = new_rows[..new_prefix].to_vec();
+            let positions = (0..new_rows.len())
+                .map(|position| insertion + position)
+                .collect::<Vec<_>>();
+            (insertion, inserted, positions)
+        }
+    };
+    let inserted = inserted_rows.len();
+    let mut rows = old_rows.to_vec();
+    rows.splice(insertion..insertion, inserted_rows);
+    let old_positions = (0..old_rows.len())
+        .map(|position| position + usize::from(position >= insertion) * inserted)
+        .collect::<Vec<_>>();
+    if direction == AlternateScrollDirection::Newer && matched == 0 {
+        new_positions = (insertion..insertion + new_rows.len()).collect();
+    }
+    for (row, position) in new_rows.iter().zip(&new_positions) {
+        if let Some(existing) = rows.get_mut(*position) {
+            existing.clone_from(row);
+        }
+    }
+    AlternateRowMerge {
+        rows,
+        old_positions,
+        new_positions,
+    }
+}
+
+fn matching_prefix(left: &[String], right: &[String]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn matching_suffix(left: &[String], right: &[String]) -> usize {
+    left.iter()
+        .rev()
+        .zip(right.iter().rev())
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn overlap_has_text(keys: &[String]) -> bool {
+    keys.iter().any(|key| !key.is_empty())
+}
+
+fn overlap_is_strong(keys: &[String]) -> bool {
+    keys.len() >= 2
+        || keys.iter().any(|key| {
+            key.chars()
+                .filter(|character| character.is_alphanumeric())
+                .take(2)
+                .count()
+                == 2
+        })
+}
+
+fn bound_alternate_row_merge(merged: &mut AlternateRowMerge, direction: AlternateScrollDirection) {
+    let overflow = merged.rows.len().saturating_sub(SCROLLBACK_LINES);
+    if overflow == 0 {
+        return;
+    }
+    let mut protected = vec![false; merged.rows.len()];
+    for position in &merged.new_positions {
+        protected[*position] = true;
+    }
+    let mut removed = vec![false; merged.rows.len()];
+    let mut remaining = overflow;
+    match direction {
+        AlternateScrollDirection::Older => {
+            for position in (0..merged.rows.len()).rev() {
+                if remaining == 0 {
+                    break;
+                }
+                if !protected[position] {
+                    removed[position] = true;
+                    remaining -= 1;
+                }
+            }
+        }
+        AlternateScrollDirection::Newer => {
+            for position in 0..merged.rows.len() {
+                if remaining == 0 {
+                    break;
+                }
+                if !protected[position] {
+                    removed[position] = true;
+                    remaining -= 1;
+                }
+            }
+        }
+    }
+    debug_assert_eq!(remaining, 0);
+
+    let mut kept_before = vec![0; merged.rows.len() + 1];
+    for position in 0..merged.rows.len() {
+        kept_before[position + 1] = kept_before[position] + usize::from(!removed[position]);
+    }
+    let retained = kept_before[merged.rows.len()];
+    let compact = |position: usize| {
+        if !removed[position] {
+            kept_before[position]
+        } else {
+            match direction {
+                AlternateScrollDirection::Older => kept_before[position].saturating_sub(1),
+                AlternateScrollDirection::Newer => kept_before[position].min(retained - 1),
+            }
+        }
+    };
+    for position in &mut merged.old_positions {
+        *position = compact(*position);
+    }
+    for position in &mut merged.new_positions {
+        *position = compact(*position);
+    }
+    let mut position = 0;
+    merged.rows.retain(|_| {
+        let keep = !removed[position];
+        position += 1;
+        keep
+    });
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TerminalSelection {
     pane: PaneTarget,
-    start: TerminalCell,
-    end: TerminalCell,
+    start: TerminalBufferCell,
+    end: TerminalBufferCell,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PendingAgentClick {
     event: WorkspaceMouseEvent,
+    cell: TerminalCell,
+    selection_start: TerminalBufferCell,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingAlternateCopy {
+    pane: PaneTarget,
     cell: TerminalCell,
 }
 
@@ -1909,6 +2797,7 @@ struct WorkspaceLayout {
     shell_panes: Vec<(usize, PaneRect)>,
     shell_list: Option<PaneRect>,
     status_row: u16,
+    notification_row: u16,
 }
 
 #[derive(Clone, Copy)]
@@ -1925,7 +2814,8 @@ impl WorkspaceLayout {
         let sidebar_width = (cols / 6).clamp(20, 28);
         let right_left = sidebar_width + 1;
         let right_width = cols.saturating_sub(right_left).max(2);
-        let status_row = rows - 1;
+        let status_row = rows - 2;
+        let notification_row = rows - 1;
         let content_height = status_row;
         if shell_count == 0 {
             return Self {
@@ -1940,6 +2830,7 @@ impl WorkspaceLayout {
                 shell_panes: Vec::new(),
                 shell_list: None,
                 status_row,
+                notification_row,
             };
         }
 
@@ -1995,6 +2886,7 @@ impl WorkspaceLayout {
             shell_panes,
             shell_list,
             status_row,
+            notification_row,
         }
     }
 
@@ -2099,6 +2991,39 @@ fn pane_at(layout: &WorkspaceLayout, col: u16, row: u16) -> Option<(PaneTarget, 
             )
         })
     })
+}
+
+fn terminal_pane_rect(layout: &WorkspaceLayout, pane: PaneTarget) -> Option<PaneRect> {
+    match pane {
+        PaneTarget::Agent => Some(layout.agent),
+        PaneTarget::Shell(selected) => layout
+            .shell_panes
+            .iter()
+            .find(|(index, _)| *index == selected)
+            .map(|(_, rect)| PaneRect {
+                top: rect.top + 1,
+                left: rect.left,
+                width: rect.width,
+                height: rect.height.saturating_sub(1),
+            }),
+    }
+}
+
+fn clamped_pane_cell(rect: PaneRect, col: u16, row: u16) -> TerminalCell {
+    TerminalCell {
+        row: row
+            .clamp(
+                rect.top,
+                rect.top.saturating_add(rect.height.saturating_sub(1)),
+            )
+            .saturating_sub(rect.top),
+        col: col
+            .clamp(
+                rect.left,
+                rect.left.saturating_add(rect.width.saturating_sub(1)),
+            )
+            .saturating_sub(rect.left),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2719,11 +3644,79 @@ impl SessionTerminals {
     ) -> io::Result<()> {
         let col = event.col.saturating_sub(1);
         let row = event.row.saturating_sub(1);
-        let Some((pane, cell)) = pane_at(layout, col, row) else {
-            return Ok(());
-        };
         let button = event.button & !(4 | 8 | 16 | 32);
         let dragging = event.button & 32 != 0;
+        let continuing_selection = button == 0 && (dragging || !event.pressed);
+        if self.suppressed_mouse_buttons != 0 {
+            if matches!(button, 0..=2) {
+                let mask = 1_u8 << button;
+                if event.pressed {
+                    self.suppressed_mouse_buttons |= mask;
+                } else {
+                    self.suppressed_mouse_buttons &= !mask;
+                }
+            }
+            return Ok(());
+        }
+        if button == 0
+            && !event.pressed
+            && let Some(capture) = &mut self.alternate_selection
+        {
+            capture.queued_scrolls.clear();
+        }
+        self.refresh_alternate_selection()?;
+        if self.pending_alternate_copy.is_some() && !self.finish_pending_alternate_copy() {
+            if matches!(button, 0..=2) && event.pressed {
+                self.suppressed_mouse_buttons |= 1_u8 << button;
+            }
+            return Ok(());
+        }
+        let selection_pane = self
+            .selection
+            .map(|selection| selection.pane)
+            .or_else(|| self.pending_agent_click.map(|_| PaneTarget::Agent));
+        let hit = pane_at(layout, col, row);
+        let (pane, cell, edge_scroll) = if continuing_selection
+            && let Some(selection_pane) = selection_pane
+            && hit.is_none_or(|(pane, _)| pane != selection_pane)
+            && let Some(rect) = terminal_pane_rect(layout, selection_pane)
+        {
+            let edge_scroll = if dragging && row < rect.top {
+                3
+            } else if dragging && row >= rect.top.saturating_add(rect.height) {
+                -3
+            } else {
+                0
+            };
+            (
+                selection_pane,
+                clamped_pane_cell(rect, col, row),
+                edge_scroll,
+            )
+        } else if let Some((pane, cell)) = hit {
+            (pane, cell, 0)
+        } else {
+            return Ok(());
+        };
+        if edge_scroll != 0 {
+            let alternate = pane == PaneTarget::Agent
+                && self
+                    .terminal(pane)
+                    .is_some_and(ManagedTerminal::alternate_screen);
+            if alternate {
+                let button = if edge_scroll > 0 { 64 } else { 65 };
+                let direction = if edge_scroll > 0 {
+                    AlternateScrollDirection::Older
+                } else {
+                    AlternateScrollDirection::Newer
+                };
+                if let Some(bytes) = alternate_screen_scroll(button) {
+                    self.queue_alternate_scroll(pane, direction, bytes)?;
+                }
+            } else if let Some(terminal) = self.terminal(pane) {
+                terminal.scroll_viewport(edge_scroll);
+            }
+        }
         if pane == PaneTarget::Agent
             && matches!(button, 64 | 65)
             && let Some(terminal) = self.terminal(pane)
@@ -2731,43 +3724,93 @@ impl SessionTerminals {
             let before = terminal.scrollback_offset();
             let amount = if button == 64 { 3 } else { -3 };
             let after = terminal.scroll_viewport(amount);
+            let selection_end = self.selection_cell(pane, cell);
+            if let Some(selection) = &mut self.selection
+                && selection.pane == pane
+                && let Some(selection_end) = selection_end
+            {
+                selection.end = selection_end;
+            }
             if before > 0 || after > 0 {
                 return Ok(());
             }
+        }
+        if button == 0
+            && !event.pressed
+            && (self.selection.is_some() || self.pending_agent_click.is_some())
+            && self
+                .alternate_selection
+                .as_ref()
+                .is_some_and(|capture| capture.pane == pane && capture.pending_scroll.is_some())
+        {
+            self.pending_alternate_copy = Some(PendingAlternateCopy { pane, cell });
+            return Ok(());
         }
         if pane == PaneTarget::Agent && event.button & 4 == 0 {
             let mouse_protocol = self.terminal(pane).map(ManagedTerminal::mouse_protocol);
             if let Some((mode, encoding)) = mouse_protocol
                 && mode != vt100::MouseProtocolMode::None
             {
+                if matches!(button, 64 | 65)
+                    && self
+                        .alternate_selection
+                        .as_ref()
+                        .is_some_and(|capture| capture.pane == pane)
+                    && self
+                        .terminal(pane)
+                        .is_some_and(ManagedTerminal::alternate_screen)
+                    && let Some(bytes) = encoded_child_mouse_event(event, cell, encoding)
+                {
+                    let direction = if button == 64 {
+                        AlternateScrollDirection::Older
+                    } else {
+                        AlternateScrollDirection::Newer
+                    };
+                    self.queue_alternate_scroll(pane, direction, bytes)?;
+                    return Ok(());
+                }
                 if button == 0 && event.pressed && !dragging {
                     self.selection = None;
-                    self.pending_agent_click = Some(PendingAgentClick { event, cell });
+                    let Some(selection_start) = self.begin_selection(pane, cell) else {
+                        return Ok(());
+                    };
+                    self.pending_agent_click = Some(PendingAgentClick {
+                        event,
+                        cell,
+                        selection_start,
+                    });
                     return Ok(());
                 }
                 if button == 0 && event.pressed && dragging {
                     if let Some(pending) = self.pending_agent_click.take() {
+                        let Some(end) = self.selection_cell(pane, cell) else {
+                            return Ok(());
+                        };
                         self.selection = Some(TerminalSelection {
                             pane,
-                            start: pending.cell,
-                            end: cell,
+                            start: pending.selection_start,
+                            end,
                         });
                         return Ok(());
                     }
+                    let end = self.selection_cell(pane, cell);
                     if let Some(selection) = &mut self.selection
                         && selection.pane == pane
+                        && let Some(end) = end
                     {
-                        selection.end = cell;
+                        selection.end = end;
                         return Ok(());
                     }
                 }
                 if button == 0 && !event.pressed {
+                    let end = self.selection_cell(pane, cell);
                     if let Some(selection) = &mut self.selection
                         && selection.pane == pane
+                        && let Some(end) = end
                     {
-                        selection.end = cell;
+                        selection.end = end;
                         self.pending_agent_click = None;
-                        self.copy_selection_to_clipboard();
+                        self.finish_selection_copy();
                         return Ok(());
                     }
                     if let Some(pending) = self.pending_agent_click.take() {
@@ -2794,42 +3837,281 @@ impl SessionTerminals {
         }
         match button {
             64 | 65 => {
-                if let Some(terminal) = self.terminal(pane)
-                    && pane == PaneTarget::Agent
-                    && terminal.alternate_screen()
-                    && let Some(bytes) = alternate_screen_scroll(button)
-                {
-                    terminal.write(&bytes)?;
+                let alternate = pane == PaneTarget::Agent
+                    && self
+                        .terminal(pane)
+                        .is_some_and(ManagedTerminal::alternate_screen);
+                if alternate {
+                    let end = self.selection_cell(pane, cell);
+                    if let Some(selection) = &mut self.selection
+                        && selection.pane == pane
+                        && let Some(end) = end
+                    {
+                        selection.end = end;
+                    }
+                    let direction = if button == 64 {
+                        AlternateScrollDirection::Older
+                    } else {
+                        AlternateScrollDirection::Newer
+                    };
+                    if let Some(bytes) = alternate_screen_scroll(button) {
+                        self.queue_alternate_scroll(pane, direction, bytes)?;
+                    }
                     return Ok(());
                 }
                 if let Some(terminal) = self.terminal(pane) {
                     let amount = if button == 64 { 3 } else { -3 };
                     terminal.scroll_viewport(amount);
+                    let selection_end = self.selection_cell(pane, cell);
+                    if let Some(selection) = &mut self.selection
+                        && selection.pane == pane
+                        && let Some(selection_end) = selection_end
+                    {
+                        selection.end = selection_end;
+                    }
                 }
             }
             0 if event.pressed && event.button & 32 == 0 => {
-                self.selection = Some(TerminalSelection {
-                    pane,
-                    start: cell,
-                    end: cell,
-                });
+                if let Some(cell) = self.begin_selection(pane, cell) {
+                    self.selection = Some(TerminalSelection {
+                        pane,
+                        start: cell,
+                        end: cell,
+                    });
+                }
             }
             0 if event.pressed && event.button & 32 != 0 => {
+                let end = self.selection_cell(pane, cell);
                 if let Some(selection) = &mut self.selection
                     && selection.pane == pane
+                    && let Some(end) = end
                 {
-                    selection.end = cell;
+                    selection.end = end;
                 }
             }
             0 if !event.pressed => {
+                let end = self.selection_cell(pane, cell);
                 if let Some(selection) = &mut self.selection
                     && selection.pane == pane
+                    && let Some(end) = end
                 {
-                    selection.end = cell;
+                    selection.end = end;
                 }
-                self.copy_selection_to_clipboard();
+                self.finish_selection_copy();
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    fn begin_selection(
+        &mut self,
+        pane: PaneTarget,
+        cell: TerminalCell,
+    ) -> Option<TerminalBufferCell> {
+        self.alternate_selection = None;
+        self.pending_alternate_copy = None;
+        let terminal = self.terminal(pane)?;
+        if terminal.alternate_screen() {
+            let capture = AlternateSelectionBuffer::new(pane, terminal.screen_view())?;
+            let cell = capture.cell(cell);
+            self.alternate_selection = Some(capture);
+            Some(cell)
+        } else {
+            terminal.selection_cell(cell)
+        }
+    }
+
+    fn selection_cell(
+        &mut self,
+        pane: PaneTarget,
+        cell: TerminalCell,
+    ) -> Option<TerminalBufferCell> {
+        if let Some(capture) = self
+            .alternate_selection
+            .as_ref()
+            .filter(|capture| capture.pane == pane)
+        {
+            Some(capture.cell(cell))
+        } else {
+            self.terminal(pane)?.selection_cell(cell)
+        }
+    }
+
+    fn queue_alternate_scroll(
+        &mut self,
+        pane: PaneTarget,
+        direction: AlternateScrollDirection,
+        bytes: Vec<u8>,
+    ) -> io::Result<()> {
+        let generation = self.terminal(pane).map(ManagedTerminal::output_generation);
+        let bytes = if let Some(capture) = self
+            .alternate_selection
+            .as_mut()
+            .filter(|capture| capture.pane == pane)
+            && let Some(generation) = generation
+        {
+            capture.queue_scroll(AlternateScrollRequest { direction, bytes }, generation)
+        } else {
+            Some(bytes)
+        };
+        if let Some(bytes) = bytes
+            && let Some(terminal) = self.terminal(pane)
+        {
+            terminal.write(&bytes)?;
+        }
+        Ok(())
+    }
+
+    fn refresh_alternate_selection(&mut self) -> io::Result<bool> {
+        let Some(pane) = self
+            .alternate_selection
+            .as_ref()
+            .and_then(|capture| capture.pending_scroll.as_ref().map(|_| capture.pane))
+        else {
+            return Ok(false);
+        };
+        let Some(generation) = self.terminal(pane).map(ManagedTerminal::output_generation) else {
+            self.alternate_selection = None;
+            return Ok(true);
+        };
+        let now = Instant::now();
+        let (candidate, timed_out) = {
+            let pending = self
+                .alternate_selection
+                .as_mut()
+                .and_then(|capture| capture.pending_scroll.as_mut())
+                .expect("the alternate pane was resolved from a pending scroll");
+            let timed_out = now.duration_since(pending.started_at) >= ALTERNATE_SCROLL_TIMEOUT;
+            let ready = pending.candidate.as_ref().is_some_and(|candidate| {
+                candidate.generation == generation
+                    && (timed_out
+                        || now.duration_since(candidate.stable_since) >= ALTERNATE_REPAINT_SETTLE)
+            });
+            (
+                ready.then(|| pending.candidate.take().unwrap().view),
+                timed_out,
+            )
+        };
+        if let Some(view) = candidate {
+            return self.commit_alternate_view(pane, generation, view);
+        }
+
+        let pending_generation = self
+            .alternate_selection
+            .as_ref()
+            .and_then(|capture| capture.pending_scroll.as_ref())
+            .map(|pending| pending.generation);
+        if pending_generation == Some(generation) {
+            if timed_out {
+                return self.complete_alternate_scroll(pane, generation);
+            }
+            return Ok(false);
+        }
+
+        let Some(view) = self.terminal(pane).map(ManagedTerminal::screen_view) else {
+            self.alternate_selection = None;
+            return Ok(true);
+        };
+        if let Some(capture) = self.alternate_selection.as_mut() {
+            if capture.view_matches(&view) {
+                capture.replace_current_view(view);
+                if let Some(pending) = &mut capture.pending_scroll {
+                    pending.generation = generation;
+                    pending.candidate = None;
+                }
+                if timed_out {
+                    return self.complete_alternate_scroll(pane, generation);
+                }
+                return Ok(true);
+            }
+            let direction = capture
+                .pending_scroll
+                .as_ref()
+                .map(|pending| pending.direction);
+            if let Some(direction) = direction
+                && capture.replace_chrome_update(view.clone(), direction)
+            {
+                if let Some(pending) = &mut capture.pending_scroll {
+                    pending.generation = generation;
+                    pending.candidate = None;
+                }
+                if timed_out {
+                    return self.complete_alternate_scroll(pane, generation);
+                }
+                return Ok(true);
+            }
+            if timed_out {
+                return self.commit_alternate_view(pane, generation, view);
+            }
+            if let Some(pending) = &mut capture.pending_scroll {
+                pending.generation = generation;
+                pending.candidate = Some(AlternateViewCandidate {
+                    generation,
+                    stable_since: now,
+                    view,
+                });
+            }
+        }
+        Ok(false)
+    }
+
+    fn complete_alternate_scroll(&mut self, pane: PaneTarget, generation: u64) -> io::Result<bool> {
+        if let Some(capture) = self
+            .alternate_selection
+            .as_mut()
+            .filter(|capture| capture.pane == pane)
+        {
+            capture.pending_scroll = None;
+        }
+        self.start_next_alternate_scroll(pane, generation)?;
+        Ok(true)
+    }
+
+    fn commit_alternate_view(
+        &mut self,
+        pane: PaneTarget,
+        generation: u64,
+        view: ScreenView,
+    ) -> io::Result<bool> {
+        let edit = self
+            .alternate_selection
+            .as_mut()
+            .and_then(|capture| capture.merge_view(view));
+        if let Some(edit) = edit {
+            let rebase = |endpoint: &mut TerminalBufferCell| {
+                endpoint.row = edit
+                    .old_positions
+                    .get(endpoint.row)
+                    .copied()
+                    .or_else(|| edit.old_positions.last().copied())
+                    .unwrap_or(0);
+            };
+            if let Some(selection) = &mut self.selection
+                && selection.pane == pane
+            {
+                rebase(&mut selection.start);
+                rebase(&mut selection.end);
+            }
+            if let Some(pending_click) = &mut self.pending_agent_click
+                && pane == PaneTarget::Agent
+            {
+                rebase(&mut pending_click.selection_start);
+            }
+        }
+        self.start_next_alternate_scroll(pane, generation)?;
+        Ok(true)
+    }
+
+    fn start_next_alternate_scroll(&mut self, pane: PaneTarget, generation: u64) -> io::Result<()> {
+        let next = self
+            .alternate_selection
+            .as_mut()
+            .and_then(|capture| capture.begin_next_scroll(generation));
+        if let Some(bytes) = next
+            && let Some(terminal) = self.terminal(pane)
+        {
+            terminal.write(&bytes)?;
         }
         Ok(())
     }
@@ -2847,6 +4129,54 @@ impl SessionTerminals {
         };
     }
 
+    fn finish_selection_copy(&mut self) {
+        self.pending_alternate_copy = None;
+        if self
+            .selection
+            .is_some_and(|selection| selection.start == selection.end)
+        {
+            self.selection = None;
+            self.alternate_selection = None;
+            return;
+        }
+        if let Some(capture) = &mut self.alternate_selection {
+            capture.pending_scroll = None;
+            capture.queued_scrolls.clear();
+        }
+        self.copy_selection_to_clipboard();
+    }
+
+    fn finish_pending_alternate_copy(&mut self) -> bool {
+        let Some(pending) = self.pending_alternate_copy else {
+            return false;
+        };
+        let Some(capture) = self
+            .alternate_selection
+            .as_ref()
+            .filter(|capture| capture.pane == pending.pane)
+        else {
+            self.pending_alternate_copy = None;
+            return true;
+        };
+        if capture.pending_scroll.is_some() || !capture.queued_scrolls.is_empty() {
+            return false;
+        }
+        let end = capture.cell(pending.cell);
+        if let Some(selection) = &mut self.selection
+            && selection.pane == pending.pane
+        {
+            selection.end = end;
+        } else if let Some(click) = self.pending_agent_click.take() {
+            self.selection = Some(TerminalSelection {
+                pane: pending.pane,
+                start: click.selection_start,
+                end,
+            });
+        }
+        self.finish_selection_copy();
+        true
+    }
+
     fn terminal(&self, pane: PaneTarget) -> Option<&ManagedTerminal> {
         match pane {
             PaneTarget::Agent => self.agent.as_ref(),
@@ -2856,9 +4186,28 @@ impl SessionTerminals {
 
     fn selected_text(&self) -> Option<String> {
         let selection = self.selection?;
-        self.terminal(selection.pane)
-            .map(|terminal| terminal.selected_text(selection.start, selection.end))
-            .filter(|text| !text.is_empty())
+        let text = self
+            .alternate_selection
+            .as_ref()
+            .filter(|capture| capture.pane == selection.pane)
+            .map(|capture| capture.selected_text(selection.start, selection.end))
+            .or_else(|| {
+                self.terminal(selection.pane)
+                    .map(|terminal| terminal.selected_text(selection.start, selection.end))
+            })?;
+        (!text.is_empty()).then_some(text)
+    }
+
+    fn selected_rows(&self, selection: TerminalSelection) -> Vec<(TerminalCell, String)> {
+        self.alternate_selection
+            .as_ref()
+            .filter(|capture| capture.pane == selection.pane)
+            .map(|capture| capture.selected_rows(selection.start, selection.end))
+            .or_else(|| {
+                self.terminal(selection.pane)
+                    .map(|terminal| terminal.selected_rows(selection.start, selection.end))
+            })
+            .unwrap_or_default()
     }
 
     fn attach_workspace<F, G>(
@@ -2956,6 +4305,11 @@ impl SessionTerminals {
                     last_layout_key = Some(layout_key);
                     last_signature.clear();
                     clear_next_frame = true;
+                }
+                let alternate_changed = self.refresh_alternate_selection()?;
+                let selection_copied = self.finish_pending_alternate_copy();
+                if alternate_changed || selection_copied {
+                    last_signature.clear();
                 }
                 let signature = self.render_signature(size, &layout, focus);
                 if signature != last_signature {
@@ -3294,7 +4648,11 @@ impl SessionTerminals {
         }
     }
 
-    fn resize_workspace(&self, layout: &WorkspaceLayout) -> io::Result<()> {
+    fn resize_workspace(&mut self, layout: &WorkspaceLayout) -> io::Result<()> {
+        self.selection = None;
+        self.alternate_selection = None;
+        self.pending_alternate_copy = None;
+        self.pending_agent_click = None;
         if let Some(agent) = &self.agent {
             agent.resize(layout.agent.width, layout.agent.height)?;
         }
@@ -3417,6 +4775,20 @@ fn render_workspace_with_bindings(
     bindings: &WorkspaceBindings,
     clear: bool,
 ) -> io::Result<()> {
+    stdout.sync_update(|stdout| {
+        render_workspace_frame(stdout, terminals, chrome, layout, state, bindings, clear)
+    })?
+}
+
+fn render_workspace_frame(
+    stdout: &mut impl Write,
+    terminals: &SessionTerminals,
+    chrome: &WorkspaceChrome,
+    layout: &WorkspaceLayout,
+    state: WorkspaceRenderState<'_>,
+    bindings: &WorkspaceBindings,
+    clear: bool,
+) -> io::Result<()> {
     let WorkspaceRenderState {
         focus,
         search,
@@ -3459,7 +4831,7 @@ fn render_workspace_with_bindings(
                     .selection
                     .filter(|selection| selection.pane == PaneTarget::Agent)
                 {
-                    render_selection(stdout, agent, selection, layout.agent)?;
+                    render_selection(stdout, terminals.selected_rows(selection), layout.agent)?;
                 }
             }
         } else {
@@ -3510,7 +4882,7 @@ fn render_workspace_with_bindings(
                 .selection
                 .filter(|selection| selection.pane == PaneTarget::Shell(*index))
             {
-                render_selection(stdout, &shell.terminal, selection, terminal_rect)?;
+                render_selection(stdout, terminals.selected_rows(selection), terminal_rect)?;
             }
         }
         if position + 1 < layout.shell_panes.len() {
@@ -3585,51 +4957,32 @@ fn render_workspace_with_bindings(
             ),
         };
         let badge = format!(" {focus_name} ");
-        let controls_text = if let Some(notification) = &chrome.notification {
-            let alert = match (bindings.label_opt("alert"), focus) {
-                (Some(direct), WorkspaceFocus::Sessions) => {
-                    format!("{direct}/{}", bindings.label("session_alert"))
-                }
-                (Some(direct), _) => direct.to_owned(),
-                (None, WorkspaceFocus::Sessions) => bindings.label("session_alert").to_owned(),
-                (None, _) => format!(
-                    "{} then {}",
-                    bindings.label("focus"),
-                    bindings.label("session_alert")
-                ),
-            };
-            format!(
-                "  ALERT · {notification}  ·  {} jump  {} dashboard",
-                alert,
-                bindings.label("dashboard")
-            )
-        } else {
-            let shortcuts = match focus {
-                WorkspaceFocus::Sessions => format!(
-                    "{} dashboard  {} focus  {search_label}  {} alert  {} help  ↑↓/j/k select  Enter agent  {} agent  {} shell  n new  s +shell  x archive",
-                    bindings.label("dashboard"),
-                    bindings.label("focus"),
-                    bindings.label("session_alert"),
-                    bindings.label("help"),
-                    bindings.label("hide_shells"),
-                    bindings.label("maximize")
-                ),
-                WorkspaceFocus::Agent => format!(
-                    "{} dashboard  {} focus  {} new shell  ·  keys pass through  ·  Shift-PageUp/Down scroll",
-                    bindings.label("dashboard"),
-                    bindings.label("focus"),
-                    bindings.label("new_shell")
-                ),
-                WorkspaceFocus::Shell => format!(
-                    "{} dashboard  {} focus  {} new  {} next  {} close  ·  Shift-PageUp/Down scroll",
-                    bindings.label("dashboard"),
-                    bindings.label("focus"),
-                    bindings.label("new_shell"),
-                    bindings.label("next_shell"),
-                    bindings.label("close_shell")
-                ),
-            };
-            terminals.notice.as_deref().map_or_else(
+        let shortcuts = match focus {
+            WorkspaceFocus::Sessions => format!(
+                "{} dashboard  {} focus  {search_label}  {} alert  {} help  ↑↓/j/k select  Enter agent  {} agent  {} shell  n new  s +shell  x archive",
+                bindings.label("dashboard"),
+                bindings.label("focus"),
+                bindings.label("session_alert"),
+                bindings.label("help"),
+                bindings.label("hide_shells"),
+                bindings.label("maximize")
+            ),
+            WorkspaceFocus::Agent => format!(
+                "{} dashboard  {} focus  {} new shell  ·  keys pass through  ·  Shift-PageUp/Down scroll",
+                bindings.label("dashboard"),
+                bindings.label("focus"),
+                bindings.label("new_shell")
+            ),
+            WorkspaceFocus::Shell => format!(
+                "{} dashboard  {} focus  {} new  {} next  {} close  ·  Shift-PageUp/Down scroll",
+                bindings.label("dashboard"),
+                bindings.label("focus"),
+                bindings.label("new_shell"),
+                bindings.label("next_shell"),
+                bindings.label("close_shell")
+            ),
+        };
+        let controls_text = terminals.notice.as_deref().map_or_else(
             || format!("  {shortcuts}"),
             |notice| {
                 let essentials = match focus {
@@ -3657,8 +5010,7 @@ fn render_workspace_with_bindings(
                 };
                 format!("  {essentials}  ·  {notice}")
             },
-        )
-        };
+        );
         (badge, controls_text)
     };
     let controls = fit_text(
@@ -3675,8 +5027,40 @@ fn render_workspace_with_bindings(
         0,
         format!("\x1b[30;46;1m{badge}\x1b[0m\x1b[2m{controls}\x1b[0m").as_bytes(),
     )?;
+    let notification_text = chrome
+        .notification
+        .as_ref()
+        .map_or_else(String::new, |notification| {
+            let alert = match (bindings.label_opt("alert"), focus) {
+                (Some(direct), WorkspaceFocus::Sessions) => {
+                    format!("{direct}/{}", bindings.label("session_alert"))
+                }
+                (Some(direct), _) => direct.to_owned(),
+                (None, WorkspaceFocus::Sessions) => bindings.label("session_alert").to_owned(),
+                (None, _) => format!(
+                    "{} then {}",
+                    bindings.label("focus"),
+                    bindings.label("session_alert")
+                ),
+            };
+            format!(
+                " ALERT · {notification}  ·  {alert} jump  {} dashboard",
+                bindings.label("dashboard")
+            )
+        });
+    let footer_width = layout.agent.left.saturating_add(layout.agent.width);
+    write_at(
+        stdout,
+        layout.notification_row,
+        0,
+        format!(
+            "\x1b[33m{}\x1b[0m",
+            fit_text(&notification_text, footer_width)
+        )
+        .as_bytes(),
+    )?;
     position_workspace_cursor(stdout, terminals, layout, focus)?;
-    stdout.flush()
+    Ok(())
 }
 
 fn render_workspace_help(
@@ -3960,11 +5344,10 @@ fn render_terminal(
 
 fn render_selection(
     stdout: &mut impl Write,
-    terminal: &ManagedTerminal,
-    selection: TerminalSelection,
+    rows: Vec<(TerminalCell, String)>,
     rect: PaneRect,
 ) -> io::Result<()> {
-    for (cell, text) in terminal.selected_rows(selection.start, selection.end) {
+    for (cell, text) in rows {
         if cell.row >= rect.height || cell.col >= rect.width {
             continue;
         }
@@ -5468,8 +6851,12 @@ mod tests {
         agent.wait_for_first_output(Duration::from_secs(1));
         assert_eq!(agent.scroll_viewport(1), 1);
 
-        let first = TerminalCell { row: 0, col: 0 };
-        let last = TerminalCell { row: 0, col: 5 };
+        let first = agent
+            .selection_cell(TerminalCell { row: 0, col: 0 })
+            .unwrap();
+        let last = agent
+            .selection_cell(TerminalCell { row: 0, col: 5 })
+            .unwrap();
         assert_eq!(agent.selected_text(first, last), "oldest");
         assert_eq!(agent.selected_rows(first, last)[0].1, "oldest");
     }
@@ -5705,11 +7092,234 @@ mod tests {
         terminal.wait_for_first_output(Duration::from_secs(1));
 
         let selected = terminal.selected_text(
-            TerminalCell { row: 0, col: 6 },
-            TerminalCell { row: 1, col: 4 },
+            terminal
+                .selection_cell(TerminalCell { row: 0, col: 6 })
+                .unwrap(),
+            terminal
+                .selection_cell(TerminalCell { row: 1, col: 4 })
+                .unwrap(),
         );
 
         assert_eq!(selected, "beta\ngamma");
+    }
+
+    #[test]
+    fn terminal_selection_keeps_its_history_anchor_across_viewport_scrolling() {
+        let mut parser = vt100::Parser::new(3, 12, 20);
+        let mut scrollback = StatusBarScrollback::default();
+        process_terminal_output(
+            &mut parser,
+            &mut scrollback,
+            b"line-1\r\nline-2\r\nline-3\r\nline-4\r\nline-5",
+        );
+        parser.screen_mut().set_scrollback(usize::MAX);
+        let start = terminal_buffer_cell(&mut parser, &scrollback, TerminalCell { row: 0, col: 0 })
+            .unwrap();
+        parser.screen_mut().set_scrollback(0);
+        let end = terminal_buffer_cell(&mut parser, &scrollback, TerminalCell { row: 2, col: 5 })
+            .unwrap();
+
+        assert_eq!(
+            terminal_selected_text(&mut parser, &scrollback, start, end),
+            "line-1\nline-2\nline-3\nline-4\nline-5"
+        );
+        assert_eq!(
+            terminal_selected_rows(&mut parser, &scrollback, start, end)
+                .into_iter()
+                .map(|(cell, text)| (cell.row, text.trim_end().to_owned()))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, "line-3".into()),
+                (1, "line-4".into()),
+                (2, "line-5".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn terminal_selection_collects_more_than_two_native_viewports() {
+        let mut parser = vt100::Parser::new(3, 12, 20);
+        let scrollback = StatusBarScrollback::default();
+        let output = (1..=11)
+            .map(|line| format!("line-{line:02}"))
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        parser.process(output.as_bytes());
+        parser.screen_mut().set_scrollback(usize::MAX);
+        let start = terminal_buffer_cell(&mut parser, &scrollback, TerminalCell { row: 0, col: 0 })
+            .unwrap();
+        parser.screen_mut().set_scrollback(0);
+        let end = terminal_buffer_cell(&mut parser, &scrollback, TerminalCell { row: 2, col: 6 })
+            .unwrap();
+
+        assert_eq!(
+            terminal_selected_text(&mut parser, &scrollback, start, end),
+            (1..=11)
+                .map(|line| format!("line-{line:02}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    #[test]
+    fn terminal_selection_spans_codex_status_bar_scrollback() {
+        let mut parser = vt100::Parser::new(3, 12, 20);
+        parser.process(b"line-4\r\nline-5\r\nline-6");
+        let mut scrollback = StatusBarScrollback::default();
+        scrollback
+            .rows
+            .extend([b"line-1".to_vec(), b"line-2".to_vec(), b"line-3".to_vec()]);
+        scrollback.offset = 3;
+        let start = terminal_buffer_cell(&mut parser, &scrollback, TerminalCell { row: 0, col: 0 })
+            .unwrap();
+        scrollback.offset = 0;
+        let end = terminal_buffer_cell(&mut parser, &scrollback, TerminalCell { row: 2, col: 5 })
+            .unwrap();
+
+        assert_eq!(
+            terminal_selected_text(&mut parser, &scrollback, start, end),
+            "line-1\nline-2\nline-3\nline-4\nline-5\nline-6"
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_extends_an_active_selection_across_history() {
+        let root = tempdir().unwrap();
+        let agent = ManagedTerminal::spawn(
+            &CommandSpec::new("/bin/sh", root.path())
+                .arg("-c")
+                .arg("printf 'line-1\r\nline-2\r\nline-3\r\nline-4\r\nline-5\r\nline-6'; sleep 2"),
+            (12, 3),
+        )
+        .unwrap();
+        agent.wait_for_first_output(Duration::from_secs(1));
+        let mut terminals = SessionTerminals {
+            agent: Some(agent),
+            ..SessionTerminals::default()
+        };
+        let layout = WorkspaceLayout::new(120, 30, 0, 0);
+
+        terminals
+            .handle_mouse(
+                &layout,
+                WorkspaceMouseEvent {
+                    button: 0,
+                    col: layout.agent.left + 6,
+                    row: layout.agent.top + 3,
+                    pressed: true,
+                },
+            )
+            .unwrap();
+        terminals
+            .handle_mouse(
+                &layout,
+                WorkspaceMouseEvent {
+                    button: 64,
+                    col: layout.agent.left + 1,
+                    row: layout.agent.top + 1,
+                    pressed: true,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            terminals.selected_text().as_deref(),
+            Some("line-1\nline-2\nline-3\nline-4\nline-5\nline-6")
+        );
+    }
+
+    #[test]
+    fn dragging_past_the_pane_edge_scrolls_and_keeps_selecting() {
+        let root = tempdir().unwrap();
+        let agent = ManagedTerminal::spawn(
+            &CommandSpec::new("/bin/sh", root.path())
+                .arg("-c")
+                .arg("printf 'line-1\r\nline-2\r\nline-3\r\nline-4\r\nline-5\r\nline-6'; sleep 2"),
+            (12, 3),
+        )
+        .unwrap();
+        agent.wait_for_first_output(Duration::from_secs(1));
+        let mut terminals = SessionTerminals {
+            agent: Some(agent),
+            ..SessionTerminals::default()
+        };
+        let layout = WorkspaceLayout::new(120, 30, 0, 0);
+
+        for event in [
+            WorkspaceMouseEvent {
+                button: 0,
+                col: layout.agent.left + 6,
+                row: layout.agent.top + 3,
+                pressed: true,
+            },
+            WorkspaceMouseEvent {
+                button: 32,
+                col: layout.agent.left + 1,
+                row: layout.agent.top,
+                pressed: true,
+            },
+        ] {
+            terminals.handle_mouse(&layout, event).unwrap();
+        }
+
+        assert_eq!(terminals.agent.as_ref().unwrap().scrollback_offset(), 3);
+        assert_eq!(
+            terminals.selected_text().as_deref(),
+            Some("line-1\nline-2\nline-3\nline-4\nline-5\nline-6")
+        );
+    }
+
+    #[test]
+    fn mouse_reporting_keeps_the_pending_selection_anchor_while_scrolling() {
+        let root = tempdir().unwrap();
+        let agent = ManagedTerminal::spawn(
+            &CommandSpec::new("/bin/sh", root.path()).arg("-c").arg(
+                r"printf 'line-1\r\nline-2\r\nline-3\r\nline-4\r\nline-5\r\nline-6'; \
+                  printf '\033[?1002h\033[?1006h'; sleep 2",
+            ),
+            (12, 3),
+        )
+        .unwrap();
+        agent.wait_for_first_output(Duration::from_secs(1));
+        let start = Instant::now();
+        while agent.mouse_protocol().0 == vt100::MouseProtocolMode::None
+            && start.elapsed() < Duration::from_secs(1)
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let mut terminals = SessionTerminals {
+            agent: Some(agent),
+            ..SessionTerminals::default()
+        };
+        let layout = WorkspaceLayout::new(120, 30, 0, 0);
+
+        for event in [
+            WorkspaceMouseEvent {
+                button: 0,
+                col: layout.agent.left + 6,
+                row: layout.agent.top + 3,
+                pressed: true,
+            },
+            WorkspaceMouseEvent {
+                button: 64,
+                col: layout.agent.left + 1,
+                row: layout.agent.top + 1,
+                pressed: true,
+            },
+            WorkspaceMouseEvent {
+                button: 32,
+                col: layout.agent.left + 1,
+                row: layout.agent.top + 1,
+                pressed: true,
+            },
+        ] {
+            terminals.handle_mouse(&layout, event).unwrap();
+        }
+
+        assert_eq!(
+            terminals.selected_text().as_deref(),
+            Some("line-1\nline-2\nline-3\nline-4\nline-5\nline-6")
+        );
     }
 
     #[test]
@@ -5728,10 +7338,980 @@ mod tests {
         assert_eq!(terminal.mouse_protocol().0, vt100::MouseProtocolMode::None);
         assert_eq!(
             terminal.selected_text(
-                TerminalCell { row: 0, col: 0 },
-                TerminalCell { row: 0, col: 13 },
+                terminal
+                    .selection_cell(TerminalCell { row: 0, col: 0 })
+                    .unwrap(),
+                terminal
+                    .selection_cell(TerminalCell { row: 0, col: 13 })
+                    .unwrap(),
             ),
             "claude-visible"
+        );
+    }
+
+    #[test]
+    fn alternate_screen_selection_keeps_pages_repainted_by_claude() {
+        let root = tempdir().unwrap();
+        let agent = ManagedTerminal::spawn(
+            &CommandSpec::new("/bin/sh", root.path()).arg("-c").arg(
+                r"stty raw -echo; \
+                  printf '\033[?1049hline-4\r\nline-5\r\nline-6'; \
+                  dd bs=1 count=9 of=/dev/null 2>/dev/null; \
+                  printf '\033[?25l'; sleep 0.08; \
+                  printf '\033[2J\033[Hline-1\r\nline-2\r\nline-3'; sleep 2",
+            ),
+            (12, 3),
+        )
+        .unwrap();
+        agent.wait_for_first_output(Duration::from_secs(1));
+        let mut terminals = SessionTerminals {
+            agent: Some(agent),
+            ..SessionTerminals::default()
+        };
+        let layout = WorkspaceLayout::new(120, 30, 0, 0);
+
+        terminals
+            .handle_mouse(
+                &layout,
+                WorkspaceMouseEvent {
+                    button: 0,
+                    col: layout.agent.left + 6,
+                    row: layout.agent.top + 3,
+                    pressed: true,
+                },
+            )
+            .unwrap();
+        terminals
+            .handle_mouse(
+                &layout,
+                WorkspaceMouseEvent {
+                    button: 64,
+                    col: layout.agent.left + 1,
+                    row: layout.agent.top + 1,
+                    pressed: true,
+                },
+            )
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            terminals.refresh_alternate_selection().unwrap();
+            if terminals
+                .alternate_selection
+                .as_ref()
+                .is_some_and(|capture| capture.pending_scroll.is_none())
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            terminals
+                .alternate_selection
+                .as_ref()
+                .is_some_and(|capture| capture.pending_scroll.is_none()),
+            "the same-view cursor update must not consume the pending page capture"
+        );
+        terminals
+            .handle_mouse(
+                &layout,
+                WorkspaceMouseEvent {
+                    button: 32,
+                    col: layout.agent.left + 1,
+                    row: layout.agent.top + 1,
+                    pressed: true,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            terminals.selected_text().as_deref(),
+            Some("line-1\nline-2\nline-3\nline-4\nline-5\nline-6")
+        );
+    }
+
+    #[test]
+    fn alternate_scroll_timeout_releases_a_boundary_and_sends_the_queued_reverse() {
+        let root = tempdir().unwrap();
+        let agent = ManagedTerminal::spawn(
+            &CommandSpec::new("/bin/sh", root.path())
+                .arg("-c")
+                .arg(r"stty raw -echo; printf '\033[?1049hstatic'; dd bs=1 count=2 of=/dev/null 2>/dev/null; sleep 2"),
+            (12, 3),
+        )
+        .unwrap();
+        agent.wait_for_first_output(Duration::from_secs(1));
+        let mut terminals = SessionTerminals {
+            agent: Some(agent),
+            ..SessionTerminals::default()
+        };
+        terminals
+            .begin_selection(PaneTarget::Agent, TerminalCell { row: 0, col: 0 })
+            .unwrap();
+        terminals
+            .queue_alternate_scroll(
+                PaneTarget::Agent,
+                AlternateScrollDirection::Older,
+                b"u".to_vec(),
+            )
+            .unwrap();
+        terminals
+            .queue_alternate_scroll(
+                PaneTarget::Agent,
+                AlternateScrollDirection::Newer,
+                b"d".to_vec(),
+            )
+            .unwrap();
+        terminals
+            .alternate_selection
+            .as_mut()
+            .unwrap()
+            .pending_scroll
+            .as_mut()
+            .unwrap()
+            .started_at = Instant::now() - ALTERNATE_SCROLL_TIMEOUT;
+
+        assert!(terminals.refresh_alternate_selection().unwrap());
+        let capture = terminals.alternate_selection.as_ref().unwrap();
+        assert_eq!(capture.queued_scrolls.len(), 0);
+        assert_eq!(
+            capture
+                .pending_scroll
+                .as_ref()
+                .map(|pending| pending.direction),
+            Some(AlternateScrollDirection::Newer)
+        );
+
+        terminals
+            .alternate_selection
+            .as_mut()
+            .unwrap()
+            .pending_scroll
+            .as_mut()
+            .unwrap()
+            .started_at = Instant::now() - ALTERNATE_SCROLL_TIMEOUT;
+        assert!(terminals.refresh_alternate_selection().unwrap());
+        assert!(
+            terminals
+                .alternate_selection
+                .as_ref()
+                .unwrap()
+                .pending_scroll
+                .is_none()
+        );
+
+        terminals
+            .queue_alternate_scroll(
+                PaneTarget::Agent,
+                AlternateScrollDirection::Older,
+                b"x".to_vec(),
+            )
+            .unwrap();
+        let generation = terminals.agent.as_ref().unwrap().output_generation();
+        let pending = terminals
+            .alternate_selection
+            .as_mut()
+            .unwrap()
+            .pending_scroll
+            .as_mut()
+            .unwrap();
+        pending.started_at = Instant::now() - ALTERNATE_SCROLL_TIMEOUT;
+        pending.candidate = Some(AlternateViewCandidate {
+            generation,
+            stable_since: Instant::now(),
+            view: ScreenView {
+                rows: ["candidate-1", "candidate-2", "candidate-3"]
+                    .map(|line| line.as_bytes().to_vec())
+                    .to_vec(),
+                size: (3, 12),
+                cursor: (0, 0),
+                hide_cursor: false,
+            },
+        });
+        assert!(terminals.refresh_alternate_selection().unwrap());
+        assert!(
+            alternate_row_keys(&terminals.alternate_selection.as_ref().unwrap().rows, 12,)
+                .iter()
+                .any(|row| row == "candidate-1"),
+            "an overall timeout must commit the latest candidate, even before its quiet window"
+        );
+    }
+
+    #[test]
+    fn rapid_alternate_wheels_wait_for_each_repaint() {
+        let root = tempdir().unwrap();
+        let agent = ManagedTerminal::spawn(
+            &CommandSpec::new("/bin/sh", root.path()).arg("-c").arg(
+                r"stty raw -echo; printf '\033[?1049hstatic'; dd bs=1 count=18 of=/dev/null 2>/dev/null; sleep 2",
+            ),
+            (12, 3),
+        )
+        .unwrap();
+        agent.wait_for_first_output(Duration::from_secs(1));
+        let mut terminals = SessionTerminals {
+            agent: Some(agent),
+            ..SessionTerminals::default()
+        };
+        let layout = WorkspaceLayout::new(120, 30, 0, 0);
+        for event in [
+            WorkspaceMouseEvent {
+                button: 0,
+                col: layout.agent.left + 1,
+                row: layout.agent.top + 1,
+                pressed: true,
+            },
+            WorkspaceMouseEvent {
+                button: 64,
+                col: layout.agent.left + 1,
+                row: layout.agent.top + 1,
+                pressed: true,
+            },
+            WorkspaceMouseEvent {
+                button: 64,
+                col: layout.agent.left + 1,
+                row: layout.agent.top + 1,
+                pressed: true,
+            },
+        ] {
+            terminals.handle_mouse(&layout, event).unwrap();
+        }
+        let capture = terminals.alternate_selection.as_ref().unwrap();
+        assert_eq!(capture.queued_scrolls.len(), 1);
+        assert_eq!(
+            capture
+                .pending_scroll
+                .as_ref()
+                .map(|pending| pending.direction),
+            Some(AlternateScrollDirection::Older)
+        );
+        terminals
+            .handle_mouse(
+                &layout,
+                WorkspaceMouseEvent {
+                    button: 0,
+                    col: layout.agent.left + 1,
+                    row: layout.agent.top + 1,
+                    pressed: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            terminals
+                .alternate_selection
+                .as_ref()
+                .unwrap()
+                .queued_scrolls
+                .len(),
+            0,
+            "release must cancel scrolls that have not been sent to the child"
+        );
+        assert!(terminals.pending_alternate_copy.is_some());
+
+        terminals
+            .handle_mouse(
+                &layout,
+                WorkspaceMouseEvent {
+                    button: 65,
+                    col: layout.agent.left + 1,
+                    row: layout.agent.top + 1,
+                    pressed: true,
+                },
+            )
+            .unwrap();
+        let capture = terminals.alternate_selection.as_ref().unwrap();
+        assert_eq!(capture.queued_scrolls.len(), 0);
+        assert_eq!(
+            capture
+                .pending_scroll
+                .as_ref()
+                .map(|pending| pending.direction),
+            Some(AlternateScrollDirection::Older),
+            "paging after release must not change the range waiting to be copied"
+        );
+
+        terminals
+            .handle_mouse(
+                &layout,
+                WorkspaceMouseEvent {
+                    button: 0,
+                    col: layout.agent.left + 2,
+                    row: layout.agent.top + 2,
+                    pressed: true,
+                },
+            )
+            .unwrap();
+        assert!(terminals.pending_alternate_copy.is_some());
+        assert!(
+            terminals
+                .alternate_selection
+                .as_ref()
+                .is_some_and(|capture| capture.pending_scroll.is_some()),
+            "a new click must not cancel a release that is still waiting to copy"
+        );
+
+        let selection = terminals.selection;
+        terminals.pending_alternate_copy = None;
+        terminals
+            .alternate_selection
+            .as_mut()
+            .unwrap()
+            .pending_scroll = None;
+        terminals
+            .handle_mouse(
+                &layout,
+                WorkspaceMouseEvent {
+                    button: 0,
+                    col: layout.agent.left + 2,
+                    row: layout.agent.top + 2,
+                    pressed: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            terminals.selection, selection,
+            "the release paired with a suppressed press must also be ignored"
+        );
+
+        for button in [1, 2] {
+            let generation = terminals.agent.as_ref().unwrap().output_generation();
+            terminals.pending_alternate_copy = Some(PendingAlternateCopy {
+                pane: PaneTarget::Agent,
+                cell: TerminalCell { row: 0, col: 0 },
+            });
+            terminals
+                .alternate_selection
+                .as_mut()
+                .unwrap()
+                .pending_scroll = Some(PendingAlternateScroll {
+                direction: AlternateScrollDirection::Older,
+                generation,
+                started_at: Instant::now(),
+                candidate: None,
+            });
+            terminals
+                .handle_mouse(
+                    &layout,
+                    WorkspaceMouseEvent {
+                        button,
+                        col: layout.agent.left + 1,
+                        row: layout.agent.top + 1,
+                        pressed: true,
+                    },
+                )
+                .unwrap();
+            assert_eq!(terminals.suppressed_mouse_buttons, 1_u8 << button);
+            terminals.pending_alternate_copy = None;
+            terminals
+                .alternate_selection
+                .as_mut()
+                .unwrap()
+                .pending_scroll = None;
+            terminals
+                .handle_mouse(
+                    &layout,
+                    WorkspaceMouseEvent {
+                        button,
+                        col: layout.agent.left + 1,
+                        row: layout.agent.top + 1,
+                        pressed: false,
+                    },
+                )
+                .unwrap();
+            assert_eq!(terminals.suppressed_mouse_buttons, 0);
+        }
+
+        let generation = terminals.agent.as_ref().unwrap().output_generation();
+        terminals.pending_alternate_copy = Some(PendingAlternateCopy {
+            pane: PaneTarget::Agent,
+            cell: TerminalCell { row: 0, col: 0 },
+        });
+        terminals
+            .alternate_selection
+            .as_mut()
+            .unwrap()
+            .pending_scroll = Some(PendingAlternateScroll {
+            direction: AlternateScrollDirection::Older,
+            generation,
+            started_at: Instant::now(),
+            candidate: None,
+        });
+        for button in [2, 0] {
+            terminals
+                .handle_mouse(
+                    &layout,
+                    WorkspaceMouseEvent {
+                        button,
+                        col: layout.agent.left + 1,
+                        row: layout.agent.top + 1,
+                        pressed: true,
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(terminals.suppressed_mouse_buttons, 0b101);
+        terminals.pending_alternate_copy = None;
+        terminals
+            .alternate_selection
+            .as_mut()
+            .unwrap()
+            .pending_scroll = None;
+        for (button, remaining) in [(2, 0b001), (0, 0)] {
+            terminals
+                .handle_mouse(
+                    &layout,
+                    WorkspaceMouseEvent {
+                        button,
+                        col: layout.agent.left + 1,
+                        row: layout.agent.top + 1,
+                        pressed: false,
+                    },
+                )
+                .unwrap();
+            assert_eq!(terminals.suppressed_mouse_buttons, remaining);
+        }
+    }
+
+    #[test]
+    fn alternate_selection_merges_overlapping_repaints_without_duplicates() {
+        let page = |lines: &[&str]| ScreenView {
+            rows: lines.iter().map(|line| line.as_bytes().to_vec()).collect(),
+            size: (3, 8),
+            cursor: (0, 0),
+            hide_cursor: false,
+        };
+        let mut capture =
+            AlternateSelectionBuffer::new(PaneTarget::Agent, page(&["line-3", "line-4", "line-5"]))
+                .unwrap();
+        let mut anchor = capture.cell(TerminalCell { row: 2, col: 5 });
+        assert_eq!(
+            capture.queue_scroll(
+                AlternateScrollRequest {
+                    direction: AlternateScrollDirection::Older,
+                    bytes: Vec::new(),
+                },
+                1,
+            ),
+            Some(Vec::new())
+        );
+        let edit = capture
+            .merge_view(page(&["line-1", "line-2", "line-3"]))
+            .unwrap();
+        anchor.row = edit.old_positions[anchor.row];
+        let oldest = capture.cell(TerminalCell { row: 0, col: 0 });
+
+        assert_eq!(
+            capture.selected_text(anchor, oldest),
+            "line-1\nline-2\nline-3\nline-4\nline-5"
+        );
+
+        assert_eq!(
+            capture.queue_scroll(
+                AlternateScrollRequest {
+                    direction: AlternateScrollDirection::Newer,
+                    bytes: Vec::new(),
+                },
+                2,
+            ),
+            Some(Vec::new())
+        );
+        capture
+            .merge_view(page(&["line-3", "line-4", "line-5"]))
+            .unwrap();
+        assert_eq!(capture.viewport_positions, [2, 3, 4]);
+        assert_eq!(capture.rows.len(), 5);
+
+        assert_eq!(
+            capture.queue_scroll(
+                AlternateScrollRequest {
+                    direction: AlternateScrollDirection::Older,
+                    bytes: Vec::new(),
+                },
+                3,
+            ),
+            Some(Vec::new())
+        );
+        capture
+            .merge_view(page(&["line-1", "line-2", "line-3"]))
+            .unwrap();
+        assert_eq!(capture.viewport_positions, [0, 1, 2]);
+
+        assert_eq!(
+            capture.queue_scroll(
+                AlternateScrollRequest {
+                    direction: AlternateScrollDirection::Newer,
+                    bytes: Vec::new(),
+                },
+                4,
+            ),
+            Some(Vec::new())
+        );
+        capture
+            .merge_view(page(&["line-4", "line-5", "line-6"]))
+            .unwrap();
+        assert_eq!(capture.viewport_positions, [3, 4, 5]);
+        assert_eq!(
+            alternate_row_keys(&capture.rows, capture.cols),
+            ["line-1", "line-2", "line-3", "line-4", "line-5", "line-6"]
+        );
+    }
+
+    #[test]
+    fn alternate_selection_aligns_fixed_chrome_and_distant_captured_rows() {
+        let page = |lines: &[&str]| ScreenView {
+            rows: lines.iter().map(|line| line.as_bytes().to_vec()).collect(),
+            size: (lines.len() as u16, 16),
+            cursor: (0, 0),
+            hide_cursor: false,
+        };
+        let mut capture = AlternateSelectionBuffer::new(
+            PaneTarget::Agent,
+            page(&["HEADER", "line-4", "line-5", "line-6", "STATUS"]),
+        )
+        .unwrap();
+        capture.queue_scroll(
+            AlternateScrollRequest {
+                direction: AlternateScrollDirection::Older,
+                bytes: Vec::new(),
+            },
+            1,
+        );
+        capture
+            .merge_view(page(&["HEADER", "line-1", "line-2", "line-4", "STATUS"]))
+            .unwrap();
+        assert_eq!(
+            alternate_row_keys(&capture.rows, capture.cols),
+            [
+                "HEADER", "line-1", "line-2", "line-4", "line-5", "line-6", "STATUS"
+            ]
+        );
+        assert_eq!(capture.viewport_positions, [0, 1, 2, 3, 6]);
+
+        let mut capture =
+            AlternateSelectionBuffer::new(PaneTarget::Agent, page(&["line-0", "line-1", "line-2"]))
+                .unwrap();
+        capture.rows = (0..9)
+            .map(|line| format!("line-{line}").into_bytes())
+            .collect();
+        capture.viewport_positions = vec![0, 1, 2];
+        capture.queue_scroll(
+            AlternateScrollRequest {
+                direction: AlternateScrollDirection::Newer,
+                bytes: Vec::new(),
+            },
+            2,
+        );
+        capture
+            .merge_view(page(&["line-7", "line-8", "line-9"]))
+            .unwrap();
+        assert_eq!(
+            alternate_row_keys(&capture.rows, capture.cols),
+            (0..10)
+                .map(|line| format!("line-{line}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(capture.viewport_positions, [7, 8, 9]);
+
+        let mut capture =
+            AlternateSelectionBuffer::new(PaneTarget::Agent, page(&["line-7", "line-8", "line-9"]))
+                .unwrap();
+        capture.rows = (1..10)
+            .map(|line| format!("line-{line}").into_bytes())
+            .collect();
+        capture.viewport_positions = vec![6, 7, 8];
+        capture.queue_scroll(
+            AlternateScrollRequest {
+                direction: AlternateScrollDirection::Older,
+                bytes: Vec::new(),
+            },
+            3,
+        );
+        capture
+            .merge_view(page(&["line-0", "line-1", "line-2"]))
+            .unwrap();
+        assert_eq!(
+            alternate_row_keys(&capture.rows, capture.cols),
+            (0..10)
+                .map(|line| format!("line-{line}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(capture.viewport_positions, [0, 1, 2]);
+    }
+
+    #[test]
+    fn alternate_selection_keeps_repeated_content_and_replaces_dynamic_chrome() {
+        let page = |lines: &[&str]| ScreenView {
+            rows: lines.iter().map(|line| line.as_bytes().to_vec()).collect(),
+            size: (lines.len() as u16, 16),
+            cursor: (0, 0),
+            hide_cursor: false,
+        };
+        let merge = |old: &[&str], new: &[&str], direction| {
+            let mut capture = AlternateSelectionBuffer::new(PaneTarget::Agent, page(old)).unwrap();
+            capture.queue_scroll(
+                AlternateScrollRequest {
+                    direction,
+                    bytes: Vec::new(),
+                },
+                1,
+            );
+            capture.merge_view(page(new)).unwrap();
+            alternate_row_keys(&capture.rows, capture.cols)
+        };
+
+        assert_eq!(
+            merge(
+                &["H", "old-1", "", "old-2", "S"],
+                &["H", "new-1", "", "new-2", "S"],
+                AlternateScrollDirection::Older,
+            ),
+            ["H", "new-1", "", "new-2", "old-1", "", "old-2", "S"]
+        );
+        assert_eq!(
+            merge(
+                &["H", "A", "B", "A", "S"],
+                &["H", "A", "B", "C", "S"],
+                AlternateScrollDirection::Newer,
+            ),
+            ["H", "A", "B", "A", "B", "C", "S"]
+        );
+        assert_eq!(
+            merge(
+                &["H", "A", "B", "C", "STATUS-1"],
+                &["H", "X", "Y", "A", "STATUS-2"],
+                AlternateScrollDirection::Older,
+            ),
+            ["H", "X", "Y", "A", "B", "C", "STATUS-2"]
+        );
+        assert_eq!(
+            merge(
+                &["H", "X", "Y", "A", "STATUS-1"],
+                &["H", "A", "B", "C", "STATUS-2"],
+                AlternateScrollDirection::Newer,
+            ),
+            ["H", "X", "Y", "A", "B", "C", "STATUS-2"]
+        );
+        assert_eq!(
+            merge(
+                &["H1", "H2", "line-4", "line-5", "S1", "S2"],
+                &["H1", "H2", "line-2", "line-3", "S1", "S2"],
+                AlternateScrollDirection::Older,
+            ),
+            [
+                "H1", "H2", "line-2", "line-3", "line-4", "line-5", "S1", "S2"
+            ]
+        );
+        assert_eq!(
+            merge(
+                &["H1", "H2", "line-4", "line-5", "line-6", "S1-old", "S2-old",],
+                &["H1", "H2", "line-2", "line-3", "line-4", "S1-new", "S2-new",],
+                AlternateScrollDirection::Older,
+            ),
+            [
+                "H1", "H2", "line-2", "line-3", "line-4", "line-5", "line-6", "S1-new", "S2-new"
+            ]
+        );
+        assert_eq!(
+            merge(
+                &["H1-old", "H2-old", "line-2", "line-3", "line-4", "S1", "S2",],
+                &["H1-new", "H2-new", "line-4", "line-5", "line-6", "S1", "S2",],
+                AlternateScrollDirection::Newer,
+            ),
+            [
+                "H1-new", "H2-new", "line-2", "line-3", "line-4", "line-5", "line-6", "S1", "S2"
+            ]
+        );
+
+        let mut capture = AlternateSelectionBuffer::new(
+            PaneTarget::Agent,
+            page(&["H", "A", "B", "C", "STATUS-1"]),
+        )
+        .unwrap();
+        capture.queue_scroll(
+            AlternateScrollRequest {
+                direction: AlternateScrollDirection::Older,
+                bytes: Vec::new(),
+            },
+            2,
+        );
+        assert!(capture.replace_chrome_update(
+            page(&["H", "A", "B", "C", "STATUS-2"]),
+            AlternateScrollDirection::Older,
+        ));
+        assert!(capture.pending_scroll.is_some());
+        capture
+            .merge_view(page(&["H", "X", "Y", "A", "STATUS-3"]))
+            .unwrap();
+        assert_eq!(
+            alternate_row_keys(&capture.rows, capture.cols),
+            ["H", "X", "Y", "A", "B", "C", "STATUS-3"]
+        );
+
+        let mut capture =
+            AlternateSelectionBuffer::new(PaneTarget::Agent, page(&["H", "A", "B", "C", "S1"]))
+                .unwrap();
+        capture.chrome_prefix = 1;
+        capture.chrome_suffix = 1;
+        let mut anchor = capture.cell(TerminalCell { row: 1, col: 0 });
+        capture.queue_scroll(
+            AlternateScrollRequest {
+                direction: AlternateScrollDirection::Older,
+                bytes: Vec::new(),
+            },
+            3,
+        );
+        assert!(capture.replace_chrome_update(
+            page(&["H", "A", "B", "C", "S2"]),
+            AlternateScrollDirection::Older,
+        ));
+        assert_eq!((capture.chrome_prefix, capture.chrome_suffix), (1, 1));
+        let edit = capture
+            .merge_view(page(&["H", "W", "X", "Y", "S3"]))
+            .unwrap();
+        anchor.row = edit.old_positions[anchor.row];
+        assert_eq!(
+            alternate_row_keys(&capture.rows, capture.cols),
+            ["H", "W", "X", "Y", "A", "B", "C", "S3"]
+        );
+        assert_eq!(
+            selected_row_text(capture.rows.get(anchor.row).map(Vec::as_slice), 16, 0, 0),
+            "A"
+        );
+
+        assert_eq!(
+            merge(
+                &["H1", "H2", "A", "B", "C", "D", "S-old"],
+                &["H1", "H2", "W", "X", "Y", "Z", "S-new"],
+                AlternateScrollDirection::Older,
+            ),
+            [
+                "H1", "H2", "W", "X", "Y", "Z", "S-new", "H1", "H2", "A", "B", "C", "D", "S-old"
+            ],
+            "without overlap evidence, preserving every body row is safer than guessing chrome"
+        );
+    }
+
+    #[test]
+    fn alternate_older_overlap_prefers_the_nearest_captured_occurrence() {
+        let rows = |lines: &[&str]| {
+            lines
+                .iter()
+                .map(|line| line.as_bytes().to_vec())
+                .collect::<Vec<_>>()
+        };
+        let merged = directional_content_merge(
+            &rows(&["A", "B", "Q", "A", "B", "C", "D", "E"]),
+            &[5, 6, 7],
+            &rows(&["Z", "A", "B"]),
+            8,
+            AlternateScrollDirection::Older,
+        );
+
+        assert_eq!(
+            alternate_row_keys(&merged.rows, 8),
+            ["A", "B", "Q", "Z", "A", "B", "C", "D", "E"]
+        );
+        assert_eq!(merged.new_positions, [3, 4, 5]);
+    }
+
+    #[test]
+    fn alternate_selection_serializes_scrolls_and_bounds_captured_rows() {
+        let page = |first: usize| ScreenView {
+            rows: (first..first + 3)
+                .map(|line| format!("line-{line:04}").into_bytes())
+                .collect(),
+            size: (3, 16),
+            cursor: (0, 0),
+            hide_cursor: false,
+        };
+        let mut capture = AlternateSelectionBuffer::new(PaneTarget::Agent, page(1_997)).unwrap();
+        capture.rows = (0..SCROLLBACK_LINES)
+            .map(|line| format!("line-{line:04}").into_bytes())
+            .collect();
+        capture.viewport_rows = page(1_997).rows;
+        capture.viewport_positions = vec![1_997, 1_998, 1_999];
+
+        assert_eq!(
+            capture.queue_scroll(
+                AlternateScrollRequest {
+                    direction: AlternateScrollDirection::Newer,
+                    bytes: b"first".to_vec(),
+                },
+                10,
+            ),
+            Some(b"first".to_vec())
+        );
+        assert_eq!(
+            capture.queue_scroll(
+                AlternateScrollRequest {
+                    direction: AlternateScrollDirection::Newer,
+                    bytes: b"second".to_vec(),
+                },
+                10,
+            ),
+            None
+        );
+
+        let edit = capture.merge_view(page(2_000)).unwrap();
+        assert_eq!(edit.old_positions[0], 0);
+        assert_eq!(capture.rows.len(), SCROLLBACK_LINES);
+        assert_eq!(capture.viewport_positions, [1_997, 1_998, 1_999]);
+        assert_eq!(
+            alternate_row_keys(&capture.rows[..1], capture.cols),
+            ["line-0003"]
+        );
+        assert_eq!(
+            alternate_row_keys(&capture.rows[SCROLLBACK_LINES - 1..], capture.cols),
+            ["line-2002"]
+        );
+        assert_eq!(capture.begin_next_scroll(11), Some(b"second".to_vec()));
+        assert_eq!(capture.queued_scrolls.len(), 0);
+        assert_eq!(
+            capture
+                .pending_scroll
+                .as_ref()
+                .map(|pending| pending.direction),
+            Some(AlternateScrollDirection::Newer)
+        );
+
+        let older = ScreenView {
+            rows: ["older-3", "older-2", "older-1"]
+                .map(|line| line.as_bytes().to_vec())
+                .to_vec(),
+            size: (3, 16),
+            cursor: (0, 0),
+            hide_cursor: false,
+        };
+        let mut capture = AlternateSelectionBuffer::new(PaneTarget::Agent, page(0)).unwrap();
+        capture.rows = (0..SCROLLBACK_LINES)
+            .map(|line| format!("line-{line:04}").into_bytes())
+            .collect();
+        capture.viewport_rows = page(0).rows;
+        capture.viewport_positions = vec![0, 1, 2];
+        capture.queue_scroll(
+            AlternateScrollRequest {
+                direction: AlternateScrollDirection::Older,
+                bytes: Vec::new(),
+            },
+            12,
+        );
+        capture.merge_view(older).unwrap();
+        assert_eq!(capture.rows.len(), SCROLLBACK_LINES);
+        assert_eq!(capture.viewport_positions, [0, 1, 2]);
+        assert_eq!(
+            alternate_row_keys(&capture.rows[..3], capture.cols),
+            ["older-3", "older-2", "older-1"]
+        );
+        assert_eq!(
+            alternate_row_keys(&capture.rows[SCROLLBACK_LINES - 1..], capture.cols),
+            ["line-1996"]
+        );
+
+        let mut capture = AlternateSelectionBuffer::new(PaneTarget::Agent, page(0)).unwrap();
+        for request in 0..ALTERNATE_SCROLL_QUEUE_LIMIT + 10 {
+            capture.queue_scroll(
+                AlternateScrollRequest {
+                    direction: AlternateScrollDirection::Newer,
+                    bytes: vec![request as u8],
+                },
+                20,
+            );
+        }
+        assert_eq!(capture.queued_scrolls.len(), ALTERNATE_SCROLL_QUEUE_LIMIT);
+    }
+
+    #[test]
+    fn alternate_mouse_reporting_selection_captures_the_scrolled_page() {
+        let root = tempdir().unwrap();
+        let agent = ManagedTerminal::spawn(
+            &CommandSpec::new("/bin/sh", root.path()).arg("-c").arg(
+                r"stty raw -echo; \
+                  printf '\033[?1049h\033[?1002h\033[?1006hline-4\r\nline-5\r\nline-6'; \
+                  dd bs=1 count=10 of=/dev/null 2>/dev/null; \
+                  printf '\033[2J\033[Hline-1'; sleep 0.08; \
+                  printf '\r\nline-2\r\nline-3'; sleep 2",
+            ),
+            (12, 3),
+        )
+        .unwrap();
+        agent.wait_for_first_output(Duration::from_secs(1));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while agent.mouse_protocol().0 == vt100::MouseProtocolMode::None
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let mut terminals = SessionTerminals {
+            agent: Some(agent),
+            ..SessionTerminals::default()
+        };
+        let layout = WorkspaceLayout::new(120, 30, 0, 0);
+
+        for event in [
+            WorkspaceMouseEvent {
+                button: 0,
+                col: layout.agent.left + 6,
+                row: layout.agent.top + 3,
+                pressed: true,
+            },
+            WorkspaceMouseEvent {
+                button: 64,
+                col: layout.agent.left + 1,
+                row: layout.agent.top + 1,
+                pressed: true,
+            },
+        ] {
+            terminals.handle_mouse(&layout, event).unwrap();
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            let visible = terminals
+                .agent
+                .as_ref()
+                .unwrap()
+                .screen_view()
+                .rows
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            if String::from_utf8_lossy(&visible).contains("line-1") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        terminals
+            .handle_mouse(
+                &layout,
+                WorkspaceMouseEvent {
+                    button: 32,
+                    col: layout.agent.left + 1,
+                    row: layout.agent.top + 1,
+                    pressed: true,
+                },
+            )
+            .unwrap();
+        terminals
+            .handle_mouse(
+                &layout,
+                WorkspaceMouseEvent {
+                    button: 0,
+                    col: layout.agent.left + 1,
+                    row: layout.agent.top + 1,
+                    pressed: false,
+                },
+            )
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while terminals.pending_alternate_copy.is_some() && Instant::now() < deadline {
+            terminals.refresh_alternate_selection().unwrap();
+            terminals.finish_pending_alternate_copy();
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            terminals.selected_text().as_deref(),
+            Some("line-1\nline-2\nline-3\nline-4\nline-5\nline-6")
         );
     }
 
@@ -5799,6 +8379,45 @@ mod tests {
             String::from_utf8_lossy(&output).contains("\x1b[7mselect\x1b[0m"),
             "selected cells should be visibly highlighted"
         );
+    }
+
+    #[test]
+    fn mouse_click_without_drag_does_not_select_or_copy() {
+        let root = tempdir().unwrap();
+        let agent = ManagedTerminal::spawn(
+            &CommandSpec::new("/bin/sh", root.path())
+                .arg("-c")
+                .arg(r"printf '\033[?1049hclick-me'; sleep 2"),
+            (20, 3),
+        )
+        .unwrap();
+        agent.wait_for_first_output(Duration::from_secs(1));
+        let mut terminals = SessionTerminals {
+            agent: Some(agent),
+            ..SessionTerminals::default()
+        };
+        let layout = WorkspaceLayout::new(120, 30, 0, 0);
+        let click = WorkspaceMouseEvent {
+            button: 0,
+            col: layout.agent.left + 1,
+            row: layout.agent.top + 1,
+            pressed: true,
+        };
+
+        terminals.handle_mouse(&layout, click).unwrap();
+        terminals
+            .handle_mouse(
+                &layout,
+                WorkspaceMouseEvent {
+                    pressed: false,
+                    ..click
+                },
+            )
+            .unwrap();
+
+        assert_eq!(terminals.selection, None);
+        assert_eq!(terminals.selected_text(), None);
+        assert_eq!(terminals.notice, None);
     }
 
     #[test]
@@ -6134,6 +8753,41 @@ mod tests {
     }
 
     #[test]
+    fn workspace_frame_is_synchronized_to_prevent_partial_redraw_flicker() {
+        let terminals = SessionTerminals::default();
+        let chrome = WorkspaceChrome {
+            sessions: vec!["repo  codex".into()],
+            selected: 0,
+            selected_session_key: None,
+            search_query: String::new(),
+            status_counts: (0, 0, 1, 0),
+            preview: vec!["preview".into()],
+            notification: None,
+        };
+        let layout = WorkspaceLayout::new(120, 40, 0, 0);
+        let mut output = Vec::new();
+
+        render_workspace(
+            &mut output,
+            &terminals,
+            &chrome,
+            &layout,
+            WorkspaceFocus::Sessions,
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            output.starts_with(b"\x1b[?2026h"),
+            "the terminal can display a partially rewritten frame without synchronized update mode"
+        );
+        assert!(
+            output.ends_with(b"\x1b[?2026l"),
+            "the synchronized update must end after the complete frame"
+        );
+    }
+
+    #[test]
     fn focused_sidebar_highlights_the_selected_item_instead_of_the_title() {
         let chrome = WorkspaceChrome {
             sessions: vec!["▾ repo".into(), "○ Cdx current task".into()],
@@ -6466,6 +9120,66 @@ mod tests {
         assert!(output.contains("/ search"));
         assert!(output.contains("a alert"));
         assert!(output.contains("? help"));
+    }
+
+    #[test]
+    fn workspace_alert_renders_below_session_shortcut_hints() {
+        let terminals = SessionTerminals::default();
+        let chrome = WorkspaceChrome {
+            sessions: vec!["▾ repo".into(), "○ Cdx inspect session".into()],
+            selected: 1,
+            selected_session_key: None,
+            search_query: String::new(),
+            status_counts: (0, 1, 1, 0),
+            preview: vec!["preview".into()],
+            notification: Some("inspect session: approval needed".into()),
+        };
+        let layout = WorkspaceLayout::new(160, 40, 0, 0);
+        let mut output = Vec::new();
+
+        render_workspace(
+            &mut output,
+            &terminals,
+            &chrome,
+            &layout,
+            WorkspaceFocus::Sessions,
+            false,
+        )
+        .unwrap();
+        let mut parser = vt100::Parser::new(40, 160, 0);
+        parser.process(&output);
+        let rows = parser.screen().rows(0, 160).collect::<Vec<_>>();
+        let shortcuts_row = rows
+            .iter()
+            .position(|row| row.contains("/ search") && row.contains("? help"))
+            .expect("session shortcut hints should stay visible");
+        let alert_row = rows
+            .iter()
+            .position(|row| row.contains("ALERT · inspect session: approval needed"))
+            .expect("alert should be visible");
+
+        assert_eq!(shortcuts_row, rows.len() - 2);
+        assert_eq!(alert_row, rows.len() - 1);
+
+        let chrome = WorkspaceChrome {
+            notification: None,
+            ..chrome
+        };
+        output.clear();
+        render_workspace(
+            &mut output,
+            &terminals,
+            &chrome,
+            &layout,
+            WorkspaceFocus::Sessions,
+            false,
+        )
+        .unwrap();
+        parser.process(&output);
+        let rows = parser.screen().rows(0, 160).collect::<Vec<_>>();
+
+        assert!(rows[rows.len() - 2].contains("/ search"));
+        assert!(rows[rows.len() - 1].trim().is_empty());
     }
 
     #[test]

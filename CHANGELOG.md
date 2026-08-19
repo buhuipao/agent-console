@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.0.16] - 2026-08-07
+
+### Added
+- Add a `make install` target for atomic source-checkout installs.
+
+### Fixed
+- Exclude Codex and Claude Code subagents from session discovery and tracking.
+- Skip injected `AGENTS.md` instructions when choosing a Codex session title.
+- Persist the first real prompt so refreshes and restarts never retitle a session.
+- Derive Codex goal-session titles from the embedded user objective instead of the internal context wrapper.
+- Ignore image-only placeholders and use accompanying or subsequent text for Codex and Claude session titles.
+- Keep Workspace input and rendering responsive while session discovery or Codex metadata reads are slow.
+- Preserve terminal text selections while paging through Codex, Claude, and shell scrollback.
+
+## [0.0.15] - 2026-08-07
+
+### Fixed
+- Keep Workspace shortcut hints visible on their own footer row while an alert is active.
+- Clear alerts when their session recovers or the user opens the affected agent.
+- Preserve first-prompt session titles after transcripts grow beyond the bounded head/tail discovery windows.
+
 ## [0.0.14] - 2026-08-04
 
 ### Fixed

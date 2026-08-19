@@ -221,11 +221,11 @@ most the newest 60 files. Reuse parsed results while file metadata is unchanged.
 Read the first `session_meta.payload` for the transcript's own `id`; fork
 transcripts may contain a later copy of the parent's metadata. Read `cwd` from
 metadata and turn context. Identify a fork subagent from
-`thread_source = "subagent"` or `source.subagent`. Show it only while its latest
-task lifecycle record is `task_started`; remove it from Sessions after
-`task_complete`, `turn_aborted`, or `stream_error`. Read only a bounded tail for
-recent user, agent, tool, and completion records. The transcript format is an
-observation fallback, not a write interface.
+`thread_source = "subagent"` or `source.subagent` and exclude it from Sessions,
+status tracking, and summary generation. Stream complete records until the
+first real user prompt is found, then use only a bounded tail for recent user,
+agent, tool, and completion records. The transcript format is an observation
+fallback, not a write interface.
 
 When the newest `$CODEX_HOME/state_<version>.sqlite` is readable, enrich the
 session with the provider's name, extracted title, first user message, and
@@ -247,18 +247,21 @@ codex -C <cwd>
 ### 7.2 Claude Code
 
 Scan `~/.claude/projects` recursively for top-level UUID `.jsonl` transcript
-files. Ignore `agent-*` subagent transcripts. Sort by modification time
-descending and inspect at most the newest 60 files. Reuse parsed results while
-file metadata is unchanged.
+files. Ignore transcripts below `subagents/`, `agent-*` files, and transcripts
+whose records have `isSidechain = true`; exclude them from Sessions, status
+tracking, and summary generation. Sort by modification time descending and
+inspect at most the newest 60 files. Reuse parsed results while file metadata is
+unchanged.
 
 Ignore claude-mem's internal observer sessions whose cwd is
 `~/.claude-mem/observer-sessions`; they summarize another primary session and
 are not user workspaces.
 
-Read `sessionId`, `cwd`, `gitBranch`, provider/AI/custom titles, first and
-latest prompts, conversation summaries, tags, PR/MR links, user messages,
-assistant messages, and tool results from the bounded transcript head and
-tail.
+Stream complete records to reject any sidechain marker and recover the first
+real user prompt. Read `sessionId`, `cwd`, `gitBranch`, provider/AI/custom
+titles, latest prompts, conversation summaries, tags, PR/MR links, user
+messages, assistant messages, and tool results from the bounded transcript
+head and tail.
 
 Resume command:
 
@@ -587,10 +590,12 @@ the session task and pending decision or failure reason.
 
 The left list is grouped by exact workspace path. Each session row shows its
 provider, status/age, and title. The title is the session's first user prompt,
-falling back to branch or a short session ID. It never follows the latest prompt
-or the rolling summary, so a session keeps one stable identity for its whole
-life and slash commands or shell echoes cannot rename it. The right side begins
-with a full-width selected-session focus
+excluding provider-injected setup records such as `# AGENTS.md instructions`,
+and falls back to branch or a short session ID. It never follows the latest
+prompt or the rolling summary, so a session keeps one stable identity for its
+whole life, including discovery refreshes and application restarts; slash
+commands or shell echoes cannot rename it. The right side begins with a
+full-width selected-session focus
 panel: full title, `NEEDS YOU`/`BLOCKER`/`NOW`/`LAST` priority, next step, and
 full workspace context. Below it is an adaptive session-card grid with no more
 than three cards per row. Card titles stay short (provider/status/age/shells),

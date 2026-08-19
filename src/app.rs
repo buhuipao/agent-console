@@ -3,6 +3,8 @@ use std::{
     fs, io,
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
+    sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
+    thread,
     time::{Duration, Instant, UNIX_EPOCH},
 };
 
@@ -91,6 +93,92 @@ pub struct RuntimeNotification {
     read: bool,
 }
 
+struct DiscoveryWorker {
+    requests: SyncSender<DiscoveryPaths>,
+    results: Receiver<Vec<Session>>,
+    in_flight: bool,
+    stopped: bool,
+}
+
+impl DiscoveryWorker {
+    fn start(cache: DiscoveryCache) -> io::Result<Self> {
+        Self::start_with_runner(cache, discovery::discover_cached)
+    }
+
+    fn start_with_runner<F>(mut cache: DiscoveryCache, runner: F) -> io::Result<Self>
+    where
+        F: Fn(&DiscoveryPaths, &mut DiscoveryCache) -> Vec<Session> + Send + 'static,
+    {
+        let (request_tx, request_rx) = mpsc::sync_channel::<DiscoveryPaths>(1);
+        let (result_tx, result_rx) = mpsc::channel();
+        thread::Builder::new()
+            .name("agent-console-discovery".into())
+            .spawn(move || {
+                while let Ok(paths) = request_rx.recv() {
+                    let sessions = runner(&paths, &mut cache);
+                    if result_tx.send(sessions).is_err() {
+                        break;
+                    }
+                }
+            })?;
+        Ok(Self {
+            requests: request_tx,
+            results: result_rx,
+            in_flight: false,
+            stopped: false,
+        })
+    }
+
+    fn request(&mut self, paths: DiscoveryPaths) -> Result<bool, &'static str> {
+        if self.in_flight || self.stopped {
+            return Ok(false);
+        }
+        match self.requests.try_send(paths) {
+            Ok(()) => {
+                self.in_flight = true;
+                Ok(true)
+            }
+            Err(TrySendError::Full(_)) => Ok(false),
+            Err(TrySendError::Disconnected(_)) => {
+                self.stopped = true;
+                Err("session discovery worker stopped accepting refresh requests")
+            }
+        }
+    }
+
+    fn poll(&mut self) -> Result<Option<Vec<Session>>, &'static str> {
+        if self.stopped {
+            return Ok(None);
+        }
+        match self.results.try_recv() {
+            Ok(sessions) => {
+                self.in_flight = false;
+                Ok(Some(sessions))
+            }
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => {
+                self.in_flight = false;
+                self.stopped = true;
+                Err("session discovery worker stopped unexpectedly")
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn disconnected() -> Self {
+        let (requests, request_rx) = mpsc::sync_channel(1);
+        drop(request_rx);
+        let (result_tx, results) = mpsc::channel();
+        drop(result_tx);
+        Self {
+            requests,
+            results,
+            in_flight: false,
+            stopped: false,
+        }
+    }
+}
+
 pub struct RuntimeState {
     pub sessions: Vec<Session>,
     pub selected: usize,
@@ -98,7 +186,7 @@ pub struct RuntimeState {
     pub banner: Option<String>,
     pub summary_busy: Option<String>,
     discovery_paths: DiscoveryPaths,
-    discovery_cache: DiscoveryCache,
+    discovery_worker: DiscoveryWorker,
     last_discovery: Instant,
     last_event_refresh: Instant,
     changed_at: HashMap<String, Instant>,
@@ -160,6 +248,7 @@ impl App {
         )?;
         let mut discovery_cache = DiscoveryCache::default();
         let mut sessions = discovery::discover_cached(&discovery_paths, &mut discovery_cache);
+        let discovery_worker = DiscoveryWorker::start(discovery_cache)?;
         for session in &mut sessions {
             store.apply(session);
             apply_event_inbox(&mut event_index, &store.events_dir(), session);
@@ -181,7 +270,7 @@ impl App {
                 banner: warning,
                 summary_busy: None,
                 discovery_paths,
-                discovery_cache,
+                discovery_worker,
                 last_discovery: Instant::now(),
                 last_event_refresh: Instant::now(),
                 changed_at: HashMap::new(),
@@ -737,10 +826,13 @@ impl App {
 
     fn activate_workspace_agent(&mut self, current_exe: &Path) -> io::Result<Session> {
         let session = self.prepare_selected_view(current_exe)?;
-        if self.terminals.agent_alive(&session.key) {
-            return Ok(session);
-        }
-        self.prepare_selected_agent(current_exe)
+        let session = if self.terminals.agent_alive(&session.key) {
+            session
+        } else {
+            self.prepare_selected_agent(current_exe)?
+        };
+        self.runtime.mark_notifications_read(&session.key);
+        Ok(session)
     }
 
     fn prepare_selected_view(&mut self, current_exe: &Path) -> io::Result<Session> {
@@ -765,10 +857,14 @@ impl App {
                 .iter()
                 .find(|session| &session.key == key)
             {
-                self.runtime.store.set_managed_transcript_fingerprint(
-                    key,
-                    Some(session.transcript_fingerprint.clone()),
-                );
+                let fingerprint = session
+                    .transcript_path
+                    .as_deref()
+                    .and_then(discovery::transcript_fingerprint)
+                    .unwrap_or_else(|| session.transcript_fingerprint.clone());
+                self.runtime
+                    .store
+                    .set_managed_transcript_fingerprint(key, Some(fingerprint));
             }
         }
         self.runtime.store.save_incremental()
@@ -834,9 +930,10 @@ impl App {
             .alive_keys()
             .into_iter()
             .collect::<HashSet<_>>();
-        for (old_key, new_key) in self.runtime.refresh_now(&alive) {
+        for (old_key, new_key) in self.runtime.poll_discovery(&alive) {
             self.terminals.rekey(&old_key, new_key);
         }
+        self.runtime.request_discovery();
     }
 
     pub fn shutdown(&mut self) -> io::Result<()> {
@@ -858,11 +955,10 @@ impl RuntimeState {
     fn tick(&mut self, alive: &HashSet<String>) -> Vec<(String, String)> {
         self.tick_count = self.tick_count.wrapping_add(1);
         self.collect_summary_results();
-        let rekeys = if self.last_discovery.elapsed() >= DISCOVERY_INTERVAL {
-            self.refresh_now(alive)
-        } else {
-            Vec::new()
-        };
+        let rekeys = self.poll_discovery(alive);
+        if !self.discovery_worker.stopped && self.last_discovery.elapsed() >= DISCOVERY_INTERVAL {
+            self.request_discovery();
+        }
         if self.last_event_refresh.elapsed() >= EVENT_REFRESH_INTERVAL {
             self.refresh_event_state();
             self.observe_changes();
@@ -873,7 +969,42 @@ impl RuntimeState {
         rekeys
     }
 
+    fn request_discovery(&mut self) {
+        if let Err(error) = self.discovery_worker.request(self.discovery_paths.clone()) {
+            self.report_discovery_failure(error);
+        }
+    }
+
+    fn poll_discovery(&mut self, alive: &HashSet<String>) -> Vec<(String, String)> {
+        match self.discovery_worker.poll() {
+            Ok(Some(discovered)) => self.apply_discovered(discovered, alive),
+            Ok(None) => Vec::new(),
+            Err(error) => {
+                self.report_discovery_failure(error);
+                Vec::new()
+            }
+        }
+    }
+
+    fn report_discovery_failure(&mut self, error: &str) {
+        diagnostics::record(error);
+        self.banner = Some(format!(
+            "DISCOVERY STOPPED · {error} · restart Agent Console"
+        ));
+    }
+
+    #[cfg(test)]
     fn refresh_now(&mut self, alive: &HashSet<String>) -> Vec<(String, String)> {
+        let mut cache = DiscoveryCache::default();
+        let discovered = discovery::discover_cached(&self.discovery_paths, &mut cache);
+        self.apply_discovered(discovered, alive)
+    }
+
+    fn apply_discovered(
+        &mut self,
+        mut discovered: Vec<Session>,
+        alive: &HashSet<String>,
+    ) -> Vec<(String, String)> {
         let mut selected_key = self
             .sessions
             .get(self.selected)
@@ -883,9 +1014,6 @@ impl RuntimeState {
             .drain(..)
             .map(|session| (session.key.clone(), session))
             .collect::<HashMap<_, _>>();
-        let discovery_paths = self.discovery_paths.clone();
-        let mut discovered =
-            discovery::discover_cached(&discovery_paths, &mut self.discovery_cache);
         let now = Instant::now();
         let mut old = old;
         let mut effective_alive = alive.clone();
@@ -939,6 +1067,9 @@ impl RuntimeState {
             if let Some(previous) = old.remove(&session.key) {
                 let changed = previous.transcript_fingerprint != session.transcript_fingerprint;
                 let discovered_task = std::mem::take(&mut session.summary.task);
+                if previous.first_prompt.is_some() {
+                    session.first_prompt.clone_from(&previous.first_prompt);
+                }
                 session.summary = previous.summary;
                 // Caches written before provider command wrappers were filtered
                 // still carry one as the task; the parsed prompt wins over it.
@@ -1183,15 +1314,23 @@ impl RuntimeState {
             search_query: self.filter.query.clone(),
             status_counts: session_status_counts(&self.sessions),
             preview,
-            notification: self.active_notification().map(|notification| {
-                let title = self
-                    .sessions
-                    .iter()
-                    .find(|session| session.key == notification.session_key)
-                    .map(|session| self.session_title(session))
-                    .unwrap_or_else(|| "session".into());
-                format!("{title}: {}", notification.message)
-            }),
+            notification: self
+                .active_notification()
+                .map(|notification| {
+                    let title = self
+                        .sessions
+                        .iter()
+                        .find(|session| session.key == notification.session_key)
+                        .map(|session| self.session_title(session))
+                        .unwrap_or_else(|| "session".into());
+                    format!("{title}: {}", notification.message)
+                })
+                .or_else(|| {
+                    self.banner
+                        .as_deref()
+                        .filter(|banner| banner.starts_with("DISCOVERY STOPPED"))
+                        .map(str::to_owned)
+                }),
         }
     }
 
@@ -1230,6 +1369,9 @@ impl RuntimeState {
         for (key, status, message) in current {
             let previous = self.observed_statuses.insert(key.clone(), status);
             let critical = matches!(status, SessionStatus::Waiting | SessionStatus::Failed);
+            if !critical {
+                self.mark_notifications_read(&key);
+            }
             if previous.is_some_and(|previous| previous != status)
                 && critical
                 && selected_key.as_deref() != Some(&key)
@@ -1282,6 +1424,14 @@ impl RuntimeState {
         self.filter = SessionFilter::default();
         notification.read = true;
         true
+    }
+
+    fn mark_notifications_read(&mut self, session_key: &str) {
+        for notification in &mut self.notifications {
+            if notification.session_key == session_key {
+                notification.read = true;
+            }
+        }
     }
 
     fn refresh_event_state(&mut self) {
@@ -1631,7 +1781,7 @@ impl App {
                     codex_sessions: root.join("codex"),
                     claude_projects: root.join("claude"),
                 },
-                discovery_cache: DiscoveryCache::default(),
+                discovery_worker: DiscoveryWorker::start(DiscoveryCache::default()).unwrap(),
                 last_discovery: Instant::now(),
                 last_event_refresh: Instant::now(),
                 changed_at: HashMap::new(),
@@ -1763,7 +1913,7 @@ mod tests {
                     codex_sessions: codex,
                     claude_projects: claude,
                 },
-                discovery_cache: DiscoveryCache::default(),
+                discovery_worker: DiscoveryWorker::start(DiscoveryCache::default()).unwrap(),
                 last_discovery: Instant::now(),
                 last_event_refresh: Instant::now(),
                 changed_at: HashMap::new(),
@@ -1793,6 +1943,97 @@ mod tests {
         // Provisional sessions are retained by refresh.
         app.refresh_now();
         assert_eq!(app.selected_session().unwrap().key, "codex:two");
+    }
+
+    #[test]
+    fn periodic_discovery_does_not_block_tick_or_queue_duplicate_scans() {
+        let mut app = App::test_fixture();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        app.runtime.discovery_worker =
+            DiscoveryWorker::start_with_runner(DiscoveryCache::default(), move |_, _| {
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                finished_tx.send(()).unwrap();
+                Vec::new()
+            })
+            .unwrap();
+        app.runtime.last_discovery = Instant::now() - DISCOVERY_INTERVAL;
+
+        let started_at = Instant::now();
+        app.runtime.tick(&HashSet::new());
+        assert!(
+            started_at.elapsed() < Duration::from_millis(500),
+            "the UI tick must only enqueue discovery"
+        );
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        for _ in 0..3 {
+            let started_at = Instant::now();
+            app.runtime.tick(&HashSet::new());
+            assert!(
+                started_at.elapsed() < Duration::from_millis(500),
+                "an in-flight scan must not block or accept a duplicate"
+            );
+        }
+        assert!(started_rx.try_recv().is_err());
+
+        release_tx.send(()).unwrap();
+        finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while app.runtime.discovery_worker.in_flight && Instant::now() < deadline {
+            app.runtime.tick(&HashSet::new());
+            thread::yield_now();
+        }
+        assert!(!app.runtime.discovery_worker.in_flight);
+        assert!(started_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_stopped_discovery_worker_is_reported_to_the_user() {
+        let mut app = App::test_fixture();
+        app.runtime.discovery_worker = DiscoveryWorker::disconnected();
+
+        app.runtime.tick(&HashSet::new());
+
+        assert!(app.runtime.discovery_worker.stopped);
+        assert!(
+            app.runtime
+                .banner
+                .as_deref()
+                .is_some_and(|banner| banner.contains("DISCOVERY STOPPED")),
+            "background discovery failure should be visible: {:?}",
+            app.runtime.banner
+        );
+        assert!(
+            app.runtime
+                .workspace_chrome()
+                .notification
+                .as_deref()
+                .is_some_and(|notice| notice.contains("DISCOVERY STOPPED"))
+        );
+    }
+
+    #[test]
+    fn finishing_workspace_records_the_current_transcript_metadata_without_scanning() {
+        let root = tempdir().unwrap();
+        let transcript_path = root.path().join("rollout-finished.jsonl");
+        fs::write(&transcript_path, b"new transcript bytes").unwrap();
+        let expected = discovery::transcript_fingerprint(&transcript_path).unwrap();
+        let mut app = App::test_fixture();
+        app.runtime.sessions[0].transcript_path = Some(transcript_path);
+        app.runtime.sessions[0].transcript_fingerprint = "stale-in-memory".into();
+
+        app.finish_workspace(&HashSet::from(["codex:test".to_owned()]))
+            .unwrap();
+
+        assert_eq!(
+            app.runtime
+                .store
+                .managed_transcript_fingerprint("codex:test"),
+            Some(expected.as_str())
+        );
     }
 
     #[test]
@@ -1959,6 +2200,32 @@ mod tests {
             app.runtime.active_notification().unwrap().message,
             "Integration test failed"
         );
+    }
+
+    #[test]
+    fn background_notification_clears_when_the_session_recovers_or_is_opened() {
+        let mut app = App::test_fixture();
+        let mut background = fixture_session("codex:background");
+        background.status = SessionStatus::Idle;
+        app.sessions.push(background);
+        app.runtime.capture_notifications();
+
+        app.sessions[1].status = SessionStatus::Waiting;
+        app.runtime.capture_notifications();
+        assert_eq!(app.runtime.unread_notification_count(), 1);
+
+        app.sessions[1].status = SessionStatus::Working;
+        app.runtime.capture_notifications();
+
+        assert_eq!(app.runtime.unread_notification_count(), 0);
+        assert!(app.runtime.active_notification().is_none());
+
+        app.sessions[1].status = SessionStatus::Waiting;
+        app.runtime.capture_notifications();
+        assert_eq!(app.runtime.unread_notification_count(), 1);
+
+        app.runtime.mark_notifications_read("codex:background");
+        assert_eq!(app.runtime.unread_notification_count(), 0);
     }
 
     #[test]
@@ -2312,6 +2579,39 @@ mod tests {
             app.session_title(&app.runtime.sessions[0]),
             "Implement signed releases",
             "the parsed prompt must replace the provisional session-id title"
+        );
+    }
+
+    #[test]
+    fn refresh_never_replaces_a_known_first_prompt() {
+        let root = tempdir().unwrap();
+        let codex_sessions = root.path().join("codex");
+        fs::create_dir_all(&codex_sessions).unwrap();
+        fs::write(
+            codex_sessions.join("rollout-known-title.jsonl"),
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"known-title\",\"cwd\":\"/tmp\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"A later prompt must not replace the title\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let mut app = App::test_fixture();
+        let mut previous = fixture_session("codex:known-title");
+        previous.first_prompt = Some("Keep this stable title".into());
+        previous.transcript_fingerprint = "stale".into();
+        app.runtime.sessions = vec![previous];
+        app.runtime.selected = 0;
+        app.runtime.discovery_paths = DiscoveryPaths {
+            codex_sessions,
+            claude_projects: root.path().join("claude"),
+        };
+
+        app.runtime.refresh_now(&HashSet::new());
+
+        assert_eq!(
+            app.runtime.sessions[0].first_prompt.as_deref(),
+            Some("Keep this stable title")
         );
     }
 

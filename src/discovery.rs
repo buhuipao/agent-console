@@ -1,9 +1,9 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     env, fs,
-    io::{self, Read, Seek, SeekFrom},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    time::UNIX_EPOCH,
+    time::{Duration, UNIX_EPOCH},
 };
 
 use rusqlite::{Connection, OpenFlags};
@@ -29,13 +29,28 @@ pub struct DiscoveryPaths {
 
 #[derive(Default)]
 pub struct DiscoveryCache {
-    entries: HashMap<PathBuf, (String, Session)>,
+    entries: HashMap<PathBuf, (String, Option<Session>)>,
+    codex_threads: Option<CodexThreadCache>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct CodexThreadMetadata {
     name: Option<String>,
     search_terms: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FileFingerprint {
+    modified_nanos: u128,
+    len: u64,
+}
+
+#[derive(Clone)]
+struct CodexThreadCache {
+    database_path: PathBuf,
+    database_fingerprint: Option<FileFingerprint>,
+    wal_fingerprint: Option<FileFingerprint>,
+    metadata: HashMap<String, CodexThreadMetadata>,
 }
 
 impl DiscoveryPaths {
@@ -72,7 +87,7 @@ pub fn discover_cached(paths: &DiscoveryPaths, cache: &mut DiscoveryCache) -> Ve
         seen.extend(files.iter().cloned());
         let mut parsed = parse_cached_files(files, adapter, cache);
         if let Some(enrich) = adapter.enrich {
-            enrich(root, &mut parsed);
+            enrich(root, &mut parsed, cache);
         }
         sessions.extend(parsed);
     }
@@ -92,8 +107,12 @@ pub fn discover_cached(paths: &DiscoveryPaths, cache: &mut DiscoveryCache) -> Ve
 /// Apply the optional Codex thread database over parsed Codex sessions. The
 /// database is read-only enrichment; an absent or incompatible one must not
 /// hide transcript sessions.
-pub(crate) fn enrich_codex(sessions_root: &Path, sessions: &mut [Session]) {
-    let metadata = load_codex_thread_metadata(sessions_root);
+pub(crate) fn enrich_codex(
+    sessions_root: &Path,
+    sessions: &mut [Session],
+    cache: &mut DiscoveryCache,
+) {
+    let metadata = load_codex_thread_metadata(sessions_root, cache);
     if metadata.is_empty() {
         return;
     }
@@ -114,7 +133,10 @@ pub(crate) fn enrich_codex(sessions_root: &Path, sessions: &mut [Session]) {
     }
 }
 
-fn load_codex_thread_metadata(sessions_root: &Path) -> HashMap<String, CodexThreadMetadata> {
+fn load_codex_thread_metadata(
+    sessions_root: &Path,
+    cache: &mut DiscoveryCache,
+) -> HashMap<String, CodexThreadMetadata> {
     let Some(codex_home) = sessions_root.parent() else {
         return HashMap::new();
     };
@@ -136,19 +158,49 @@ fn load_codex_thread_metadata(sessions_root: &Path) -> HashMap<String, CodexThre
         .max_by_key(|(version, _)| *version)
         .map(|(_, path)| path)
     else {
-        return HashMap::new();
+        return cache
+            .codex_threads
+            .as_ref()
+            .map(|cached| cached.metadata.clone())
+            .unwrap_or_default();
     };
-    let Ok(connection) =
-        Connection::open_with_flags(database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-    else {
-        return HashMap::new();
-    };
-    let Ok(mut statement) =
-        connection.prepare("SELECT id, name, title, first_user_message, preview FROM threads")
-    else {
-        return HashMap::new();
-    };
-    let Ok(rows) = statement.query_map([], |row| {
+    let database_fingerprint = file_fingerprint(&database_path);
+    let wal_fingerprint = file_fingerprint(&database_path.with_extension("sqlite-wal"));
+    if let Some(cached) = cache.codex_threads.as_ref()
+        && cached.database_path == database_path
+        && cached.database_fingerprint == database_fingerprint
+        && cached.wal_fingerprint == wal_fingerprint
+    {
+        return cached.metadata.clone();
+    }
+
+    let loaded = query_codex_thread_metadata(&database_path);
+    match loaded {
+        Ok(metadata) => {
+            cache.codex_threads = Some(CodexThreadCache {
+                database_path,
+                database_fingerprint,
+                wal_fingerprint,
+                metadata: metadata.clone(),
+            });
+            metadata
+        }
+        Err(_) => cache
+            .codex_threads
+            .as_ref()
+            .map(|cached| cached.metadata.clone())
+            .unwrap_or_default(),
+    }
+}
+
+fn query_codex_thread_metadata(
+    database_path: &Path,
+) -> rusqlite::Result<HashMap<String, CodexThreadMetadata>> {
+    let connection = Connection::open_with_flags(database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    connection.busy_timeout(Duration::from_millis(25))?;
+    let mut statement =
+        connection.prepare("SELECT id, name, title, first_user_message, preview FROM threads")?;
+    let rows = statement.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, Option<String>>(1)?,
@@ -156,10 +208,10 @@ fn load_codex_thread_metadata(sessions_root: &Path) -> HashMap<String, CodexThre
             row.get::<_, Option<String>>(3)?,
             row.get::<_, Option<String>>(4)?,
         ))
-    }) else {
-        return HashMap::new();
-    };
-    rows.flatten()
+    })?;
+    let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows
+        .into_iter()
         .map(|(id, name, title, first_prompt, preview)| {
             let mut metadata = CodexThreadMetadata {
                 name,
@@ -173,7 +225,7 @@ fn load_codex_thread_metadata(sessions_root: &Path) -> HashMap<String, CodexThre
             }
             (id, metadata)
         })
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
@@ -181,7 +233,7 @@ fn discover_codex(root: &Path) -> Vec<Session> {
     let adapter = providers::adapter(AgentKind::Codex);
     provider_files(root, adapter.accepts)
         .into_iter()
-        .filter_map(|path| (adapter.parse)(&path).ok().flatten())
+        .filter_map(|path| (adapter.parse)(&path, None).ok().flatten())
         .collect()
 }
 
@@ -201,20 +253,30 @@ fn parse_cached_files(
     files
         .into_iter()
         .filter_map(|path| {
-            let fingerprint = metadata_fingerprint(&path)?;
+            let fingerprint = transcript_fingerprint(&path)?;
             if let Some((cached_fingerprint, session)) = cache.entries.get(&path)
                 && cached_fingerprint == &fingerprint
             {
-                return Some(session.clone());
+                return session.clone();
             }
-            let parsed = (adapter.parse)(&path).ok().flatten()?;
+            let cached_prompt = cache
+                .entries
+                .get(&path)
+                .and_then(|(_, session)| session.as_ref())
+                .and_then(|session| {
+                    session
+                        .first_prompt
+                        .as_deref()
+                        .map(|prompt| (session.provider_session_id.as_str(), prompt))
+                });
+            let parsed = (adapter.parse)(&path, cached_prompt).ok()?;
             cache.entries.insert(path, (fingerprint, parsed.clone()));
-            Some(parsed)
+            parsed
         })
         .collect()
 }
 
-fn metadata_fingerprint(path: &Path) -> Option<String> {
+pub(crate) fn transcript_fingerprint(path: &Path) -> Option<String> {
     let metadata = fs::metadata(path).ok()?;
     let modified = metadata
         .modified()
@@ -223,6 +285,20 @@ fn metadata_fingerprint(path: &Path) -> Option<String> {
         .ok()?
         .as_secs();
     Some(format!("{modified}:{}", metadata.len()))
+}
+
+fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified_nanos = metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some(FileFingerprint {
+        modified_nanos,
+        len: metadata.len(),
+    })
 }
 
 fn collect_files(root: &Path, accept: &impl Fn(&Path) -> bool, output: &mut Vec<PathBuf>) {
@@ -242,7 +318,15 @@ fn collect_files(root: &Path, accept: &impl Fn(&Path) -> bool, output: &mut Vec<
     }
 }
 
+#[cfg(test)]
 pub(crate) fn parse_codex(path: &Path) -> io::Result<Option<Session>> {
+    parse_codex_with_cached_prompt(path, None)
+}
+
+pub(crate) fn parse_codex_with_cached_prompt(
+    path: &Path,
+    cached_prompt: Option<(&str, &str)>,
+) -> io::Result<Option<Session>> {
     let (lines, fingerprint, modified_at) = bounded_jsonl(path)?;
     let mut id = None;
     let mut cwd = None;
@@ -253,8 +337,6 @@ pub(crate) fn parse_codex(path: &Path) -> io::Result<Option<Session>> {
     let mut task = String::new();
     let mut activity = VecDeque::new();
     let mut failed = false;
-    let mut is_subagent = false;
-    let mut subagent_running = None;
 
     for line in lines {
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
@@ -267,12 +349,15 @@ pub(crate) fn parse_codex(path: &Path) -> io::Result<Option<Session>> {
         if record_type == "session_meta" {
             if id.is_none() {
                 id = raw_string_field(payload, "id");
-                is_subagent = payload.get("thread_source").and_then(Value::as_str)
+                let is_subagent = payload.get("thread_source").and_then(Value::as_str)
                     == Some("subagent")
                     || payload
                         .get("source")
                         .and_then(|source| source.get("subagent"))
                         .is_some();
+                if is_subagent {
+                    return Ok(None);
+                }
             }
             provider_name = raw_string_field(payload, "name").or(provider_name);
             for field in ["title", "first_user_message", "preview"] {
@@ -288,8 +373,8 @@ pub(crate) fn parse_codex(path: &Path) -> io::Result<Option<Session>> {
 
         match (record_type, payload_type) {
             ("event_msg", "user_message") => {
-                if let Some(text) = string_field(payload, "message")
-                    && !is_internal_context(&text)
+                if let Some(text) =
+                    string_field(payload, "message").and_then(|text| user_prompt_text(&text))
                 {
                     first_prompt.get_or_insert_with(|| text.clone());
                     task.clone_from(&text);
@@ -302,23 +387,14 @@ pub(crate) fn parse_codex(path: &Path) -> io::Result<Option<Session>> {
                 }
             }
             ("event_msg", "task_started") => {
-                if is_subagent {
-                    subagent_running = Some(true);
-                }
                 push_activity(&mut activity, "Turn started".to_owned());
             }
             ("event_msg", "task_complete") => {
-                if is_subagent {
-                    subagent_running = Some(false);
-                }
                 if let Some(text) = string_field(payload, "last_agent_message") {
                     push_activity(&mut activity, format!("Agent: {text}"));
                 }
             }
             ("event_msg", "turn_aborted") | ("event_msg", "stream_error") => {
-                if is_subagent {
-                    subagent_running = Some(false);
-                }
                 failed = true;
                 push_activity(&mut activity, "Turn failed".to_owned());
             }
@@ -330,7 +406,7 @@ pub(crate) fn parse_codex(path: &Path) -> io::Result<Option<Session>> {
                     .unwrap_or("agent");
                 if !text.is_empty() {
                     if role == "user" {
-                        if !is_internal_context(&text) {
+                        if let Some(text) = user_prompt_text(&text) {
                             first_prompt.get_or_insert_with(|| text.clone());
                             task.clone_from(&text);
                             push_activity(&mut activity, format!("You: {text}"));
@@ -357,8 +433,12 @@ pub(crate) fn parse_codex(path: &Path) -> io::Result<Option<Session>> {
     let (Some(id), Some(cwd)) = (id, cwd) else {
         return Ok(None);
     };
-    if is_subagent && subagent_running != Some(true) {
-        return Ok(None);
+    if let Some((_, prompt)) =
+        cached_prompt.filter(|(provider_session_id, _)| *provider_session_id == id)
+    {
+        first_prompt = Some(prompt.to_owned());
+    } else if let Some(prompt) = first_prompt_in_jsonl(path, codex_prompt_from_record)? {
+        first_prompt = Some(prompt);
     }
     if let Some(value) = provider_name.clone() {
         push_search_term(&mut search_terms, value);
@@ -407,7 +487,19 @@ pub(crate) fn parse_codex(path: &Path) -> io::Result<Option<Session>> {
     }))
 }
 
+#[cfg(test)]
 pub(crate) fn parse_claude(path: &Path) -> io::Result<Option<Session>> {
+    parse_claude_with_cached_prompt(path, None)
+}
+
+pub(crate) fn parse_claude_with_cached_prompt(
+    path: &Path,
+    cached_prompt: Option<(&str, &str)>,
+) -> io::Result<Option<Session>> {
+    let (scanned_first_prompt, is_sidechain) = scan_claude_identity(path)?;
+    if is_sidechain {
+        return Ok(None);
+    }
     let (lines, fingerprint, modified_at) = bounded_jsonl(path)?;
     let mut id = path
         .file_stem()
@@ -473,15 +565,13 @@ pub(crate) fn parse_claude(path: &Path) -> io::Result<Option<Session>> {
                 .and_then(Value::as_array)
                 .is_some_and(|items| item_type_present(items, "tool_result"));
             let tools = tool_names(content);
-            if record_type == "user"
-                && !has_tool_result
-                && !text.is_empty()
-                && !is_internal_context(&text)
-            {
-                first_prompt.get_or_insert_with(|| text.clone());
-                latest_prompt = Some(text.clone());
-                task.clone_from(&text);
-                push_activity(&mut activity, format!("You: {text}"));
+            if record_type == "user" && !has_tool_result && !text.is_empty() {
+                if let Some(text) = user_prompt_text(&text) {
+                    first_prompt.get_or_insert_with(|| text.clone());
+                    latest_prompt = Some(text.clone());
+                    task.clone_from(&text);
+                    push_activity(&mut activity, format!("You: {text}"));
+                }
             } else if record_type == "assistant" && !text.is_empty() {
                 push_activity(&mut activity, format!("Agent: {text}"));
             } else if has_tool_result && !text.is_empty() {
@@ -505,6 +595,13 @@ pub(crate) fn parse_claude(path: &Path) -> io::Result<Option<Session>> {
     };
     if is_claude_mem_observer(&cwd) {
         return Ok(None);
+    }
+    if let Some((_, prompt)) =
+        cached_prompt.filter(|(provider_session_id, _)| *provider_session_id == id)
+    {
+        first_prompt = Some(prompt.to_owned());
+    } else if let Some(prompt) = scanned_first_prompt {
+        first_prompt = Some(prompt);
     }
     let mut search_terms = Vec::new();
     for term in [
@@ -608,6 +705,88 @@ fn bounded_jsonl(path: &Path) -> io::Result<(Vec<String>, String, u64)> {
     Ok((lines, fingerprint, modified_at))
 }
 
+fn first_prompt_in_jsonl(
+    path: &Path,
+    extract: fn(&Value) -> Option<String>,
+) -> io::Result<Option<String>> {
+    let file = fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        if !line.ends_with(b"\n") {
+            break;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        if let Some(prompt) = extract(&value) {
+            return Ok(Some(prompt));
+        }
+    }
+    Ok(None)
+}
+
+fn scan_claude_identity(path: &Path) -> io::Result<(Option<String>, bool)> {
+    let file = fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut first_prompt = None;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        if !line.ends_with(b"\n") {
+            break;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            return Ok((None, true));
+        }
+        if first_prompt.is_none() {
+            first_prompt = claude_prompt_from_record(&value);
+        }
+    }
+    Ok((first_prompt, false))
+}
+
+fn codex_prompt_from_record(value: &Value) -> Option<String> {
+    let record_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+    let payload = value.get("payload").unwrap_or(&Value::Null);
+    let payload_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
+    let text = match (record_type, payload_type) {
+        ("event_msg", "user_message") => string_field(payload, "message"),
+        ("response_item", "message")
+            if payload.get("role").and_then(Value::as_str) == Some("user") =>
+        {
+            let text = content_text(payload.get("content"));
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }?;
+    user_prompt_text(&text)
+}
+
+fn claude_prompt_from_record(value: &Value) -> Option<String> {
+    if value.get("type").and_then(Value::as_str) != Some("user") {
+        return None;
+    }
+    let content = value.get("message")?.get("content");
+    let has_tool_result = content
+        .and_then(Value::as_array)
+        .is_some_and(|items| item_type_present(items, "tool_result"));
+    let text = content_text(content);
+    (!has_tool_result)
+        .then(|| user_prompt_text(&text))
+        .flatten()
+}
+
 fn file_modified(path: &Path) -> u64 {
     fs::metadata(path)
         .and_then(|metadata| metadata.modified())
@@ -686,32 +865,90 @@ fn clean_text(value: &str) -> String {
     output
 }
 
+fn user_prompt_text(value: &str) -> Option<String> {
+    if let Some(objective) = codex_goal_objective(value) {
+        return Some(objective);
+    }
+    if is_internal_context(value) {
+        return None;
+    }
+    let text = strip_image_attachments(value);
+    (!text.is_empty() && !is_internal_context(&text)).then_some(text)
+}
+
+fn codex_goal_objective(value: &str) -> Option<String> {
+    let value = value.trim_start();
+    if !value.starts_with("<codex_internal_context") {
+        return None;
+    }
+    let opening_end = value.find('>')?;
+    let opening = &value[..=opening_end];
+    if !opening.contains("source=\"goal\"") && !opening.contains("source='goal'") {
+        return None;
+    }
+    let objective = value
+        .split_once("<objective>")?
+        .1
+        .split("</objective>")
+        .next()
+        .unwrap_or_default();
+    let objective = strip_image_attachments(objective);
+    (!objective.is_empty()).then_some(objective)
+}
+
+fn strip_image_attachments(value: &str) -> String {
+    let mut text = value.to_owned();
+    while let Some(start) = text.find("<image") {
+        let Some(open_end) = text[start..].find('>').map(|offset| start + offset) else {
+            break;
+        };
+        let end = text[open_end + 1..]
+            .find("</image>")
+            .map_or(open_end + 1, |offset| {
+                open_end + 1 + offset + "</image>".len()
+            });
+        text.replace_range(start..end, " ");
+    }
+    text = text.replace("</image>", " ");
+    while let Some(start) = text.find("[Image #") {
+        let Some(end) = text[start..].find(']').map(|offset| start + offset + 1) else {
+            break;
+        };
+        text.replace_range(start..end, " ");
+    }
+    clean_text(&text)
+}
+
 pub(crate) fn is_internal_context(value: &str) -> bool {
     let value = value.trim_start();
-    [
-        "<environment_context>",
-        "<permissions instructions>",
-        "<collaboration_mode>",
-        "<skills_instructions>",
-        "<apps_instructions>",
-        "<plugins_instructions>",
-        "<subagent_notification>",
-        "<turn_aborted>",
-        "<user_shell_command>",
-        "<observed_from_primary_session>",
-        "<system-reminder>",
-        "<command-name>",
-        "<command-message>",
-        "<command-args>",
-        "<local-command-caveat>",
-        "<local-command-stdout>",
-        "<local-command-stderr>",
-        "<bash-input>",
-        "<bash-stdout>",
-        "<bash-stderr>",
-    ]
-    .iter()
-    .any(|prefix| value.starts_with(prefix))
+    value
+        .strip_prefix("# AGENTS.md instructions")
+        .is_some_and(|rest| rest.trim_start().starts_with("<INSTRUCTIONS>"))
+        || [
+            "<environment_context>",
+            "<codex_internal_context",
+            "<permissions instructions>",
+            "<collaboration_mode>",
+            "<skills_instructions>",
+            "<apps_instructions>",
+            "<plugins_instructions>",
+            "<subagent_notification>",
+            "<turn_aborted>",
+            "<user_shell_command>",
+            "<observed_from_primary_session>",
+            "<system-reminder>",
+            "<command-name>",
+            "<command-message>",
+            "<command-args>",
+            "<local-command-caveat>",
+            "<local-command-stdout>",
+            "<local-command-stderr>",
+            "<bash-input>",
+            "<bash-stdout>",
+            "<bash-stderr>",
+        ]
+        .iter()
+        .any(|prefix| value.starts_with(prefix))
 }
 
 fn push_activity(activity: &mut VecDeque<String>, value: String) {
@@ -815,6 +1052,335 @@ mod tests {
     }
 
     #[test]
+    fn first_prompts_are_recovered_from_between_the_bounded_windows() {
+        let root = tempdir().unwrap();
+        let codex_dir = root.path().join("codex");
+        let claude_dir = root.path().join("claude/project");
+        let cwd = root.path().join("repo");
+        fs::create_dir_all(&codex_dir).unwrap();
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::create_dir(&cwd).unwrap();
+        let head_padding = "h".repeat(HEAD_BYTES + 1_024);
+        let tail_padding = "t".repeat(TAIL_BYTES * 2);
+
+        let codex_path = codex_dir.join("rollout-windowed.jsonl");
+        let mut codex = fs::File::create(&codex_path).unwrap();
+        for record in [
+            serde_json::json!({"type":"session_meta","payload":{"id":"windowed","cwd":cwd}}),
+            serde_json::json!({"type":"developer_context","payload":{"text":head_padding}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"Keep the first Codex prompt"}}),
+            serde_json::json!({"type":"tool_output","payload":{"text":tail_padding}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"Do not replace the Codex title"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete"}}),
+        ] {
+            writeln!(codex, "{record}").unwrap();
+        }
+
+        let claude_id = "11111111-1111-4111-8111-111111111111";
+        let claude_path = claude_dir.join(format!("{claude_id}.jsonl"));
+        let mut claude = fs::File::create(&claude_path).unwrap();
+        for record in [
+            serde_json::json!({"type":"system","sessionId":claude_id,"cwd":cwd}),
+            serde_json::json!({"type":"developer_context","padding":head_padding}),
+            serde_json::json!({"type":"user","sessionId":claude_id,"cwd":cwd,"message":{"role":"user","content":"Keep the first Claude prompt"}}),
+            serde_json::json!({"type":"assistant","sessionId":claude_id,"cwd":cwd,"message":{"role":"assistant","content":tail_padding}}),
+            serde_json::json!({"type":"user","sessionId":claude_id,"cwd":cwd,"message":{"role":"user","content":"Do not replace the Claude title"}}),
+            serde_json::json!({"type":"system","sessionId":claude_id,"cwd":cwd}),
+        ] {
+            writeln!(claude, "{record}").unwrap();
+        }
+
+        assert_eq!(
+            parse_codex(&codex_path)
+                .unwrap()
+                .unwrap()
+                .first_prompt
+                .as_deref(),
+            Some("Keep the first Codex prompt")
+        );
+        assert_eq!(
+            parse_claude(&claude_path)
+                .unwrap()
+                .unwrap()
+                .first_prompt
+                .as_deref(),
+            Some("Keep the first Claude prompt")
+        );
+    }
+
+    #[test]
+    fn first_prompt_fallback_scans_past_the_old_byte_budget() {
+        const OLD_SCAN_BYTES: usize = 512 * 1024;
+        let root = tempdir().unwrap();
+        let path = root.path().join("rollout-bounded.jsonl");
+        let mut transcript = fs::File::create(&path).unwrap();
+        writeln!(
+            transcript,
+            "{}",
+            serde_json::json!({
+                "type": "developer_context",
+                "payload": {"text": "x".repeat(OLD_SCAN_BYTES + 1_024)}
+            })
+        )
+        .unwrap();
+        writeln!(
+            transcript,
+            "{}",
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "past the old budget"}
+            })
+        )
+        .unwrap();
+        drop(transcript);
+
+        assert_eq!(
+            first_prompt_in_jsonl(&path, codex_prompt_from_record)
+                .unwrap()
+                .as_deref(),
+            Some("past the old budget")
+        );
+
+        let malformed_path = root.path().join("rollout-malformed.jsonl");
+        let mut malformed = fs::File::create(&malformed_path).unwrap();
+        malformed.write_all(b"\xff\n").unwrap();
+        writeln!(
+            malformed,
+            "{}",
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "valid after malformed"}
+            })
+        )
+        .unwrap();
+        drop(malformed);
+        assert_eq!(
+            first_prompt_in_jsonl(&malformed_path, codex_prompt_from_record)
+                .unwrap()
+                .as_deref(),
+            Some("valid after malformed")
+        );
+
+        let split_path = root.path().join("rollout-split-utf8.jsonl");
+        let mut split = fs::File::create(&split_path).unwrap();
+        split.write_all(&vec![b'x'; OLD_SCAN_BYTES - 1]).unwrap();
+        split.write_all(&[0xc3, 0xa9, b'\n']).unwrap();
+        writeln!(
+            split,
+            "{}",
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "after split utf8"}
+            })
+        )
+        .unwrap();
+        drop(split);
+        assert_eq!(
+            first_prompt_in_jsonl(&split_path, codex_prompt_from_record)
+                .unwrap()
+                .as_deref(),
+            Some("after split utf8")
+        );
+    }
+
+    #[test]
+    fn changed_transcript_reuses_a_cached_prompt_for_the_same_provider_session() {
+        let root = tempdir().unwrap();
+        let codex_dir = root.path().join("codex");
+        let claude_dir = root.path().join("claude");
+        let cwd = root.path().join("repo");
+        fs::create_dir_all(&codex_dir).unwrap();
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::create_dir(&cwd).unwrap();
+        let transcript_path = codex_dir.join("rollout-cached-prompt.jsonl");
+        let head_padding = "h".repeat(HEAD_BYTES + 1_024);
+        let tail_padding = "t".repeat(TAIL_BYTES * 2);
+        let mut transcript = fs::File::create(&transcript_path).unwrap();
+        for record in [
+            serde_json::json!({"type":"session_meta","payload":{"id":"cached-prompt","cwd":cwd}}),
+            serde_json::json!({"type":"developer_context","payload":{"text":head_padding}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"Keep the cached prompt"}}),
+            serde_json::json!({"type":"tool_output","payload":{"text":tail_padding}}),
+        ] {
+            writeln!(transcript, "{record}").unwrap();
+        }
+        drop(transcript);
+        let paths = DiscoveryPaths {
+            codex_sessions: codex_dir,
+            claude_projects: claude_dir,
+        };
+        let mut cache = DiscoveryCache::default();
+        let first = discover_cached(&paths, &mut cache);
+        assert_eq!(
+            first[0].first_prompt.as_deref(),
+            Some("Keep the cached prompt")
+        );
+
+        let mut transcript = fs::File::create(&transcript_path).unwrap();
+        for record in [
+            serde_json::json!({"type":"session_meta","payload":{"id":"cached-prompt","cwd":cwd}}),
+            serde_json::json!({"type":"developer_context","payload":{"text":"h".repeat(HEAD_BYTES + 2_048)}}),
+            serde_json::json!({"type":"tool_output","payload":{"text":"t".repeat(TAIL_BYTES * 2)}}),
+        ] {
+            writeln!(transcript, "{record}").unwrap();
+        }
+        drop(transcript);
+
+        let refreshed = discover_cached(&paths, &mut cache);
+        assert_eq!(
+            refreshed[0].first_prompt.as_deref(),
+            Some("Keep the cached prompt")
+        );
+    }
+
+    #[test]
+    fn codex_title_uses_the_first_real_prompt_once() {
+        let root = tempdir().unwrap();
+        let cwd = root.path().join("repo");
+        fs::create_dir(&cwd).unwrap();
+        let path = root.path().join("rollout-agents-instructions.jsonl");
+        let mut transcript = fs::File::create(&path).unwrap();
+        for record in [
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": {"id": "agents-instructions", "cwd": cwd}
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nUse repository rules.\n</INSTRUCTIONS><environment_context>\n<cwd>/tmp/repo</cwd>\n</environment_context>"
+                    }]
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": "Use the first real prompt as the session title"
+                    }]
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": "This later prompt updates the current task only"
+                    }]
+                }
+            }),
+        ] {
+            writeln!(transcript, "{record}").unwrap();
+        }
+
+        let session = parse_codex(&path).unwrap().unwrap();
+        assert_eq!(
+            session.first_prompt.as_deref(),
+            Some("Use the first real prompt as the session title")
+        );
+        assert_eq!(
+            session.list_title(),
+            "Use the first real prompt as the session title"
+        );
+        assert_eq!(
+            session.summary.task,
+            "This later prompt updates the current task only"
+        );
+        assert_eq!(
+            user_prompt_text("# AGENTS.md instructions for end users"),
+            Some("# AGENTS.md instructions for end users".into())
+        );
+    }
+
+    #[test]
+    fn provider_titles_use_the_first_real_text_after_internal_and_image_content() {
+        let root = tempdir().unwrap();
+        let cwd = root.path().join("repo");
+        fs::create_dir(&cwd).unwrap();
+
+        let goal_path = root.path().join("rollout-goal.jsonl");
+        let mut goal = fs::File::create(&goal_path).unwrap();
+        for record in [
+            serde_json::json!({"type":"session_meta","payload":{"id":"goal","cwd":cwd}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<codex_internal_context source=\"goal\">Continue toward the active goal. <objective>Build the browser extension</objective></codex_internal_context>"}]}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<image name=[Image #1] path=\"/tmp/example.png\"> </image> [Image #1]"}]}}),
+        ] {
+            writeln!(goal, "{record}").unwrap();
+        }
+
+        let placeholder_path = root.path().join("rollout-placeholders.jsonl");
+        let mut placeholder = fs::File::create(&placeholder_path).unwrap();
+        for record in [
+            serde_json::json!({"type":"session_meta","payload":{"id":"placeholders","cwd":cwd}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<codex_internal_context source=\"runtime\">generated launch metadata</codex_internal_context>"}]}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<image name=[Image #1] path=\"/tmp/example.png\"> </image> [Image #1]"}]}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"Analyze the actual request"}}),
+        ] {
+            writeln!(placeholder, "{record}").unwrap();
+        }
+
+        let caption_path = root.path().join("rollout-caption.jsonl");
+        let mut caption = fs::File::create(&caption_path).unwrap();
+        for record in [
+            serde_json::json!({"type":"session_meta","payload":{"id":"caption","cwd":cwd}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<image name=[Image #1] path=\"/tmp/example.png\"> </image> [Image #1] Diagnose this layout regression"}]}}),
+        ] {
+            writeln!(caption, "{record}").unwrap();
+        }
+
+        let claude_path = root.path().join("claude-image.jsonl");
+        let mut claude = fs::File::create(&claude_path).unwrap();
+        for record in [
+            serde_json::json!({"type":"user","sessionId":"claude-image","cwd":cwd,"message":{"role":"user","content":[{"type":"text","text":"<image name=[Image #1] path=\"/tmp/example.png\"> </image> [Image #1]"}]}}),
+            serde_json::json!({"type":"user","sessionId":"claude-image","cwd":cwd,"message":{"role":"user","content":[{"type":"text","text":"First Claude text request"}]}}),
+        ] {
+            writeln!(claude, "{record}").unwrap();
+        }
+
+        assert_eq!(
+            parse_codex(&goal_path)
+                .unwrap()
+                .unwrap()
+                .first_prompt
+                .as_deref(),
+            Some("Build the browser extension")
+        );
+        assert_eq!(
+            parse_codex(&placeholder_path)
+                .unwrap()
+                .unwrap()
+                .first_prompt
+                .as_deref(),
+            Some("Analyze the actual request")
+        );
+        assert_eq!(
+            parse_codex(&caption_path)
+                .unwrap()
+                .unwrap()
+                .first_prompt
+                .as_deref(),
+            Some("Diagnose this layout regression")
+        );
+        assert_eq!(
+            parse_claude(&claude_path)
+                .unwrap()
+                .unwrap()
+                .first_prompt
+                .as_deref(),
+            Some("First Claude text request")
+        );
+    }
+
+    #[test]
     fn codex_state_metadata_enriches_resume_search_terms() {
         let root = tempdir().unwrap();
         let codex_home = root.path().join("codex");
@@ -888,6 +1454,52 @@ mod tests {
         ] {
             assert!(session.search_terms.iter().any(|value| value == term));
         }
+    }
+
+    #[test]
+    fn codex_metadata_cache_keeps_last_good_result_when_sqlite_refresh_fails() {
+        let root = tempdir().unwrap();
+        let codex_home = root.path().join("codex");
+        let codex_sessions = codex_home.join("sessions");
+        let claude_projects = root.path().join("claude");
+        fs::create_dir_all(&codex_sessions).unwrap();
+        fs::create_dir_all(&claude_projects).unwrap();
+        let cwd = root.path().join("repo");
+        fs::create_dir(&cwd).unwrap();
+        let transcript_path = codex_sessions.join("rollout-last-good.jsonl");
+        let mut transcript = fs::File::create(transcript_path).unwrap();
+        writeln!(
+            transcript,
+            "{}",
+            serde_json::json!({"type":"session_meta","payload":{"id":"last-good","cwd":cwd}})
+        )
+        .unwrap();
+        let database_path = codex_home.join("state_5.sqlite");
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    name TEXT,
+                    title TEXT,
+                    first_user_message TEXT,
+                    preview TEXT
+                );
+                INSERT INTO threads (id, name) VALUES ('last-good', 'cached-name');",
+            )
+            .unwrap();
+        drop(connection);
+        let paths = DiscoveryPaths {
+            codex_sessions,
+            claude_projects,
+        };
+        let mut cache = DiscoveryCache::default();
+        let first = discover_cached(&paths, &mut cache);
+        assert_eq!(first[0].name, "cached-name");
+
+        fs::write(&database_path, b"not a sqlite database anymore").unwrap();
+        let refreshed = discover_cached(&paths, &mut cache);
+        assert_eq!(refreshed[0].name, "cached-name");
     }
 
     #[test]
@@ -968,7 +1580,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_subagents_use_their_own_id_and_disappear_after_completion() {
+    fn codex_subagents_are_not_discovered() {
         let root = tempdir().unwrap();
         let codex = root.path().join("codex");
         fs::create_dir(&codex).unwrap();
@@ -1031,14 +1643,14 @@ mod tests {
         }
 
         let sessions = discover_codex(&codex);
-        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions.len(), 1);
         assert!(
             sessions
                 .iter()
                 .any(|session| session.provider_session_id == "parent")
         );
         assert!(
-            sessions
+            !sessions
                 .iter()
                 .any(|session| session.provider_session_id == "running-subagent")
         );
@@ -1046,6 +1658,69 @@ mod tests {
             !sessions
                 .iter()
                 .any(|session| session.provider_session_id == "finished-subagent")
+        );
+    }
+
+    #[test]
+    fn claude_sidechain_markers_between_bounded_windows_are_not_discovered() {
+        let root = tempdir().unwrap();
+        let cwd = root.path().join("repo");
+        fs::create_dir(&cwd).unwrap();
+        let path = root
+            .path()
+            .join("11111111-1111-4111-8111-111111111111.jsonl");
+        let mut file = fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({"type": "system", "sessionId": "parent-session", "cwd": cwd})
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "type": "assistant",
+                "message": {"role": "assistant", "content": "h".repeat(HEAD_BYTES + 1_024)}
+            })
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "type": "user",
+                "isSidechain": true,
+                "sessionId": "parent-session",
+                "agentId": "a200da4e34f99330c",
+                "cwd": cwd,
+                "message": {"role": "user", "content": "Inspect the implementation"}
+            })
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "type": "assistant",
+                "message": {"role": "assistant", "content": "t".repeat(TAIL_BYTES * 2)}
+            })
+        )
+        .unwrap();
+
+        assert!(parse_claude(&path).unwrap().is_none());
+        let paths = DiscoveryPaths {
+            codex_sessions: root.path().join("codex"),
+            claude_projects: root.path().to_owned(),
+        };
+        let mut cache = DiscoveryCache::default();
+        assert!(discover_cached(&paths, &mut cache).is_empty());
+        assert!(
+            cache
+                .entries
+                .get(&path)
+                .is_some_and(|(_, session)| session.is_none()),
+            "excluded transcripts should be cached until their metadata changes"
         );
     }
 

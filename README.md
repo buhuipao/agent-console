@@ -49,6 +49,16 @@ With a Rust toolchain installed, you can instead build and install the
 cargo install agent-console
 ```
 
+From a source checkout, `make install` builds the release binary and installs
+it to `~/.local/bin` using an atomic rename:
+
+```sh
+make install
+```
+
+Set `PREFIX` to install elsewhere, for example
+`make install PREFIX=/usr/local`.
+
 Extract the archive and place `agent-console` (`agent-console.exe` on Windows)
 in a directory on `PATH`. On macOS, install and upgrade it with an atomic
 rename so the kernel never reuses a cached signature from the old inode:
@@ -189,9 +199,11 @@ overridden in the configuration file.
 
 ## Notes
 
-- A session is titled by its first user prompt and keeps that title for life.
-  Later prompts and summaries never rename it. Bind the `alias` action in
-  `[keys.dashboard]` to set your own title instead.
+- A session is titled by its first user prompt and keeps that title across
+  discovery refreshes and application restarts.
+  Provider-injected setup records such as `# AGENTS.md instructions` do not
+  count as user prompts. Later prompts and summaries never rename it. Bind the
+  `alias` action in `[keys.dashboard]` to set your own title instead.
 - Summaries use the session's own provider and run outside the coding
   conversation, and appear in the session preview beside the first prompt rather
   than in the title. Disable them with `AGENT_CONSOLE_SUMMARIZER=off`.
@@ -201,8 +213,8 @@ overridden in the configuration file.
   sessions from other terminal tabs are resumed from their saved transcript.
 - Managed Codex sessions run with `--no-alt-screen`, allowing the Workspace
   pane to retain and scroll the transcript in every Codex state.
-- Running Codex fork subagents are identified from transcript metadata and
-  disappear from Sessions when their final task completes or aborts.
+- Codex fork-subagent and Claude sidechain transcripts are excluded from
+  Sessions; only primary sessions are discovered and tracked.
 - Each managed pane retains up to 2,000 scrollback rows. The separate 128 KiB
   daemon replay tail is a reconnect transport bound; crossing it does not stop
   the process or discard Codex's retained viewport rows.

@@ -20,6 +20,8 @@ pub struct CachedSession {
     pub summary_updated_at: Option<u64>,
     pub pending_shell_injection: Option<String>,
     #[serde(default)]
+    pub first_prompt: Option<String>,
+    #[serde(default)]
     pub alias: Option<String>,
     #[serde(default)]
     pub archived: bool,
@@ -147,6 +149,9 @@ impl StateStore {
         session
             .pending_shell_injection
             .clone_from(&cached.pending_shell_injection);
+        if cached.first_prompt.is_some() {
+            session.first_prompt.clone_from(&cached.first_prompt);
+        }
         session.apply_deterministic_status(
             false,
             session.status == crate::model::SessionStatus::Failed,
@@ -163,6 +168,7 @@ impl StateStore {
                     cached.alias.clone(),
                     cached.archived,
                     cached.managed_transcript_fingerprint.clone(),
+                    cached.first_prompt.clone(),
                 )
             })
             .unwrap_or_default();
@@ -173,6 +179,7 @@ impl StateStore {
                 summary_fingerprint: session.summary_fingerprint.clone(),
                 summary_updated_at: session.summary_updated_at,
                 pending_shell_injection: session.pending_shell_injection.clone(),
+                first_prompt: metadata.3.or_else(|| session.first_prompt.clone()),
                 alias: metadata.0,
                 archived: metadata.1,
                 managed_transcript_fingerprint: metadata.2,
@@ -474,7 +481,12 @@ mod tests {
         let root = tempdir().unwrap();
         let (mut store, warning) = StateStore::load(root.path().to_owned()).unwrap();
         assert!(warning.is_none());
-        store.update(&session());
+        let mut original = session();
+        original.first_prompt = Some("Keep the persisted title".into());
+        store.update(&original);
+        let mut later = original.clone();
+        later.first_prompt = Some("A later update must not replace the title".into());
+        store.update(&later);
         store.set_alias("claude:id", Some("release blocker".into()));
         assert!(store.toggle_archived("claude:id"));
         store.set_managed_transcript_fingerprint("claude:id", Some("mtime:length".into()));
@@ -485,10 +497,15 @@ mod tests {
         let (loaded, warning) = StateStore::load(root.path().to_owned()).unwrap();
         assert!(warning.is_none());
         let mut restored = session();
+        restored.first_prompt = Some("A later parsed prompt".into());
         restored.summary = SessionSummary::default();
         restored.pending_shell_injection = None;
         loaded.apply(&mut restored);
         assert_eq!(restored.summary.task, "test persistence");
+        assert_eq!(
+            restored.first_prompt.as_deref(),
+            Some("Keep the persisted title")
+        );
         assert_eq!(
             restored.pending_shell_injection.as_deref(),
             Some("captured")

@@ -22,28 +22,32 @@ use crate::{
 /// Environment variable holding a comma-separated provider allow list.
 pub const PROVIDERS_ENV: &str = "AGENT_CONSOLE_PROVIDERS";
 
+pub type ProviderParser =
+    for<'a> fn(&Path, Option<(&'a str, &'a str)>) -> io::Result<Option<Session>>;
+
 pub struct ProviderAdapter {
     pub kind: AgentKind,
     /// True when this file is one of the provider's session transcripts.
     pub accepts: fn(&Path) -> bool,
-    /// Parse one accepted transcript. `Ok(None)` means "not a usable session".
-    pub parse: fn(&Path) -> io::Result<Option<Session>>,
+    /// Parse one accepted transcript, optionally reusing a known
+    /// `(provider_session_id, first_prompt)`. `Ok(None)` means "not usable".
+    pub parse: ProviderParser,
     /// Optional enrichment applied to the provider's parsed sessions, given its
     /// transcript root.
-    pub enrich: Option<fn(&Path, &mut [Session])>,
+    pub enrich: Option<fn(&Path, &mut [Session], &mut discovery::DiscoveryCache)>,
 }
 
 const ADAPTERS: &[ProviderAdapter] = &[
     ProviderAdapter {
         kind: AgentKind::Codex,
         accepts: accepts_codex,
-        parse: discovery::parse_codex,
+        parse: discovery::parse_codex_with_cached_prompt,
         enrich: Some(discovery::enrich_codex),
     },
     ProviderAdapter {
         kind: AgentKind::Claude,
         accepts: accepts_claude,
-        parse: discovery::parse_claude,
+        parse: discovery::parse_claude_with_cached_prompt,
         enrich: None,
     },
 ];
@@ -109,6 +113,13 @@ fn accepts_codex(path: &Path) -> bool {
 }
 
 fn accepts_claude(path: &Path) -> bool {
+    if path
+        .ancestors()
+        .skip(1)
+        .any(|ancestor| ancestor.file_name().and_then(|name| name.to_str()) == Some("subagents"))
+    {
+        return false;
+    }
     let Some(stem) = path.file_stem().and_then(|name| name.to_str()) else {
         return false;
     };
@@ -170,11 +181,19 @@ mod tests {
     fn adapters_accept_only_their_own_transcripts() {
         let codex = PathBuf::from("/root/2026/07/27/rollout-2026-07-27T10-00-00-abc.jsonl");
         let claude = PathBuf::from("/root/project/0197e9a1-6f42-7c31-9d55-6f0f8b0a1234.jsonl");
+        let claude_subagent = PathBuf::from(
+            "/root/project/session/subagents/0197e9a1-6f42-7c31-9d55-6f0f8b0a1234.jsonl",
+        );
+        let nested_claude_subagent = PathBuf::from(
+            "/root/project/session/subagents/nested/0197e9a1-6f42-7c31-9d55-6f0f8b0a1234.jsonl",
+        );
         let other = PathBuf::from("/root/project/notes.jsonl");
 
         assert!(accepts_codex(&codex));
         assert!(!accepts_codex(&claude));
         assert!(accepts_claude(&claude));
+        assert!(!accepts_claude(&claude_subagent));
+        assert!(!accepts_claude(&nested_claude_subagent));
         assert!(!accepts_claude(&codex));
         assert!(!accepts_codex(&other));
         assert!(!accepts_claude(&other));
