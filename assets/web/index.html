@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Agent Console</title>
+  <meta name="description" content="Drive Codex and Claude Code agent sessions from a phone or desktop browser." />
+  <meta name="theme-color" content="#0a1020" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Agent Console" />
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="icon" href="/icons/icon-192.png" />
+  <link rel="apple-touch-icon" href="/icons/icon-192.png" />
+  <link rel="stylesheet" href="/vendor/xterm.css" />
+  <link rel="stylesheet" href="/app.css" />
+  <link rel="stylesheet" href="/css/dashboard.css" />
+  <link rel="stylesheet" href="/css/overview.css" />
+  <link rel="stylesheet" href="/css/conversation.css" />
+  <link rel="stylesheet" href="/css/terminal.css" />
+  <link rel="stylesheet" href="/css/dialogs.css" />
+  <link rel="stylesheet" href="/css/alerts.css" />
+  <link rel="stylesheet" href="/css/doctor.css" />
+</head>
+<body>
+  <div id="app" class="app" data-route="dashboard">
+    <header class="topbar">
+      <button id="list-toggle" class="btn btn-ghost list-toggle" type="button" aria-expanded="true"
+        aria-controls="sidebar" title="Hide the session list" aria-label="Hide the session list">
+        <svg class="toggle-glyph" viewBox="0 0 15 12" aria-hidden="true" focusable="false">
+          <rect x="0" y="0" width="15" height="2" rx="1" />
+          <rect x="0" y="5" width="15" height="2" rx="1" />
+          <rect x="0" y="10" width="15" height="2" rx="1" />
+        </svg>
+      </button>
+      <h1 class="brand">Agent Console</h1>
+      <div class="topbar-actions">
+        <div class="alerts-wrap">
+          <button id="alerts-btn" class="btn btn-ghost alerts-btn" type="button" aria-haspopup="true" aria-expanded="false"
+            title="Sessions that started waiting or failed" aria-label="Alerts">
+            <span class="btn-text">Alerts</span>
+            <span id="alerts-badge" class="alerts-badge" aria-hidden="true" hidden>0</span>
+          </button>
+          <div id="alerts-panel" class="alerts-panel" role="dialog" aria-label="Alerts" hidden>
+            <div class="alerts-head">
+              <span class="alerts-title">Alerts</span>
+              <button id="alerts-read-all" class="btn btn-ghost alerts-read-all" type="button"
+                title="Clear the unread badge here and in any running TUI">Mark all read</button>
+            </div>
+            <div id="alerts-list" class="alerts-list"></div>
+            <p id="alerts-empty" class="empty-hint alerts-empty">Loading alerts&hellip;</p>
+            <div class="alerts-foot">
+              <label id="alerts-notify-row" class="switch" title="Raise a system notification when a session needs you">
+                <input type="checkbox" id="alerts-notify" />
+                <span>Notify this device</span>
+              </label>
+              <p id="alerts-notify-hint" class="hint-text" hidden></p>
+            </div>
+          </div>
+        </div>
+        <button id="refresh-btn" class="btn btn-ghost" type="button" title="Reload the session list now" aria-label="Reload the session list now">
+          <span class="btn-icon" aria-hidden="true">&#8635;</span><span class="btn-text">Refresh</span>
+        </button>
+        <button id="new-session-btn" class="btn btn-primary" type="button" title="Start a new agent session" aria-label="Start a new agent session">
+          <span class="btn-icon" aria-hidden="true">+</span><span class="btn-text">New session</span>
+        </button>
+      </div>
+    </header>
+
+    <div id="statusbar" class="statusbar" aria-label="Session status counts">
+      <div id="status-counts" class="status-counts" role="group" aria-label="Filter by status"></div>
+      <span class="status-scope" title="These counts always cover every session on this machine, filtered or not">all sessions</span>
+    </div>
+
+    <div class="shell">
+      <button id="drawer-scrim" class="drawer-scrim" type="button" tabindex="-1"
+        aria-label="Close the session list"></button>
+      <aside id="sidebar" class="sidebar" aria-label="Sessions">
+        <div class="sidebar-search">
+          <input type="search" id="session-search" class="search-input" placeholder="Search sessions"
+            aria-label="Search sessions by name, path, branch or summary" autocomplete="off" autocapitalize="off"
+            spellcheck="false" enterkeyhint="search" />
+          <button id="search-clear" class="search-clear" type="button" title="Clear the search" aria-label="Clear the search" hidden>&times;</button>
+        </div>
+        <p id="search-echo" class="search-echo" aria-live="polite" hidden></p>
+        <div class="sidebar-tools">
+          <label class="switch" title="Include archived sessions in the list">
+            <input type="checkbox" id="show-archived" />
+            <span>Show archived</span>
+          </label>
+          <span id="session-count" class="sidebar-count" aria-live="polite"></span>
+          <a id="doctor-link" class="sidebar-link" href="#/doctor" title="Check providers, versions and discovery paths">Diagnostics</a>
+        </div>
+        <div id="workspaces" class="workspaces"></div>
+        <p id="sessions-empty" class="empty-hint" hidden>No sessions yet. Use &ldquo;New session&rdquo; to start one.</p>
+      </aside>
+
+      <main id="detail" class="detail">
+        <!-- The dashboard route's own view: every session's state, read without opening one.
+             It replaces the "pick a session" placeholder that used to sit in this space. -->
+        <section id="overview-pane" class="overview-pane" aria-label="Session overview">
+          <div id="overview-board" class="overview-board"></div>
+          <p id="overview-empty" class="empty-hint overview-empty" hidden>Loading sessions&hellip;</p>
+        </section>
+
+        <section id="doctor-pane" class="doctor-pane" hidden>
+          <header class="doctor-head">
+            <a class="btn btn-ghost back-link" href="#/" title="Back to all sessions" aria-label="Back to all sessions">
+              <span class="btn-icon" aria-hidden="true">&larr;</span><span class="btn-text">Sessions</span>
+            </a>
+            <h2 class="doctor-heading">Diagnostics</h2>
+            <button id="doctor-run" class="btn btn-primary" type="button" title="Start each provider's binary and check what it supports">Run diagnostics</button>
+          </header>
+          <p class="hint-text doctor-note">Runs the same checks as <code>agent-console doctor</code>. It starts each
+            provider's binary, so it takes several seconds.</p>
+          <p id="doctor-status" class="doctor-status"></p>
+          <div id="doctor-body" class="doctor-body"></div>
+        </section>
+
+        <section id="session-pane" class="session-pane" hidden>
+          <header class="session-header">
+            <a id="back-link" class="btn btn-ghost back-link" href="#/" title="Back to all sessions" aria-label="Back to all sessions">
+              <span class="btn-icon" aria-hidden="true">&larr;</span><span class="btn-text">Sessions</span>
+            </a>
+            <div class="session-ident">
+              <div class="session-name">
+                <span id="session-status-dot" class="dot" title="Session status"></span>
+                <span id="session-title" class="session-title">Loading&hellip;</span>
+              </div>
+              <div id="session-meta" class="session-meta"></div>
+            </div>
+            <button id="fullscreen-btn" class="btn btn-ghost fullscreen-btn" type="button" aria-pressed="false"
+              title="Give the terminal the whole window" aria-label="Toggle full-screen terminal">
+              <span class="btn-text">Full screen</span>
+            </button>
+            <div class="session-actions">
+              <button id="actions-btn" class="btn btn-ghost" type="button" aria-haspopup="true" aria-expanded="false" title="Archive or terminate this session" aria-label="Session actions">
+                <span class="btn-text">Actions</span><span class="btn-icon" aria-hidden="true">&#9662;</span>
+              </button>
+              <div id="actions-menu" class="menu" role="menu" hidden>
+                <button id="action-rename" class="menu-item" type="button" role="menuitem">Rename session</button>
+                <button id="action-archive" class="menu-item" type="button" role="menuitem">Archive session</button>
+                <button id="action-delete" class="menu-item danger" type="button" role="menuitem">Terminate session</button>
+              </div>
+            </div>
+          </header>
+
+          <nav class="tabs" aria-label="Session views">
+            <a id="tab-chat" class="tab" href="#/" title="Read the conversation and send prompts">Conversation</a>
+            <a id="tab-shell" class="tab" href="#/" title="A command line in this session's working directory">Shell</a>
+            <a id="tab-terminal" class="tab" href="#/" title="The agent's own terminal, for answering its dialogs">Agent TUI</a>
+          </nav>
+
+          <div id="chat-view" class="chat-view">
+            <div id="chat-banners" class="chat-banners"></div>
+            <div id="messages" class="messages"></div>
+            <button id="jump-latest" class="jump-latest" type="button" hidden aria-label="Scroll to the latest message">
+              <span aria-hidden="true">&darr;</span> Jump to latest
+            </button>
+            <form id="composer" class="composer">
+              <textarea id="composer-input" class="composer-input" rows="1" placeholder="Message the agent&hellip;"
+                aria-label="Prompt to send to the agent" autocomplete="off" autocapitalize="sentences" spellcheck="true"></textarea>
+              <div class="composer-side">
+                <button id="stop-btn" class="btn btn-danger" type="button" hidden title="Interrupt the agent's current turn" aria-label="Stop the agent">Stop</button>
+                <button id="send-btn" class="btn btn-primary" type="submit" title="Send this prompt to the agent" aria-label="Send prompt">Send</button>
+              </div>
+              <p id="composer-hint" class="composer-hint"></p>
+            </form>
+          </div>
+
+          <div id="shell-view" class="terminal-view" hidden>
+            <div class="shell-bar">
+              <div id="shell-tabs" class="shell-tabs" aria-label="Open shells"></div>
+              <button id="shell-add" class="shell-add" type="button" title="Open another shell in this directory" aria-label="Open another shell">+</button>
+              <div class="shell-capture">
+                <button id="shell-copy" class="shell-action" type="button" title="Copy this shell's output">Copy</button>
+                <button id="shell-stage" class="shell-action" type="button" title="Paste this shell's output into the agent's composer">To agent</button>
+              </div>
+            </div>
+            <div id="shell-container" class="terminal-container"></div>
+            <!-- Key rows are rendered by termview.js so the Shell and Agent TUI tabs cannot drift apart. -->
+            <div id="shell-toolbar" class="terminal-toolbar" aria-label="Shell keys"></div>
+          </div>
+
+          <div id="terminal-view" class="terminal-view" hidden>
+            <div id="terminal-container" class="terminal-container"></div>
+            <div id="terminal-toolbar" class="terminal-toolbar" aria-label="Agent terminal keys"></div>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <div id="new-session-overlay" class="overlay" hidden>
+    <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="new-session-title">
+      <h2 id="new-session-title">New session</h2>
+      <fieldset class="agent-choice">
+        <legend>Agent</legend>
+        <label class="radio-row">
+          <input type="radio" name="agent" value="codex" checked />
+          <span>Codex</span>
+        </label>
+        <label class="radio-row">
+          <input type="radio" name="agent" value="claude" />
+          <span>Claude</span>
+        </label>
+      </fieldset>
+      <label class="field-label" for="new-session-cwd">Working directory</label>
+      <div class="combo">
+        <input type="text" id="new-session-cwd" class="text-input" placeholder="~/github/project" autocomplete="off"
+          autocapitalize="off" spellcheck="false" role="combobox" aria-expanded="false" aria-autocomplete="list"
+          aria-controls="cwd-suggestions" />
+        <ul id="cwd-suggestions" class="suggestions" role="listbox" aria-label="Directory suggestions" hidden></ul>
+      </div>
+      <p class="hint-text">Start typing a path &mdash; suggestions come from the machine running the console.</p>
+      <p id="new-session-error" class="error-text" hidden></p>
+      <div class="dialog-actions">
+        <button type="button" id="new-session-cancel" class="btn btn-ghost">Cancel</button>
+        <button type="button" id="new-session-create" class="btn btn-primary">Create</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="token-overlay" class="overlay" hidden>
+    <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="token-title">
+      <h2 id="token-title">Enter access token</h2>
+      <p class="hint-text">Paste the token from the address <code>agent-console</code> shows in its header, or that <code>agent-console web</code> printed.</p>
+      <input type="text" id="token-input" class="text-input" placeholder="token" autocomplete="off" autocapitalize="off" spellcheck="false" />
+      <p id="token-error" class="error-text" hidden></p>
+      <div class="dialog-actions">
+        <button type="button" id="token-save" class="btn btn-primary">Continue</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="rename-overlay" class="overlay" hidden>
+    <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="rename-title">
+      <h2 id="rename-title">Rename session</h2>
+      <label class="field-label" for="rename-input">Name</label>
+      <input type="text" id="rename-input" class="text-input" placeholder="urgent release" autocomplete="off"
+        autocapitalize="sentences" spellcheck="false" />
+      <p id="rename-hint" class="hint-text"></p>
+      <p id="rename-error" class="error-text" hidden></p>
+      <div class="dialog-actions">
+        <button type="button" id="rename-clear" class="btn btn-ghost" hidden>Clear name</button>
+        <button type="button" id="rename-cancel" class="btn btn-ghost">Cancel</button>
+        <button type="button" id="rename-save" class="btn btn-primary">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="takeover-overlay" class="overlay" hidden>
+    <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="takeover-title">
+      <h2 id="takeover-title">Another surface is driving this session</h2>
+      <p id="takeover-detail" class="hint-text"></p>
+      <div id="takeover-holder" class="holder-row"></div>
+      <p class="hint-text">Taking over stops the other surface from typing into this session until it opens the
+        session again.</p>
+      <p id="takeover-error" class="error-text" hidden></p>
+      <div class="dialog-actions">
+        <button type="button" id="takeover-cancel" class="btn btn-ghost">Cancel</button>
+        <button type="button" id="takeover-confirm" class="btn btn-primary">Take over</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="capture-overlay" class="overlay" hidden>
+    <div class="dialog dialog-wide" role="dialog" aria-modal="true" aria-labelledby="capture-title">
+      <h2 id="capture-title">Copy this text</h2>
+      <p class="hint-text">This browser would not let the page write to the clipboard, so here is the text &mdash;
+        it is already selected.</p>
+      <textarea id="capture-text" class="capture-text" readonly spellcheck="false"></textarea>
+      <div class="dialog-actions">
+        <button type="button" id="capture-close" class="btn btn-primary">Done</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

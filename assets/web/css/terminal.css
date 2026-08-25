@@ -1,0 +1,199 @@
+/* Terminal tab: the raw PTY escape hatch. Secondary to the conversation view. */
+
+.terminal-view {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: #000;
+}
+
+.terminal-view[hidden] {
+  display: none;
+}
+
+.terminal-container {
+  flex: 1;
+  min-height: 0;
+  padding: 4px;
+}
+
+.terminal-toolbar {
+  display: flex;
+  gap: 0.4rem;
+  flex: none;
+  padding: 0.4rem calc(var(--safe-right) + 0.4rem) calc(var(--safe-bottom) + 0.4rem)
+    calc(var(--safe-left) + 0.4rem);
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+  overflow-x: auto;
+}
+
+.tb-key {
+  min-width: var(--tap);
+  min-height: var(--tap);
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--panel-alt);
+  color: var(--text);
+  flex: none;
+  cursor: pointer;
+}
+
+.tb-key.armed {
+  background: var(--accent);
+  color: var(--accent-ink);
+  border-color: var(--accent);
+}
+
+/* The on-screen key row exists because a soft keyboard has no Esc, Tab or Ctrl. That is a
+   property of the pointer, not of the window: a landscape phone is 844px wide and still
+   cannot type Ctrl-C without it. */
+.app:not([data-touch="true"]) .terminal-toolbar {
+  display: none;
+}
+
+/* Shell tab: one strip of shell tabs above the terminal, plus a button to add one. */
+
+.shell-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex: none;
+  padding: 0.3rem calc(var(--safe-right) + 0.4rem) 0.3rem calc(var(--safe-left) + 0.4rem);
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+
+.shell-tabs {
+  display: flex;
+  gap: 0.3rem;
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.shell-tab {
+  display: flex;
+  align-items: center;
+  flex: none;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-alt);
+  overflow: hidden;
+}
+
+.shell-tab.active {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+
+.shell-tab-name {
+  padding: 0 0.5rem;
+  line-height: var(--tap);
+  color: var(--text);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.shell-tab.active .shell-tab-name {
+  color: var(--accent-ink);
+}
+
+.shell-close {
+  border: 0;
+  background: none;
+  color: inherit;
+  opacity: 0.7;
+  cursor: pointer;
+  padding: 0 0.5rem;
+  min-height: var(--tap);
+}
+
+.shell-tab.active .shell-close {
+  color: var(--accent-ink);
+}
+
+.shell-close:hover {
+  opacity: 1;
+}
+
+.shell-add {
+  flex: none;
+  min-width: var(--tap);
+  min-height: var(--tap);
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--panel-alt);
+  color: var(--text);
+  font-size: var(--fs-icon);
+  cursor: pointer;
+}
+
+/* Getting a command's output out of the terminal. Worth more on a phone than in the TUI it
+   comes from: selecting terminal text by hand on a touch screen is close to impossible. */
+.shell-capture {
+  display: flex;
+  gap: 0.3rem;
+  flex: none;
+  margin-left: auto;
+}
+
+.shell-action {
+  min-height: var(--tap);
+  padding: 0 0.6rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--panel-alt);
+  color: var(--text);
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.shell-action:hover:not(:disabled) {
+  background: var(--panel-raised);
+}
+
+.shell-action:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* --------------------------------------------------------------- tail
+
+   One control, floated over the terminal rather than given a row of its own: a landscape
+   phone has ~390px of height and every fixed strip costs a tenth of it. Earlier output is
+   reached by scrolling the terminal itself -- a wheel, or a drag -- so there is nothing else
+   to put here.
+
+   It appears only once the reader has scrolled away from the tail, which is also the moment
+   xterm stops following it. */
+
+.term-jump {
+  position: absolute;
+  top: 0.35rem;
+  right: calc(var(--safe-right) + 0.45rem);
+  z-index: 6;
+  min-height: 30px;
+  padding: 0 0.7rem;
+  border-radius: 999px;
+  border: 1px solid var(--accent-line);
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-size: var(--fs-xs);
+  font-weight: 700;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.app[data-touch="true"] .term-jump {
+  min-height: 36px;
+  padding: 0 0.9rem;
+}
+
+.term-jump[hidden] {
+  display: none;
+}

@@ -1,0 +1,196 @@
+/* Modal dialogs: new session (with working-directory autocomplete) and token entry. */
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(2, 6, 16, 0.72);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: calc(var(--safe-top) + 1rem) 1rem calc(var(--safe-bottom) + 1rem);
+  z-index: 50;
+}
+
+.overlay[hidden] {
+  display: none;
+}
+
+.dialog {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 1.1rem;
+  width: 100%;
+  max-width: 26rem;
+  max-height: 100%;
+  overflow-y: auto;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+}
+
+.dialog h2 {
+  margin: 0 0 0.8rem;
+  font-size: var(--fs-lg);
+}
+
+.agent-choice {
+  border: none;
+  padding: 0;
+  margin: 0 0 0.6rem;
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.agent-choice legend {
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 0;
+  float: left;
+  width: 100%;
+}
+
+.radio-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-height: var(--tap);
+  cursor: pointer;
+}
+
+.radio-row input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent);
+}
+
+.field-label {
+  display: block;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 0.3rem;
+}
+
+.combo {
+  position: relative;
+}
+
+.text-input {
+  width: 100%;
+  min-height: var(--tap);
+  padding: 0.55rem 0.7rem;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--panel-alt);
+  color: var(--text);
+  font-size: var(--fs-input);
+  font-family: var(--mono);
+}
+
+.suggestions {
+  list-style: none;
+  margin: 0.3rem 0 0;
+  padding: 0.25rem;
+  max-height: 13rem;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel-raised);
+}
+
+.suggestions[hidden] {
+  display: none;
+}
+
+.suggestion {
+  min-height: var(--tap);
+  display: flex;
+  align-items: center;
+  padding: 0 0.55rem;
+  border-radius: 7px;
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+
+.suggestion:hover,
+.suggestion.active {
+  background: var(--panel-alt);
+  color: var(--accent);
+}
+
+.hint-text {
+  color: var(--muted);
+  font-size: var(--fs-sm);
+  margin: 0.5rem 0 0;
+}
+
+.error-text {
+  color: var(--danger);
+  font-size: var(--fs-sm);
+  margin: 0.5rem 0 0;
+  overflow-wrap: anywhere;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+
+/* ------------------------------------------------------- takeover and copy */
+
+.dialog-wide {
+  max-width: 44rem;
+}
+
+.holder-row {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  margin: 0.6rem 0;
+  padding: 0.5rem 0.65rem;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--panel-alt);
+  font-size: var(--fs-sm);
+}
+
+.holder-label {
+  font-size: var(--fs-2xs);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+
+.holder-value {
+  font-family: var(--mono);
+}
+
+.muted-line {
+  color: var(--muted);
+}
+
+.capture-text {
+  width: 100%;
+  height: min(24rem, 50vh);
+  margin-top: 0.6rem;
+  padding: 0.55rem 0.7rem;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--panel-alt);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  resize: none;
+  white-space: pre;
+  overflow: auto;
+}

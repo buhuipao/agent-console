@@ -1,0 +1,717 @@
+/* Base tokens, resets, shared controls, and the app shell layout.
+   View-specific rules live in css/dashboard.css, css/overview.css, css/conversation.css,
+   css/dialogs.css. */
+
+:root {
+  /* ---------------------------------------------------------- surfaces ---
+     Four steps of elevation, each a clear step darker/lighter than the last so a card
+     inside a panel inside the page still reads as three layers on an OLED phone. */
+  --bg: #0a1020;
+  --panel: #0f172a;
+  --panel-alt: #14203a;
+  --panel-raised: #1b2a46;
+  --border: #26344f;
+  --border-soft: #1b2740;
+
+  /* -------------------------------------------------------------- ink ---
+     Three text weights. `--faint` is the lowest tier that still clears 4.5:1 on
+     `--panel` (4.8:1); anything dimmer than this is a border, not text. */
+  --text: #e6edf8;
+  --text-strong: #f5f9ff;
+  --muted: #9fb0c7;
+  --faint: #7d8ba1;
+
+  /* ------------------------------------------------------------ accent --- */
+  --accent: #22d3ee;
+  --accent-ink: #04222a;
+  --accent-soft: rgba(34, 211, 238, 0.14);
+  --accent-line: rgba(34, 211, 238, 0.45);
+
+  /* ------------------------------------------------------------ status ---
+     Each status carries a fill (dots, badges, bars) and a separate `-ink` for text.
+     The saturated fills are below 4.5:1 as small text on a dark panel, so text uses
+     the lighter tint: danger 6.0:1, warn 10.1:1, ok 9.6:1.
+     Colour is never the only channel -- every status dot in this UI is paired with
+     its word ("waiting", "failed", ...) or a labelled badge. */
+  --ok: #22c55e;
+  --ok-ink: #4ade80;
+  --ok-soft: rgba(34, 197, 94, 0.14);
+  --ok-line: rgba(34, 197, 94, 0.42);
+  --warn: #eab308;
+  --warn-ink: #fbbf24;
+  --warn-soft: rgba(234, 179, 8, 0.14);
+  --warn-line: rgba(234, 179, 8, 0.45);
+  --danger: #ef4444;
+  --danger-ink: #f87171;
+  --danger-soft: rgba(239, 68, 68, 0.14);
+  --danger-line: rgba(239, 68, 68, 0.45);
+
+  /* -------------------------------------------------------- type scale ---
+     One fluid scale. Every size in this UI picks a step from it rather than
+     inventing its own value -- a half-applied scale is how a workspace group
+     header ended up set smaller than the session titles nested inside it.
+
+     Each step is `clamp(floor, intercept + slope*vw, ceiling)`, interpolating
+     between a 360px phone and a 1440px desktop and holding still outside that
+     range. The floors and ceilings are rem, so a reader who has raised their
+     browser's font size still gets bigger text; only the middle of the curve
+     follows the viewport. Type is never pinned to `vw` alone, which would
+     ignore that preference entirely.
+
+     The larger steps widen faster than the smaller ones (the brand grows 19->24,
+     meta labels only 11->12.5): headings are what should feel different on a
+     desktop, while an 11px label has nowhere to go but unreadable.
+
+                            360px    1440px */
+  --fs-2xs: clamp(0.6875rem, 0.656rem + 0.139vw, 0.78125rem); /*  11    12.5  eyebrow labels, never a sentence */
+  --fs-xs: clamp(0.75rem, 0.719rem + 0.139vw, 0.84375rem); /*     12    13.5  meta rows, chips */
+  --fs-sm: clamp(0.8125rem, 0.781rem + 0.139vw, 0.90625rem); /*   13    14.5  secondary lines */
+  --fs-base: clamp(0.90625rem, 0.875rem + 0.139vw, 1rem); /*      14.5  16    dense body: list rows, buttons */
+  --fs-md: clamp(0.96875rem, 0.927rem + 0.185vw, 1.09375rem); /*  15.5  17.5  primary body: titles, headlines */
+  --fs-lg: clamp(1.09375rem, 1rem + 0.417vw, 1.375rem); /*        17.5  22    group and section headings */
+  --fs-xl: clamp(1.1875rem, 1.083rem + 0.463vw, 1.5rem); /*       19    24    the brand */
+  --fs-icon: clamp(1.0625rem, 1rem + 0.278vw, 1.25rem); /*        17    20    glyph-only buttons */
+  /* Anything a phone keyboard focuses. Below 16px iOS Safari zooms the page on focus and
+     never zooms back, so this step has a hard floor the fluid scale is not allowed under. */
+  --fs-input: max(1rem, var(--fs-base));
+
+  /* Latin sits on 1.5; CJK needs more room between lines to stay legible, and the
+     two mix inside a single session title, so the shared value leans generous. */
+  --lh-tight: 1.35;
+  --lh-body: 1.55;
+
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+  --radius: 10px;
+  --radius-sm: 7px;
+  --tap: 44px;
+  /* Overwritten from JS when the desktop split is dragged. */
+  --sidebar-width: 360px;
+  /* Overwritten from JS with visualViewport.height so the composer stays above
+     the on-screen keyboard on phones. */
+  --app-height: 100dvh;
+  color-scheme: dark;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  /* The chrome is English, the session titles are routinely Chinese. Without the CJK
+     faces named here the fallback is whatever the platform picks -- on Windows and
+     Android that is often a mismatched or serif face beside the Latin text. */
+  --sans:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+    "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC",
+    "Source Han Sans SC", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* Several components set an explicit `display`, which would otherwise beat the
+   user-agent rule for `[hidden]`. */
+[hidden] {
+  display: none !important;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: var(--fs-md);
+  line-height: var(--lh-body);
+  overflow: hidden;
+  overscroll-behavior: none;
+  -webkit-text-size-adjust: 100%;
+  -webkit-font-smoothing: antialiased;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+  font-family: var(--sans);
+  color: inherit;
+}
+
+a {
+  color: var(--accent);
+}
+
+/* Anything the app puts a number in reads as a column, not as ragged glyphs. */
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ------------------------------------------------------------------ shell */
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: var(--app-height);
+  max-height: var(--app-height);
+  overflow: hidden;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex: none;
+  padding: calc(var(--safe-top) + 0.45rem) calc(var(--safe-right) + 0.6rem) 0.45rem
+    calc(var(--safe-left) + 0.6rem);
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+
+.brand {
+  margin: 0;
+  font-size: var(--fs-xl);
+  font-weight: 650;
+  letter-spacing: -0.015em;
+  color: var(--text-strong);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.topbar-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 0.4rem;
+  flex: none;
+}
+
+.shell {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  position: relative;
+}
+
+.detail {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+
+.session-pane {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.session-pane[hidden] {
+  display: none;
+}
+
+/* ----------------------------------------------------------------- buttons */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  min-height: var(--tap);
+  min-width: var(--tap);
+  padding: 0 0.75rem;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--panel-alt);
+  color: var(--text);
+  font-size: var(--fs-base);
+  font-weight: 500;
+  line-height: 1;
+  cursor: pointer;
+  text-decoration: none;
+  white-space: nowrap;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    color 0.15s ease;
+}
+
+.btn:hover:not(:disabled) {
+  background: var(--panel-raised);
+}
+
+.btn:active:not(:disabled) {
+  background: var(--panel-raised);
+}
+
+.btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.btn:focus-visible,
+.tab:focus-visible,
+.workspace-header:focus-visible,
+.session-row:focus-visible,
+.text-input:focus-visible,
+.composer-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 650;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: #4ee0f4;
+}
+
+.btn-danger {
+  background: transparent;
+  border-color: var(--danger-line);
+  color: var(--danger-ink);
+  font-weight: 600;
+}
+
+.btn-ghost {
+  background: transparent;
+}
+
+.btn-icon {
+  font-size: var(--fs-icon);
+  line-height: 1;
+}
+
+/* ------------------------------------------------------------------- misc */
+
+.empty-hint {
+  margin: 0;
+  color: var(--muted);
+  text-align: center;
+  padding: 1rem;
+  font-size: var(--fs-base);
+}
+
+.dot {
+  width: 9px;
+  height: 9px;
+  min-width: 9px;
+  border-radius: 50%;
+  background: var(--faint);
+  display: inline-block;
+  flex: none;
+}
+
+.dot.working {
+  background: var(--ok);
+  box-shadow: 0 0 0 3px var(--ok-soft);
+}
+
+.dot.waiting {
+  background: var(--warn);
+  box-shadow: 0 0 0 3px var(--warn-soft);
+}
+
+.dot.failed {
+  background: var(--danger);
+  box-shadow: 0 0 0 3px var(--danger-soft);
+}
+
+.dot.idle {
+  background: var(--faint);
+}
+
+.agent-badge {
+  font-size: var(--fs-2xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 0.1rem 0.35rem;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  flex: none;
+}
+
+.agent-badge.claude {
+  color: #f2b07a;
+  border-color: #5b4530;
+}
+
+.agent-badge.codex {
+  color: #9cc0fa;
+  border-color: #2f4364;
+}
+
+.toast {
+  position: fixed;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: calc(var(--safe-bottom) + 1.25rem);
+  z-index: 40;
+  max-width: min(90vw, 30rem);
+  padding: 0.6rem 0.9rem;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--panel-raised);
+  color: var(--text);
+  font-size: var(--fs-base);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+}
+
+.toast[hidden] {
+  display: none;
+}
+
+.toast.error {
+  border-color: var(--danger-line);
+  color: #fecaca;
+}
+
+/* --------------------------------------------------------- session header */
+
+.session-header {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  flex: none;
+  padding: 0.4rem calc(var(--safe-right) + 0.6rem) 0.4rem calc(var(--safe-left) + 0.6rem);
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--panel);
+}
+
+.back-link {
+  padding: 0 0.6rem;
+  flex: none;
+}
+
+.session-ident {
+  min-width: 0;
+  flex: 1;
+}
+
+.session-name {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  min-width: 0;
+}
+
+.session-title {
+  font-weight: 600;
+  font-size: var(--fs-md);
+  letter-spacing: -0.005em;
+  color: var(--text-strong);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.session-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  min-width: 0;
+}
+
+.session-meta > * {
+  flex: none;
+  white-space: nowrap;
+}
+
+.session-meta .path {
+  flex: 0 1 auto;
+  min-width: 5rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.session-actions {
+  position: relative;
+  flex: none;
+}
+
+.menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 0.35rem);
+  min-width: 12rem;
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.25rem;
+  z-index: 30;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.5);
+}
+
+.menu[hidden] {
+  display: none;
+}
+
+.menu-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  min-height: var(--tap);
+  padding: 0 0.7rem;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  cursor: pointer;
+  font-size: var(--fs-base);
+}
+
+.menu-item:hover {
+  background: var(--panel-alt);
+}
+
+.menu-item.danger {
+  color: var(--danger-ink);
+}
+
+.menu-item.armed {
+  background: var(--danger-soft);
+  font-weight: 600;
+}
+
+/* -------------------------------------------------------------------- tabs */
+
+.tabs {
+  display: flex;
+  gap: 0.3rem;
+  flex: none;
+  padding: 0.35rem calc(var(--safe-right) + 0.6rem) 0.35rem calc(var(--safe-left) + 0.6rem);
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--panel);
+}
+
+.tab {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 36px;
+  padding: 0 0.85rem;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  color: var(--muted);
+  text-decoration: none;
+  font-size: var(--fs-base);
+  font-weight: 500;
+}
+
+.tab:hover {
+  color: var(--text);
+}
+
+.tab.active {
+  background: var(--panel-raised);
+  border-color: var(--border);
+  color: var(--text-strong);
+  font-weight: 600;
+}
+
+/* ------------------------------------------------ collapse the session list
+
+   One control, one `data-list` attribute, two presentations:
+
+   * Two panes on screen (`data-layout="regular"`) -- the toggle folds the list out of the
+     flow so the detail pane takes the whole window. The choice is remembered per device,
+     and the toggle does not move when the list goes, so it is always one tap back.
+   * One pane at a time (`data-layout="compact"`) -- there is nothing to fold, the detail
+     pane already owns the screen. The same toggle slides the list in over it as a drawer,
+     which is how a landscape phone reaches search and the workspace groups without giving
+     up the board behind them. */
+
+.list-toggle {
+  flex: none;
+  padding: 0 0.6rem;
+}
+
+.list-toggle .toggle-glyph {
+  width: 15px;
+  height: 12px;
+  flex: none;
+  fill: currentColor;
+}
+
+/* Folded, on a two-pane layout. */
+.app[data-layout="regular"][data-list="collapsed"] .sidebar {
+  display: none;
+}
+
+.drawer-scrim {
+  display: none;
+  position: absolute;
+  inset: 0;
+  z-index: 18;
+  background: rgba(3, 7, 18, 0.66);
+  border: none;
+  padding: 0;
+  cursor: default;
+}
+
+/* The drawer, on a one-pane layout. */
+.app[data-layout="compact"] .sidebar {
+  display: none;
+}
+
+.app[data-layout="compact"][data-list="open"] .drawer-scrim {
+  display: block;
+}
+
+.app[data-layout="compact"][data-list="open"] .sidebar {
+  display: flex;
+  position: absolute;
+  inset: 0 auto 0 0;
+  z-index: 20;
+  /* Always leaves a scrim strip wide enough to be a tap target of its own, so the drawer
+     can be dismissed by tapping beside it and not only by the control that opened it. */
+  width: min(23rem, calc(100vw - 3.5rem));
+  border-right: 1px solid var(--border);
+  box-shadow: 14px 0 36px rgba(0, 0, 0, 0.55);
+  animation: drawer-in 0.18s ease-out;
+}
+
+@keyframes drawer-in {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+/* ------------------------------------------------------------ full screen */
+
+/* The TUI's `maximize` binding, re-cut: instead of a key that grows a pane by rows, one
+   toggle that gives the terminal the window. It only exists where there is other chrome
+   to reclaim -- on a one-pane layout the terminal already is the window -- and the session
+   header stays so there is always a way back. */
+.fullscreen-btn {
+  display: none;
+  flex: none;
+  padding: 0 0.6rem;
+}
+
+.app[data-layout="regular"][data-route="shell"] .fullscreen-btn,
+.app[data-layout="regular"][data-route="agent"] .fullscreen-btn {
+  display: inline-flex;
+}
+
+.app[data-fullscreen="true"] .topbar,
+.app[data-fullscreen="true"] .statusbar,
+.app[data-fullscreen="true"] .sidebar {
+  display: none;
+}
+
+/* --------------------------------------------------------------- responsive
+
+   The layout mode is decided in app.js from the signals that actually describe the
+   device -- pointer coarseness and viewport height as well as width -- and published
+   as `data-layout` on the shell. A width-only breakpoint puts a landscape phone
+   (844x390, coarse pointer, no hover) on the desktop two-pane layout, which is the bug
+   this replaces: wide enough for two panes, nowhere near tall enough for them.
+
+     data-layout="compact"  one pane at a time
+     data-layout="regular"  list and detail side by side
+     data-short="true"      under ~560px tall: strip vertical chrome
+     data-touch="true"      coarse pointer: full-size tap targets, no hover-only cues */
+
+/* -- one pane at a time ----------------------------------------------------
+   The detail pane is the screen -- the overview board at `#/`, the session everywhere
+   else -- and the list is the drawer above. */
+
+/* The session pane carries its own back button + title, so the global topbar
+   is redundant on one pane and its height is better spent on the conversation. */
+.app[data-layout="compact"]:not([data-route="dashboard"]) .topbar {
+  display: none;
+}
+
+.app[data-layout="compact"] .session-header {
+  padding-top: calc(var(--safe-top) + 0.4rem);
+}
+
+.app[data-layout="compact"] .back-link .btn-text {
+  display: none;
+}
+
+/* The branch is already on the list row; on one pane the header needs the
+   width for the working directory instead. */
+.app[data-layout="compact"] .session-meta .branch {
+  display: none;
+}
+
+/* -- two panes ------------------------------------------------------------- */
+
+.app[data-layout="regular"] .back-link {
+  display: none;
+}
+
+/* -- coarse pointer -------------------------------------------------------- */
+
+.app[data-touch="true"] .tab {
+  min-height: var(--tap);
+  padding: 0 1rem;
+}
+
+/* -- short viewport --------------------------------------------------------
+   A landscape phone has ~390px of height. Header, status strip, search field and
+   tool row used to eat 174px of it before a single session showed. These claw most
+   of that back without dropping a control or shrinking a tap target below --tap. */
+
+.app[data-short="true"] .topbar {
+  padding-top: calc(var(--safe-top) + 0.2rem);
+  padding-bottom: 0.2rem;
+}
+
+.app[data-short="true"] .brand {
+  font-size: var(--fs-md);
+}
+
+.app[data-short="true"] .btn {
+  min-height: 36px;
+}
+
+.app[data-short="true"] .tabs {
+  padding-top: 0.2rem;
+  padding-bottom: 0.2rem;
+}
+
+.app[data-short="true"] .tab {
+  min-height: 36px;
+}
+
+.app[data-short="true"] .session-header {
+  padding-top: calc(var(--safe-top) + 0.2rem);
+  padding-bottom: 0.2rem;
+}
+
+/* On a narrow phone there is no room for three labelled controls, and an
+   icon-only button is exactly the thing the header must not become. The list
+   already polls itself, so the manual refresh is the one that goes. */
+@media (max-width: 560px) {
+  #refresh-btn {
+    display: none;
+  }
+}

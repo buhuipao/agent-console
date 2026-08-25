@@ -1,0 +1,770 @@
+/* Conversation view: banners, message blocks, rendered markdown, composer. */
+
+.chat-view {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+
+.chat-view[hidden] {
+  display: none;
+}
+
+/* ---------------------------------------------------------------- banners */
+
+.chat-banners {
+  flex: none;
+}
+
+.chat-banners:empty {
+  display: none;
+}
+
+.banner {
+  margin: 0.5rem calc(var(--safe-right) + 0.7rem) 0 calc(var(--safe-left) + 0.7rem);
+  padding: 0.6rem 0.75rem;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--panel-alt);
+  font-size: var(--fs-sm);
+  color: var(--muted);
+}
+
+.banner.warn {
+  border-color: rgba(234, 179, 8, 0.5);
+  background: rgba(234, 179, 8, 0.1);
+  color: #fde68a;
+}
+
+.banner.error {
+  border-color: rgba(239, 68, 68, 0.5);
+  background: rgba(239, 68, 68, 0.1);
+  color: #fecaca;
+}
+
+.banner-title {
+  display: block;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 0.2rem;
+}
+
+/* ------------------------------------------------------- pending decisions */
+
+.decision-card {
+  margin: 0.5rem calc(var(--safe-right) + 0.7rem) 0 calc(var(--safe-left) + 0.7rem);
+  border: 1px solid rgba(234, 179, 8, 0.55);
+  border-left-width: 4px;
+  border-radius: var(--radius);
+  background: rgba(234, 179, 8, 0.12);
+}
+
+.decision-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  padding: 0.55rem 0.75rem;
+}
+
+.decision-badge {
+  flex: none;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  background: var(--warn);
+  color: #1f1500;
+  font-size: var(--fs-2xs);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.decision-head-text {
+  font-size: var(--fs-base);
+  font-weight: 600;
+  color: var(--text);
+}
+
+.decision-item {
+  padding: 0 0.75rem 0.7rem;
+}
+
+.decision-item + .decision-item {
+  border-top: 1px solid rgba(234, 179, 8, 0.3);
+  padding-top: 0.6rem;
+}
+
+.decision-index {
+  display: block;
+  font-size: var(--fs-2xs);
+  color: var(--muted);
+  margin-bottom: 0.15rem;
+}
+
+.decision-question {
+  margin: 0 0 0.5rem;
+  font-size: var(--fs-md);
+  line-height: 1.4;
+  color: var(--text);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+/* The slot answer controls drop into: either the provider's own options, or -- for a decision
+   only the hooks know about, which carries no options -- a hand-off to the terminal. */
+.decision-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.decision-actions .btn {
+  text-decoration: none;
+}
+
+/* One option per row rather than side by side: option labels are the provider's own prose
+   ("Yes, I trust this folder"), which does not fit two-up on a phone, and a mis-tap here
+   answers a safety question. */
+.decision-option {
+  justify-content: flex-start;
+  width: 100%;
+  gap: 0.5rem;
+  padding: 0.5rem 0.6rem;
+  border-color: rgba(234, 179, 8, 0.5);
+  background: rgba(15, 23, 42, 0.55);
+  text-align: left;
+  white-space: normal;
+}
+
+.decision-option:hover:not(:disabled) {
+  background: rgba(15, 23, 42, 0.85);
+}
+
+.option-number {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.4rem;
+  height: 1.4rem;
+  border-radius: 999px;
+  background: rgba(234, 179, 8, 0.25);
+  color: var(--warn);
+  font-size: var(--fs-xs);
+  font-weight: 700;
+}
+
+.option-label {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  line-height: 1.3;
+}
+
+.summary-card {
+  margin: 0.5rem calc(var(--safe-right) + 0.7rem) 0 calc(var(--safe-left) + 0.7rem);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+  font-size: var(--fs-sm);
+}
+
+.summary-card > summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 0.55rem 0.75rem;
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-height: var(--tap);
+}
+
+.summary-card > summary::-webkit-details-marker {
+  display: none;
+}
+
+.summary-label {
+  font-size: var(--fs-2xs);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  flex: none;
+}
+
+.summary-task {
+  min-width: 0;
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text);
+}
+
+.summary-card-empty {
+  padding: 0.35rem 0.75rem;
+}
+
+.summary-empty-row {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-height: var(--tap);
+}
+
+.summary-task.muted {
+  color: var(--muted);
+}
+
+.summary-retry {
+  flex: none;
+  min-height: 32px;
+  padding: 0 0.55rem;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--panel-alt);
+  color: var(--text);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+}
+
+.summary-retry:hover:not(:disabled) {
+  background: var(--panel-raised);
+}
+
+.summary-retry:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.summary-body {
+  padding: 0 0.75rem 0.7rem;
+  color: var(--muted);
+}
+
+.summary-body dt {
+  font-size: var(--fs-2xs);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin-top: 0.5rem;
+}
+
+.summary-body dd {
+  margin: 0.15rem 0 0;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.summary-body ul {
+  margin: 0.15rem 0 0;
+  padding-left: 1.1rem;
+  color: var(--text);
+}
+
+/* --------------------------------------------------------------- messages */
+
+.messages {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  padding: 0.75rem calc(var(--safe-right) + 0.7rem) 0.5rem calc(var(--safe-left) + 0.7rem);
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+}
+
+.msg {
+  max-width: 100%;
+  min-width: 0;
+}
+
+.msg-role {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: var(--fs-2xs);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin-bottom: 0.25rem;
+}
+
+.msg-body {
+  border-radius: 12px;
+  padding: 0.6rem 0.8rem;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.msg.user {
+  align-self: flex-end;
+  max-width: min(92%, 46rem);
+}
+
+.msg.user .msg-role {
+  justify-content: flex-end;
+}
+
+.msg.user .msg-body {
+  background: rgba(34, 211, 238, 0.09);
+  border-color: rgba(34, 211, 238, 0.42);
+}
+
+.msg.assistant {
+  align-self: stretch;
+  max-width: 56rem;
+  width: 100%;
+}
+
+.msg.system {
+  align-self: stretch;
+  max-width: 56rem;
+}
+
+.msg.system .msg-body {
+  background: transparent;
+  border-style: dashed;
+  color: var(--muted);
+  font-size: var(--fs-sm);
+}
+
+/* Optimistic bubbles sit in a wrapper rather than directly in the message flex column, so
+   they need the user-side alignment restated -- otherwise a bubble jumps from left to right
+   the moment it is pinned into the transcript. */
+.pending-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.7rem;
+}
+
+.pending-wrap:empty {
+  display: none;
+}
+
+.msg.pending {
+  opacity: 0.6;
+}
+
+/* A prompt that was refused, or one the transcript never confirmed, is not "in flight" -- it
+   has to read differently from one that is simply waiting for the transcript to catch up.
+   Red means it definitely did not send; amber means nobody can tell yet. */
+.msg.pending.unsent,
+.msg.pending.unconfirmed {
+  opacity: 1;
+}
+
+.msg.pending.unsent .msg-body {
+  border-color: rgba(239, 68, 68, 0.55);
+  background: rgba(239, 68, 68, 0.08);
+}
+
+.msg.pending.unconfirmed .msg-body {
+  border-color: rgba(234, 179, 8, 0.55);
+  background: rgba(234, 179, 8, 0.08);
+}
+
+.msg-status {
+  text-transform: none;
+  letter-spacing: 0;
+  overflow-wrap: anywhere;
+}
+
+.msg-status.sent {
+  color: var(--ok);
+}
+
+.msg-status.failed {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+.msg-status.stalled {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+/* The way back from a refused send, inside the bubble that refused. */
+.msg-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 0.35rem;
+}
+
+.msg-retry {
+  min-height: 2rem;
+  padding: 0 0.7rem;
+  font-size: var(--fs-sm);
+  border-color: rgba(239, 68, 68, 0.55);
+  color: var(--text);
+}
+
+/* Tool calls and their results: a compact stream, not a labelled bubble. */
+.msg.tool {
+  align-self: stretch;
+  max-width: 56rem;
+  width: 100%;
+}
+
+.msg.tool .msg-body {
+  border: none;
+  background: transparent;
+  padding: 0;
+}
+
+.msg.tool + .msg.tool {
+  margin-top: -0.4rem;
+}
+
+.msg-block + .msg-block {
+  margin-top: 0.5rem;
+}
+
+/* --------------------------------------------------- thinking / tool blocks */
+
+.fold {
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--panel-alt);
+  overflow: hidden;
+}
+
+.fold > summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.4rem 0.55rem;
+  min-height: 38px;
+  font-size: var(--fs-sm);
+  color: var(--muted);
+}
+
+.fold > summary::-webkit-details-marker {
+  display: none;
+}
+
+.fold > summary:hover {
+  background: var(--panel-raised);
+}
+
+.fold-caret {
+  flex: none;
+  font-size: var(--fs-2xs);
+  color: var(--muted);
+  transition: transform 0.12s ease;
+}
+
+.fold[open] .fold-caret {
+  transform: rotate(90deg);
+}
+
+.fold-line {
+  min-width: 0;
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fold-detail {
+  padding: 0.1rem 0.6rem 0.55rem;
+  font-size: var(--fs-sm);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.fold-detail pre {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--mono);
+  font-size: 0.92em;
+  color: var(--muted);
+}
+
+.chip {
+  flex: none;
+  padding: 0.1rem 0.4rem;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: var(--panel-raised);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+}
+
+.chip.ok {
+  color: var(--ok);
+  border-color: rgba(34, 197, 94, 0.4);
+}
+
+.chip.fail {
+  color: var(--danger);
+  border-color: rgba(239, 68, 68, 0.5);
+}
+
+.fold.thinking {
+  background: transparent;
+  border-style: dashed;
+}
+
+.fold.error > summary {
+  color: #fecaca;
+}
+
+/* ------------------------------------------------------- markdown rendering */
+
+.md > *:first-child {
+  margin-top: 0;
+}
+
+.md > *:last-child {
+  margin-bottom: 0;
+}
+
+.md p {
+  margin: 0 0 0.6rem;
+  overflow-wrap: anywhere;
+}
+
+.md h1,
+.md h2,
+.md h3,
+.md h4 {
+  margin: 0.9rem 0 0.4rem;
+  line-height: 1.3;
+}
+
+.md h1 {
+  font-size: 1.28em;
+}
+
+.md h2 {
+  font-size: 1.16em;
+}
+
+.md h3 {
+  font-size: 1.07em;
+}
+
+.md h4 {
+  font-size: 1em;
+  color: var(--muted);
+}
+
+.md ul,
+.md ol {
+  margin: 0 0 0.6rem;
+  padding-left: 1.3rem;
+}
+
+.md li {
+  margin: 0.15rem 0;
+}
+
+.md blockquote {
+  margin: 0 0 0.6rem;
+  padding: 0.1rem 0.7rem;
+  border-left: 3px solid var(--border);
+  color: var(--muted);
+}
+
+.md hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 0.8rem 0;
+}
+
+.md code {
+  font-family: var(--mono);
+  font-size: 0.82em;
+  padding: 0.08em 0.32em;
+  border-radius: 4px;
+  background: rgba(148, 163, 184, 0.16);
+  overflow-wrap: anywhere;
+}
+
+.md pre {
+  margin: 0 0 0.6rem;
+  padding: 0.6rem 0.7rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #0a1020;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  max-width: 100%;
+}
+
+.md pre code {
+  display: block;
+  padding: 0;
+  background: none;
+  white-space: pre;
+  overflow-wrap: normal;
+  font-size: 0.92em;
+  line-height: 1.45;
+}
+
+.md .code-lang {
+  display: block;
+  font-family: var(--mono);
+  font-size: var(--fs-2xs);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin-bottom: 0.35rem;
+}
+
+.md a {
+  color: var(--accent);
+  overflow-wrap: anywhere;
+}
+
+.md table {
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+  border-collapse: collapse;
+  margin: 0 0 0.6rem;
+  font-size: var(--fs-sm);
+}
+
+.md th,
+.md td {
+  border: 1px solid var(--border);
+  padding: 0.25rem 0.5rem;
+  text-align: left;
+}
+
+.load-earlier {
+  align-self: center;
+  flex: none;
+  min-height: 38px;
+  padding: 0 0.9rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--panel-alt);
+  color: var(--muted);
+  font-size: var(--fs-sm);
+  cursor: pointer;
+}
+
+.load-earlier:hover:not(:disabled) {
+  background: var(--panel-raised);
+  color: var(--text);
+}
+
+.load-earlier:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* ------------------------------------------------------------ jump to latest */
+
+.jump-latest {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: 5.4rem;
+  z-index: 5;
+  min-height: 38px;
+  padding: 0 0.9rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--panel-raised);
+  color: var(--text);
+  font-size: var(--fs-sm);
+  cursor: pointer;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+
+.jump-latest[hidden] {
+  display: none;
+}
+
+/* ---------------------------------------------------------------- composer */
+
+.composer {
+  flex: none;
+  display: flex;
+  align-items: flex-end;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  padding: 0.5rem calc(var(--safe-right) + 0.7rem) calc(var(--safe-bottom) + 0.5rem)
+    calc(var(--safe-left) + 0.7rem);
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.composer-input {
+  flex: 1;
+  min-width: 0;
+  min-height: var(--tap);
+  max-height: 40vh;
+  padding: 0.6rem 0.7rem;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--panel-alt);
+  color: var(--text);
+  font-size: var(--fs-input);
+  line-height: 1.4;
+  resize: none;
+  overflow-y: auto;
+}
+
+.composer-input:disabled {
+  opacity: 0.5;
+}
+
+.composer-side {
+  display: flex;
+  gap: 0.4rem;
+  flex: none;
+}
+
+.composer-hint {
+  flex-basis: 100%;
+  margin: 0.25rem 0 0;
+  font-size: var(--fs-xs);
+  color: var(--muted);
+}
+
+.composer-hint:empty {
+  display: none;
+}
+
+/* Stop and Send together leave a phone-width prompt field about 250px wide, which is not
+   enough to read back what you typed. Below this width the two buttons take their own row
+   and the field keeps the full line. */
+@media (max-width: 480px) {
+  .composer.has-stop .composer-side {
+    flex-basis: 100%;
+    justify-content: flex-end;
+  }
+}
+
+/* The keyboard hint is desktop advice ("Enter sends, Shift+Enter newlines"); on one pane
+   the row it costs is worth more than the sentence. */
+.app[data-layout="compact"] .composer-hint {
+  display: none;
+}
+
+/* A disclosure triangle is a tap target wherever the pointer is coarse, whatever the
+   window is wide. */
+.app[data-touch="true"] .fold > summary {
+  min-height: var(--tap);
+}
+
+@media (max-width: 768px) {
+  .msg.assistant .msg-body,
+  .msg.system .msg-body {
+    padding: 0.55rem 0.65rem;
+  }
+}

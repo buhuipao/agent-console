@@ -1,0 +1,356 @@
+/* The session list: sessions grouped under collapsible workspace headers, plus the search
+   box and the tool row above them. It is the navigator -- dense rows you scan and tap.
+   The overview board in css/overview.css is the other half: the same sessions, read for
+   what they are doing rather than for where to go next. */
+
+.sidebar {
+  position: relative;
+  width: 100%;
+  /* Never more than four tenths of a two-pane window: at 820px the fixed 360px left the
+     detail pane narrower than the list beside it. */
+  max-width: min(var(--sidebar-width), 40vw);
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+}
+
+/* Only the two-pane layout clamps to a fraction of the window; a drawer or a full-screen
+   list is already the width it should be. */
+.app[data-layout="compact"] .sidebar {
+  max-width: none;
+  border-right: none;
+}
+
+/* A grab strip over the sidebar's own border. Pointer events only -- there is nothing to
+   drag when the list is a drawer. */
+.sidebar-splitter {
+  position: absolute;
+  top: 0;
+  right: -3px;
+  width: 7px;
+  height: 100%;
+  z-index: 3;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.app[data-layout="compact"] .sidebar-splitter {
+  display: none;
+}
+
+.sidebar-splitter:hover,
+.sidebar-splitter:active {
+  background: var(--accent-line);
+}
+
+.sidebar-tools {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  flex: none;
+  padding: 0.15rem calc(var(--safe-right) + 0.75rem) 0.15rem calc(var(--safe-left) + 0.75rem);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: var(--tap);
+  font-size: var(--fs-sm);
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.switch input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent);
+}
+
+.sidebar-count {
+  font-size: var(--fs-xs);
+  color: var(--faint);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.workspaces {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding-bottom: calc(var(--safe-bottom) + 1rem);
+}
+
+/* ------------------------------------------------------- workspace groups
+
+   The group is the parent and has to read as one. Before this the workspace name was
+   set *smaller* than the session titles nested under it (0.85rem/600 against 0.9rem),
+   so the grouping registered as noise rather than as structure. Four signals now carry
+   it, none of them colour alone:
+
+     1. size + weight -- 17px/700 against a 14-15px/500 row title
+     2. a filled, sticky header bar that stays on screen while its own group scrolls
+     3. a rail down the left of the group's rows, so the rows sit visibly inside it
+     4. a gap above every group, so two groups never touch */
+
+.workspace {
+  margin-top: 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.workspace:first-child {
+  margin-top: 0;
+}
+
+.workspace-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  min-height: var(--tap);
+  padding: 0.45rem calc(var(--safe-right) + 0.75rem) 0.45rem calc(var(--safe-left) + 0.5rem);
+  border: none;
+  border-top: 1px solid var(--border);
+  border-left: 3px solid var(--accent-line);
+  background: var(--panel-alt);
+  color: var(--text-strong);
+  text-align: left;
+  cursor: pointer;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  box-shadow: 0 1px 0 var(--border);
+}
+
+.workspace-header:hover {
+  background: var(--panel-raised);
+}
+
+.workspace-caret {
+  flex: none;
+  width: 0.9rem;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  transition: transform 0.12s ease;
+}
+
+.workspace[data-collapsed="true"] .workspace-caret {
+  transform: rotate(-90deg);
+}
+
+.workspace-labels {
+  min-width: 0;
+  flex: 1;
+}
+
+.workspace-name {
+  display: block;
+  font-size: var(--fs-lg);
+  font-weight: 700;
+  line-height: 1.25;
+  letter-spacing: -0.015em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Metadata, not a second title: monospace and dim, so the eye reads the name and
+   stops. */
+.workspace-path {
+  display: block;
+  font-family: var(--mono);
+  font-size: var(--fs-2xs);
+  color: var(--faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.workspace-tally {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  flex: none;
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.workspace[data-collapsed="true"] .workspace-sessions {
+  display: none;
+}
+
+.workspace-sessions {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  /* The rail that puts the rows inside the group rather than merely after it. */
+  border-left: 3px solid var(--border);
+}
+
+/* ------------------------------------------------------------ session rows */
+
+/* The row link and its archive control are siblings, laid over each other so the link still
+   fills the row and stays the whole-row tap target. */
+.session-row-wrap {
+  position: relative;
+}
+
+.session-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55rem;
+  width: 100%;
+  min-height: 58px;
+  /* The right inset reserves room for the row's archive control, so a two-line title never
+     runs underneath it. */
+  padding: 0.55rem calc(var(--safe-right) + 5rem) 0.55rem calc(var(--safe-left) + 0.75rem);
+  border: none;
+  border-top: 1px solid var(--border-soft);
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  text-decoration: none;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.workspace-sessions > li:first-child .session-row {
+  border-top: none;
+}
+
+.session-row:hover {
+  background: var(--panel-alt);
+}
+
+.session-row.active {
+  background: var(--panel-raised);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.session-row .dot {
+  margin-top: 0.4rem;
+}
+
+.session-row-body {
+  min-width: 0;
+  flex: 1;
+}
+
+.session-row-title {
+  display: block;
+  font-size: var(--fs-base);
+  font-weight: 500;
+  line-height: var(--lh-tight);
+  /* Two-line clamp: session titles are often a whole sentence, and truncating to
+     one line on a phone hides the only thing that identifies the session. */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+/* A phone reads at arm's length; 14px rows that are fine under a mouse are not. */
+.app[data-touch="true"] .session-row-title {
+  font-size: var(--fs-md);
+}
+
+.session-row-sub {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.25rem 0.4rem;
+  margin-top: 0.22rem;
+  font-size: var(--fs-xs);
+  line-height: 1.4;
+  color: var(--muted);
+}
+
+.session-row-sub .sep {
+  color: var(--faint);
+}
+
+.status-word {
+  font-weight: 600;
+  color: var(--faint);
+}
+
+.status-word.working {
+  color: var(--ok-ink);
+}
+
+.status-word.waiting {
+  color: var(--warn-ink);
+}
+
+.status-word.failed {
+  color: var(--danger-ink);
+}
+
+.decision-flag {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  background: var(--warn-soft);
+  border: 1px solid var(--warn-line);
+  color: var(--warn-ink);
+  font-size: var(--fs-2xs);
+  font-weight: 700;
+}
+
+.archived-flag {
+  padding: 0.05rem 0.35rem;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  font-size: var(--fs-2xs);
+  color: var(--faint);
+}
+
+.row-archive {
+  position: absolute;
+  top: 50%;
+  right: calc(var(--safe-right) + 0.5rem);
+  transform: translateY(-50%);
+  min-height: var(--tap);
+  padding: 0 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel-alt);
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.row-archive:hover:not(:disabled) {
+  background: var(--panel-raised);
+  color: var(--text);
+}
+
+.row-archive:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.row-archive:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Vertical room is the scarce thing on a landscape phone. Padding is what gives it back;
+   the tap targets themselves stay at --tap. */
+.app[data-short="true"] .sidebar-search {
+  padding-top: 0.25rem;
+  padding-bottom: 0.15rem;
+}

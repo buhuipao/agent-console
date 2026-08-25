@@ -1,0 +1,303 @@
+/* The overview board -- what `#/` draws in the detail pane on every layout.
+
+   On a two-pane window it fills what used to be a "Pick a session" placeholder beside the
+   list. On one pane it *is* the home screen, and the list is a drawer behind the toggle,
+   because on a phone the expensive move is opening five sessions to find the blocked one. */
+
+.overview-pane {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.overview-pane[hidden] {
+  display: none;
+}
+
+.overview-board {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 0 calc(var(--safe-right) + 0.75rem) calc(var(--safe-bottom) + 1.5rem)
+    calc(var(--safe-left) + 0.75rem);
+}
+
+/* ---------------------------------------------------------------- sections */
+
+.board-section {
+  margin-top: 0.35rem;
+}
+
+.board-section-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0;
+  padding: 0.7rem 0 0.4rem;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--bg);
+}
+
+.board-section-title {
+  font-size: var(--fs-2xs);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--muted);
+}
+
+.board-section-count {
+  min-width: 1.4rem;
+  padding: 0 0.35rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--panel-alt);
+  color: var(--muted);
+  font-size: var(--fs-2xs);
+  font-weight: 700;
+  line-height: 1.2rem;
+  text-align: center;
+}
+
+/* Each section is named as well as tinted: the count pill borrows the status colour, the
+   heading says the word. Colour is never carrying the meaning by itself. */
+.board-section.attention .board-section-title {
+  color: var(--warn-ink);
+}
+
+.board-section.attention .board-section-count {
+  border-color: var(--warn-line);
+  background: var(--warn-soft);
+  color: var(--warn-ink);
+}
+
+.board-section.working .board-section-title {
+  color: var(--ok-ink);
+}
+
+.board-section.working .board-section-count {
+  border-color: var(--ok-line);
+  background: var(--ok-soft);
+  color: var(--ok-ink);
+}
+
+/* ------------------------------------------------------------------- cards */
+
+.board-items {
+  display: grid;
+  gap: 0.5rem;
+}
+
+/* A grid item's default `min-width: auto` lets a long unbroken task line push past its
+   track instead of ellipsing inside it. */
+.board-items > * {
+  min-width: 0;
+}
+
+/* Wide windows fit two columns of cards; the idle list stays one column so its rows
+   keep reading as a list. */
+@media (min-width: 1100px) {
+  .board-items.attention,
+  .board-items.working {
+    grid-template-columns: repeat(auto-fill, minmax(22rem, 1fr));
+  }
+}
+
+.board-card {
+  display: block;
+  padding: 0.6rem 0.75rem 0.7rem;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+  color: var(--text);
+  text-decoration: none;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  transition: background-color 0.15s ease;
+}
+
+.board-card:hover {
+  background: var(--panel-alt);
+}
+
+.board-card.active {
+  background: var(--panel-raised);
+  border-color: var(--accent-line);
+}
+
+.board-card.waiting {
+  border-left-color: var(--warn);
+}
+
+.board-card.failed {
+  border-left-color: var(--danger);
+}
+
+.board-card.working {
+  border-left-color: var(--ok);
+}
+
+.card-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.3rem 0.45rem;
+  font-size: var(--fs-xs);
+  color: var(--muted);
+}
+
+.card-meta .dot {
+  margin-top: 0;
+}
+
+.card-workspace {
+  max-width: 12rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: var(--fs-2xs);
+  color: var(--faint);
+}
+
+.card-age {
+  color: var(--faint);
+}
+
+.card-task {
+  margin: 0.3rem 0 0;
+  font-size: var(--fs-md);
+  font-weight: 600;
+  line-height: var(--lh-tight);
+  color: var(--text-strong);
+  /* Same two-line clamp the list rows use: a task line is often a pasted paragraph. */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+/* ------------------------------------------------------------------ fields */
+
+.card-field {
+  display: flex;
+  gap: 0.45rem;
+  margin: 0.35rem 0 0;
+  font-size: var(--fs-sm);
+  line-height: 1.45;
+  color: var(--muted);
+}
+
+/* Fixed width so the values line up into a column. Wide enough for the longest label
+   ("BLOCKED") at the top of the fluid scale, where it is widest -- at 3.6rem it overran its
+   own box on a desktop and collided with the sentence beside it. */
+.card-field-label {
+  flex: none;
+  width: 4.4rem;
+  font-size: var(--fs-2xs);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+  color: var(--faint);
+  padding-top: 0.12rem;
+}
+
+.card-field-value {
+  min-width: 0;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+/* The one thing on the board that a person has to act on. */
+.card-field.ask .card-field-label {
+  color: var(--warn-ink);
+}
+
+.card-field.ask .card-field-value {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.card-field.blocked .card-field-label {
+  color: var(--danger-ink);
+}
+
+.card-more {
+  margin: 0.25rem 0 0 4.85rem;
+  font-size: var(--fs-xs);
+  color: var(--faint);
+}
+
+/* --------------------------------------------------------------- idle rows */
+
+.board-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55rem;
+  min-height: var(--tap);
+  padding: 0.45rem 0.6rem;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+  color: var(--text);
+  text-decoration: none;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.board-row:hover {
+  background: var(--panel-alt);
+}
+
+.board-row.active {
+  background: var(--panel-raised);
+  border-color: var(--accent-line);
+}
+
+.board-row .dot {
+  margin-top: 0.42rem;
+}
+
+.board-row-body {
+  min-width: 0;
+  flex: 1;
+}
+
+.board-row-task {
+  display: block;
+  font-size: var(--fs-base);
+  line-height: var(--lh-tight);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.board-row-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin-top: 0.1rem;
+  font-size: var(--fs-2xs);
+  color: var(--faint);
+  min-width: 0;
+}
+
+.board-row-meta .card-workspace {
+  max-width: 9rem;
+}
+
+.overview-empty {
+  margin: 2rem auto;
+}
