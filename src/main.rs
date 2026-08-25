@@ -1,5 +1,6 @@
 mod app;
 mod clipboard;
+mod completion;
 mod config;
 mod diagnostics;
 mod discovery;
@@ -10,13 +11,18 @@ mod providers;
 mod pty;
 mod store;
 mod summary;
+mod web;
 
 use std::{
-    env, fs, io,
+    env, io,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::Duration,
 };
 
-use app::{App, DialogField, TextDialogKind};
+use app::{App, DialogField, TextDialogKind, WebStatus, WorkspaceDrive};
+use completion::workspace_directory_completions;
+use config::AgentConsoleConfig;
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -54,8 +60,10 @@ fn main() -> io::Result<()> {
 }
 
 fn dispatch() -> io::Result<()> {
-    let mut args = env::args().skip(1);
-    match args.next().as_deref() {
+    let mut args = env::args().skip(1).peekable();
+    // Peeked, not consumed: the dashboard now takes options of its own, so a leading `--host`
+    // has to fall through to it rather than be swallowed as a subcommand name.
+    match args.peek().map(String::as_str) {
         Some("--version" | "-V") => {
             println!("agent-console {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -64,33 +72,47 @@ fn dispatch() -> io::Result<()> {
             print!("{}", cli_help());
             Ok(())
         }
-        Some("hook") => run_hook(args.next()),
-        Some("doctor") => run_doctor(),
-        Some("pty-daemon") => args
-            .next()
-            .map(PathBuf::from)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "pty-daemon requires a socket path",
-                )
-            })
-            .and_then(|socket| pty::run_pty_daemon(&socket)),
-        Some("pty-daemon-stop") => args
-            .next()
-            .map(PathBuf::from)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "pty-daemon-stop requires a socket path",
-                )
-            })
-            .and_then(|socket| pty::stop_pty_daemon(&socket)),
-        Some(other) => Err(io::Error::new(
+        Some("hook") => {
+            args.next();
+            run_hook(args.next())
+        }
+        Some("doctor") => {
+            args.next();
+            run_doctor()
+        }
+        Some("pty-daemon") => {
+            args.next();
+            args.next()
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "pty-daemon requires a socket path",
+                    )
+                })
+                .and_then(|socket| pty::run_pty_daemon(&socket))
+        }
+        Some("pty-daemon-stop") => {
+            args.next();
+            args.next()
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "pty-daemon-stop requires a socket path",
+                    )
+                })
+                .and_then(|socket| pty::stop_pty_daemon(&socket))
+        }
+        Some("web") => {
+            args.next();
+            run_web_command(args)
+        }
+        Some(other) if !other.starts_with('-') => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("unknown command: {other}"),
         )),
-        None => run_dashboard(),
+        _ => run_dashboard(args),
     }
 }
 
@@ -100,11 +122,123 @@ fn cli_help() -> &'static str {
         env!("CARGO_PKG_VERSION"),
         "\n\n",
         "Usage:\n",
-        "  agent-console             Open the dashboard\n",
-        "  agent-console doctor      Check providers and terminal prerequisites\n",
-        "  agent-console --help      Show this help\n",
-        "  agent-console --version   Show the version\n",
+        "  agent-console [--host H] [--port P] [--auth U:P] [--no-web]\n",
+        "                                        Open the dashboard, serving the web UI too\n",
+        "  agent-console doctor                 Check providers and terminal prerequisites\n",
+        "  agent-console web [--host H] [--port P] [--auth U:P]\n",
+        "                                        Serve the web/PWA dashboard alone, with no TUI\n",
+        "  agent-console --help                 Show this help\n",
+        "  agent-console --version              Show the version\n",
+        "\n",
+        "Web options (dashboard and `web` alike; default 127.0.0.1:7878):\n",
+        "  --host <H>   Bind address; a hostname or an IP. Anything but loopback warns\n",
+        "  --port <P>   Bind port. Already in use leaves the dashboard running without it\n",
+        "  --auth <U:P> HTTP Basic user and password. Without it, a random URL token\n",
+        "  --no-web     Open the dashboard only (dashboard invocation only)\n",
+        "\n",
+        "Each of those also reads an environment variable, then [web] host/port/auth/\n",
+        "enabled in ~/.config/agent-console/config.toml:\n",
+        "  AGENT_CONSOLE_WEB_HOST   AGENT_CONSOLE_WEB_PORT\n",
+        "  AGENT_CONSOLE_WEB_AUTH   AGENT_CONSOLE_WEB_ENABLED\n",
+        "Command line wins over environment wins over config file. Prefer the environment\n",
+        "or the config file for a password: argv is visible in `ps` to every local user.\n",
     )
+}
+
+fn web_help() -> &'static str {
+    concat!(
+        "Agent Console web ",
+        env!("CARGO_PKG_VERSION"),
+        "\n\n",
+        "Serve a responsive PWA dashboard that drives the same sessions the TUI does:\n",
+        "list, create, attach, type into, resize, archive, and terminate sessions from a\n",
+        "phone or desktop browser.\n\n",
+        "Plain `agent-console` already serves this beside the dashboard. This subcommand is\n",
+        "for a machine with no TUI attached to it.\n\n",
+        "Usage:\n",
+        "  agent-console web [--host <H>] [--port <P>] [--auth <user>:<password>]\n\n",
+        "Options:\n",
+        "  --host <H>   Bind address, hostname or IP (default 127.0.0.1)\n",
+        "  --port <P>   Bind port (default 7878)\n",
+        "  --auth <U:P> HTTP Basic user and password. Without it, a random URL token\n",
+        "  --help, -h   Show this help\n\n",
+        "Also read from AGENT_CONSOLE_WEB_HOST, AGENT_CONSOLE_WEB_PORT and\n",
+        "AGENT_CONSOLE_WEB_AUTH, and from [web] host/port/auth in\n",
+        "~/.config/agent-console/config.toml. Command line wins, then environment, then\n",
+        "the config file.\n",
+    )
+}
+
+/// What the command line asked for, before the environment and the config file get a say.
+#[derive(Debug)]
+enum ParsedOptions {
+    Help,
+    Options(web::WebOverrides),
+}
+
+/// Parses the web options both invocations share.
+///
+/// `--no-web` is only offered where it means something: on `agent-console web` the server is
+/// the entire command, so accepting a flag that turns it off would be nonsense.
+fn parse_web_options(
+    mut args: impl Iterator<Item = String>,
+    context: &str,
+    allow_disable: bool,
+) -> io::Result<ParsedOptions> {
+    let mut overrides = web::WebOverrides::default();
+    while let Some(arg) = args.next() {
+        let mut value = || {
+            args.next().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{arg} requires a value"),
+                )
+            })
+        };
+        match arg.as_str() {
+            "--help" | "-h" => return Ok(ParsedOptions::Help),
+            "--host" => overrides.host = Some(value()?),
+            "--port" => {
+                let raw = value()?;
+                overrides.port = Some(raw.parse().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid --port value: {raw}"),
+                    )
+                })?);
+            }
+            // The value is a password. It is not echoed here, and a bad one is reported by
+            // `WebSettings::resolve` in terms of the rule it broke.
+            "--auth" => overrides.auth = Some(value()?),
+            "--no-web" if allow_disable => overrides.enabled = Some(false),
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unknown {context}: {other}"),
+                ));
+            }
+        }
+    }
+    Ok(ParsedOptions::Options(overrides))
+}
+
+/// Command line, then environment, then `[web]` in the config file.
+fn web_settings(overrides: &web::WebOverrides) -> io::Result<web::WebSettings> {
+    let config = AgentConsoleConfig::load()?;
+    web::WebSettings::resolve(overrides, &web::WebEnv::from_environment(), &config.web)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+}
+
+fn run_web_command(args: impl Iterator<Item = String>) -> io::Result<()> {
+    match parse_web_options(args, "web option", false)? {
+        ParsedOptions::Help => {
+            print!("{}", web_help());
+            Ok(())
+        }
+        // `enabled` is ignored here on purpose: asking for the server by name outranks a
+        // config file that turned the dashboard's embedded one off.
+        ParsedOptions::Options(overrides) => web::run_web(&web_settings(&overrides)?),
+    }
 }
 
 fn run_hook(provider: Option<String>) -> io::Result<()> {
@@ -130,134 +264,124 @@ fn run_hook(provider: Option<String>) -> io::Result<()> {
     Ok(())
 }
 
+/// Prints the shared `doctor::report()`. Every probe lives there so the web endpoint runs
+/// the same checks; this function only decides how a line reads on a terminal.
 fn run_doctor() -> io::Result<()> {
-    let config = config::AgentConsoleConfig::load()?;
-    let discovery = discovery::DiscoveryPaths::from_environment();
-    let mut providers = 0;
-    let mut failures = 0;
-    let enabled = crate::providers::enabled();
+    let report = doctor::report()?;
     println!(
         "ok   providers enabled: {}",
-        enabled
-            .iter()
-            .map(|adapter| adapter.kind.label())
-            .collect::<Vec<_>>()
-            .join(", ")
+        report.providers_enabled.join(", ")
     );
-    for provider in enabled.iter().map(|adapter| adapter.kind) {
-        let name = provider.label();
-        match doctor::check_configured_provider(&config, provider) {
-            doctor::ProviderStatus::Available(version) => {
-                providers += 1;
-                println!("ok   {name}: {version}");
-                match doctor::version_support(provider, &version) {
-                    doctor::VersionSupport::Supported => {
-                        println!("ok   {name} version: supported")
-                    }
-                    doctor::VersionSupport::TooOld => {
-                        println!("fail {name} version: below the supported minimum");
-                        failures += 1;
-                    }
-                    doctor::VersionSupport::Unknown => {
-                        println!("info {name} version: could not parse; compatibility unverified")
-                    }
-                }
-                for capability in [
-                    doctor::ProviderCapability::Resume,
-                    doctor::ProviderCapability::Hooks,
-                    doctor::ProviderCapability::Summary,
-                ] {
-                    let status = doctor::check_provider_capability(&config, provider, capability);
-                    if print_doctor_status(&format!("{name} {}", capability.label()), status) {
-                        failures += 1;
-                    }
-                }
-            }
-            doctor::ProviderStatus::Unavailable(error) => println!("info {name}: {error}"),
+    for provider in &report.providers {
+        let name = provider.name;
+        if !provider.available {
+            println!("info {name}: {}", provider.detail);
+            continue;
+        }
+        println!("ok   {name}: {}", provider.detail);
+        match provider.version_support {
+            Some("supported") => println!("ok   {name} version: supported"),
+            Some("too_old") => println!("fail {name} version: below the supported minimum"),
+            _ => println!("info {name} version: could not parse; compatibility unverified"),
+        }
+        for capability in &provider.capabilities {
+            print_doctor_check(capability);
         }
     }
-    if let Some(paths) = discovery {
-        if crate::providers::is_enabled(AgentKind::Codex) {
-            println!(
-                "{} Codex sessions: {}",
-                if paths.codex_sessions.is_dir() {
-                    "ok  "
-                } else {
-                    "info"
-                },
-                paths.codex_sessions.display()
-            );
-        }
-        if crate::providers::is_enabled(AgentKind::Claude) {
-            println!(
-                "{} Claude projects: {}",
-                if paths.claude_projects.is_dir() {
-                    "ok  "
-                } else {
-                    "info"
-                },
-                paths.claude_projects.display()
-            );
-        }
+    for path in &report.discovery {
+        println!(
+            "{} {}: {}",
+            if path.exists { "ok  " } else { "info" },
+            path.name,
+            path.path
+        );
     }
-    let state = store::state_dir()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "cannot resolve state directory"))?;
-    if print_doctor_status("state permissions/SQLite", doctor::check_state(&state)) {
-        failures += 1;
+    for check in &report.checks {
+        print_doctor_check(check);
     }
-    if print_doctor_status("hook ingress/index", doctor::check_hook_ingress(&state)) {
-        failures += 1;
+    if let Some(path) = &report.diagnostics_path {
+        println!("ok   rotating diagnostics: {path}");
     }
-    if print_doctor_status("clipboard", doctor::check_clipboard()) {
-        failures += 1;
-    }
-    if print_doctor_status("PTY daemon", doctor::check_daemon(&state)) {
-        failures += 1;
-    }
-    if let Some(path) = diagnostics::path() {
-        println!("ok   rotating diagnostics: {}", path.display());
-    }
-    if providers == 0 {
+    if !report.providers.iter().any(|provider| provider.available) {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             "neither codex nor claude is available",
         ));
     }
-    if failures > 0 {
+    if report.failures > 0 {
         return Err(io::Error::other(format!(
-            "doctor found {failures} required capability failure(s)"
+            "doctor found {} required capability failure(s)",
+            report.failures
         )));
     }
     Ok(())
 }
 
-fn print_doctor_status(label: &str, status: doctor::ProviderStatus) -> bool {
-    match status {
-        doctor::ProviderStatus::Available(detail) => {
-            println!("ok   {label}: {detail}");
-            false
-        }
-        doctor::ProviderStatus::Unavailable(detail) => {
-            println!("fail {label}: {detail}");
-            true
-        }
-    }
+fn print_doctor_check(check: &doctor::CheckReport) {
+    let prefix = if check.ok { "ok  " } else { "fail" };
+    println!("{prefix} {}: {}", check.name, check.detail);
 }
 
-fn run_dashboard() -> io::Result<()> {
+fn run_dashboard(args: impl Iterator<Item = String>) -> io::Result<()> {
+    let overrides = match parse_web_options(args, "option", true)? {
+        ParsedOptions::Help => {
+            print!("{}", cli_help());
+            return Ok(());
+        }
+        ParsedOptions::Options(overrides) => overrides,
+    };
+    // Resolved before anything slow runs: a malformed `--auth` should fail in milliseconds,
+    // not after session discovery.
+    let settings = web_settings(&overrides)?;
     let startup_cwd = env::current_dir()?;
-    let mut app = App::load(startup_cwd)?;
+
+    // One `App`, shared. The dashboard locks it per loop iteration and the server locks it
+    // per request, so both surfaces see the same sessions, the same discovery worker and the
+    // same summary worker rather than two divergent copies of all three.
+    let app = Arc::new(Mutex::new(App::load(startup_cwd)?));
+    let status = start_embedded_web(&app, &settings);
+    app.lock().unwrap().set_web_status(status);
+
     enable_raw_mode()?;
     let cleanup = TerminalCleanup;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let result = run(&mut terminal, &mut app);
+    let result = run(&mut terminal, &app);
     let restore = restore_terminal(&mut terminal);
-    let shutdown = app.shutdown();
+    let shutdown = app.lock().unwrap().shutdown();
     drop(cleanup);
     result.and(restore).and(shutdown)
+}
+
+/// Starts the embedded server, turning any failure into something the dashboard can display.
+///
+/// Nothing here is fatal. A port already taken by another agent-console -- or by anything
+/// else -- must not cost the user their dashboard, so the failure becomes a line of chrome
+/// instead of an exit code. The port is *not* silently moved: a server on a port nobody was
+/// told about is worse than no server at all.
+fn start_embedded_web(app: &Arc<Mutex<App>>, settings: &web::WebSettings) -> WebStatus {
+    if !settings.enabled {
+        return WebStatus::Disabled;
+    }
+    match web::start_embedded(Arc::clone(app), settings) {
+        Ok(running) => WebStatus::Serving {
+            url: running.url,
+            auth: running.auth,
+            exposed: running.exposed,
+        },
+        Err(error) => {
+            let reason = if error.kind() == io::ErrorKind::AddrInUse {
+                format!("{}:{} is already in use", settings.host, settings.port)
+            } else {
+                error.to_string()
+            };
+            diagnostics::record(&format!("embedded web server did not start: {reason}"));
+            eprintln!("warning: agent-console web UI did not start: {reason}");
+            WebStatus::Unavailable(reason)
+        }
+    }
 }
 
 struct TerminalCleanup;
@@ -280,27 +404,133 @@ fn restore_terminal(terminal: &mut DashboardTerminal) -> io::Result<()> {
     terminal.show_cursor()
 }
 
-fn run(terminal: &mut DashboardTerminal, app: &mut App) -> io::Result<()> {
+/// How long the dashboard waits for input before ticking again.
+const TICK_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How long a workspace frame waits for input before repainting.
+const WORKSPACE_POLL: Duration = Duration::from_millis(10);
+
+/// The dashboard loop, driving an `App` it shares with the embedded web server.
+///
+/// The lock is taken three times per iteration and released in between. It is deliberately
+/// *not* held across `event::poll`, which is where this loop spends nearly all of its time:
+/// holding it there would make every web request wait out a poll interval, and holding it
+/// across `event::read` -- which blocks until a key arrives -- would stall them indefinitely.
+fn run(terminal: &mut DashboardTerminal, shared: &Arc<Mutex<App>>) -> io::Result<()> {
     let current_exe = env::current_exe()?;
     loop {
-        terminal.draw(|frame| draw(frame, app))?;
-        if event::poll(std::time::Duration::from_millis(100))? {
-            let event = event::read()?;
-            if let Event::Mouse(mouse) = event {
-                handle_dashboard_mouse(app, mouse);
-                app.tick();
-                continue;
-            }
-            let Event::Key(key) = event else {
-                app.tick();
-                continue;
+        {
+            let app = shared.lock().unwrap();
+            terminal.draw(|frame| draw(frame, &app))?;
+        }
+        let event = if event::poll(TICK_INTERVAL)? {
+            Some(event::read()?)
+        } else {
+            None
+        };
+        let outcome = {
+            let mut app = shared.lock().unwrap();
+            let outcome = match event {
+                Some(event) => handle_dashboard_event(&mut app, event, &current_exe)?,
+                None => DashboardOutcome::Continue,
             };
-            if key.kind != KeyEventKind::Press {
+            // A workspace takes this iteration's place rather than adding to it: it runs the
+            // same tick on every frame of its own, and the dashboard's resumes when it closes.
+            if matches!(outcome, DashboardOutcome::Continue) {
                 app.tick();
+            }
+            outcome
+        };
+        match outcome {
+            DashboardOutcome::Continue => {}
+            DashboardOutcome::Quit => return Ok(()),
+            DashboardOutcome::Workspace { drive, failure } => {
+                run_workspace(shared, drive, failure, &current_exe, terminal);
+            }
+        }
+    }
+}
+
+/// What one dashboard event asked the loop above to do next.
+enum DashboardOutcome {
+    Continue,
+    Quit,
+    Workspace {
+        drive: Box<WorkspaceDrive>,
+        /// The banner prefix a failure keeps, so the message reads the same whether the
+        /// workspace failed while opening or while it was up.
+        failure: &'static str,
+    },
+}
+
+/// Runs an open workspace to its end, one frame at a time.
+///
+/// This loop is out here, rather than inside the pty layer where it used to be, because of
+/// what a frame must *not* hold. An attach that ran to completion under `&mut App` kept the
+/// shared lock for as long as a session was open, so the embedded web server could not answer
+/// at all during the only state anyone actually uses the console in. Splitting the frame is
+/// what fixes it, and the split only means something if the pieces are locked separately --
+/// which can only be arranged by whoever owns the lock, out here.
+fn run_workspace(
+    shared: &Arc<Mutex<App>>,
+    mut drive: Box<WorkspaceDrive>,
+    failure: &str,
+    current_exe: &Path,
+    terminal: &mut DashboardTerminal,
+) {
+    let result = (|| -> io::Result<()> {
+        loop {
+            // Each stage names what it locks. Only the middle one touches the `App`, and only
+            // for a runtime tick and a chrome snapshot; the two around it -- which is where a
+            // frame actually spends its time -- hold this session's terminal lock instead, and
+            // the wait at the end holds nothing at all.
+            let outcome = drive.apply_input()?;
+            let chrome = shared
+                .lock()
+                .unwrap()
+                .workspace_frame_chrome(&mut drive, outcome.search);
+            let exit = match outcome.exit {
+                Some(exit) => Some(exit),
+                None => drive.render(chrome)?,
+            };
+            if let Some(exit) = exit {
+                let finished = shared.lock().unwrap().advance_workspace_attach(
+                    &mut drive,
+                    exit,
+                    current_exe,
+                )?;
+                if finished {
+                    return Ok(());
+                }
                 continue;
             }
+            drive.wait(WORKSPACE_POLL)?;
+        }
+    })();
+    if let Err(error) = result {
+        let mut app = shared.lock().unwrap();
+        let _ = app.abandon_workspace(*drive);
+        app.banner = Some(format!("{failure}: {error}"));
+    }
+    let _ = execute!(
+        terminal.backend_mut(),
+        EnableMouseCapture,
+        Clear(ClearType::All)
+    );
+    terminal.swap_buffers();
+}
+
+/// Applies one input event, reporting what the dashboard loop should do next.
+fn handle_dashboard_event(
+    app: &mut App,
+    event: Event,
+    current_exe: &Path,
+) -> io::Result<DashboardOutcome> {
+    match event {
+        Event::Mouse(mouse) => handle_dashboard_mouse(app, mouse),
+        Event::Key(key) if key.kind == KeyEventKind::Press => {
             if app.dialog.is_some() {
-                handle_dialog_key(app, key.code, &current_exe, terminal)?;
+                return handle_dialog_key(app, key.code, current_exe);
             } else if app.text_dialog.is_some() {
                 handle_text_dialog_key(app, key.code);
             } else {
@@ -309,33 +539,30 @@ fn run(terminal: &mut DashboardTerminal, app: &mut App) -> io::Result<()> {
                     if key.code == KeyCode::Esc || app.dashboard_action(&key_name) == Some("help") {
                         app.help_open = false;
                     }
-                    app.tick();
-                    continue;
+                    return Ok(DashboardOutcome::Continue);
                 }
-                if let Some(action) = app.dashboard_action(&key_name)
-                    && handle_dashboard_action(app, action, &current_exe, terminal)
-                {
-                    return Ok(());
+                if let Some(action) = app.dashboard_action(&key_name) {
+                    return Ok(handle_dashboard_action(app, action, current_exe));
                 }
             }
         }
-        app.tick();
+        _ => {}
     }
+    Ok(DashboardOutcome::Continue)
 }
 
 fn handle_dashboard_action(
     app: &mut App,
     action: &str,
     current_exe: &std::path::Path,
-    terminal: &mut DashboardTerminal,
-) -> bool {
+) -> DashboardOutcome {
     match action {
-        "quit" => return true,
+        "quit" => return DashboardOutcome::Quit,
         "next" => app.select_next(),
         "previous" => app.select_previous(),
-        "enter" => attach_agent(app, current_exe, terminal),
-        "takeover" => force_attach_agent(app, current_exe, terminal),
-        "shell" => attach_shell(app, current_exe, terminal),
+        "enter" => return attach_agent(app, current_exe),
+        "takeover" => return force_attach_agent(app, current_exe),
+        "shell" => return attach_shell(app, current_exe),
         "copy" => {
             if let Err(error) = app.copy_shell_capture() {
                 app.banner = Some(error);
@@ -365,7 +592,7 @@ fn handle_dashboard_action(
         "help" => app.help_open = true,
         _ => {}
     }
-    false
+    DashboardOutcome::Continue
 }
 
 fn dashboard_key_name(key: KeyEvent) -> String {
@@ -438,8 +665,7 @@ fn handle_dialog_key(
     app: &mut App,
     key: KeyCode,
     current_exe: &std::path::Path,
-    terminal: &mut DashboardTerminal,
-) -> io::Result<()> {
+) -> io::Result<DashboardOutcome> {
     match key {
         KeyCode::Esc => app.cancel_dialog(),
         KeyCode::BackTab => {
@@ -515,7 +741,7 @@ fn handle_dialog_key(
             }
         }
         KeyCode::Enter => match app.create_from_dialog() {
-            Ok(()) => attach_agent(app, current_exe, terminal),
+            Ok(()) => return Ok(attach_agent(app, current_exe)),
             Err(error) => {
                 if let Some(dialog) = &mut app.dialog {
                     dialog.error = Some(error);
@@ -524,7 +750,7 @@ fn handle_dialog_key(
         },
         _ => {}
     }
-    Ok(())
+    Ok(DashboardOutcome::Continue)
 }
 
 fn edit_dialog_cwd(dialog: &mut app::NewSessionDialog, key: KeyCode) {
@@ -623,54 +849,6 @@ fn dialog_workspace_completions(
     }
 }
 
-fn workspace_directory_completions(value: &str, home: Option<&Path>) -> Vec<String> {
-    let (lookup, tilde) = if let Some(rest) = value.strip_prefix("~/") {
-        let Some(home) = home else {
-            return Vec::new();
-        };
-        (home.join(rest), Some(home))
-    } else {
-        (PathBuf::from(value), None)
-    };
-    let ends_with_separator = value.ends_with(std::path::MAIN_SEPARATOR);
-    let (parent, prefix) = if ends_with_separator {
-        (lookup.as_path(), "")
-    } else {
-        (
-            lookup.parent().unwrap_or_else(|| Path::new(".")),
-            lookup
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or(""),
-        )
-    };
-    let Ok(entries) = fs::read_dir(parent) else {
-        return Vec::new();
-    };
-    let mut matches = entries
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .filter_map(|entry| {
-            let name = entry.file_name().into_string().ok()?;
-            name.starts_with(prefix).then(|| {
-                let path = parent.join(name);
-                let display = tilde.map_or_else(
-                    || path.display().to_string(),
-                    |home| {
-                        path.strip_prefix(home).map_or_else(
-                            |_| path.display().to_string(),
-                            |rest| format!("~/{}", rest.display()),
-                        )
-                    },
-                );
-                format!("{display}{}", std::path::MAIN_SEPARATOR)
-            })
-        })
-        .collect::<Vec<_>>();
-    matches.sort_by_key(|value| value.to_lowercase());
-    matches
-}
-
 fn accept_workspace_completion(dialog: &mut app::NewSessionDialog) {
     let completions = dialog_workspace_completions(dialog, dirs::home_dir().as_deref());
     if let Some(completion) = completions.get(
@@ -694,44 +872,47 @@ fn toggle_dialog_field(field: DialogField) -> DialogField {
     }
 }
 
-fn attach_agent(app: &mut App, current_exe: &std::path::Path, terminal: &mut DashboardTerminal) {
-    if let Err(error) = app.enter_selected_agent(current_exe) {
-        app.banner = Some(format!("cannot enter agent: {error}"));
-    }
-    let _ = execute!(
-        terminal.backend_mut(),
-        EnableMouseCapture,
-        Clear(ClearType::All)
-    );
-    terminal.swap_buffers();
+fn attach_agent(app: &mut App, current_exe: &std::path::Path) -> DashboardOutcome {
+    opened(
+        app.enter_selected_agent(current_exe),
+        app,
+        "cannot enter agent",
+    )
 }
 
-fn force_attach_agent(
+fn force_attach_agent(app: &mut App, current_exe: &std::path::Path) -> DashboardOutcome {
+    opened(
+        app.force_enter_selected_agent(current_exe),
+        app,
+        "cannot take over agent",
+    )
+}
+
+fn attach_shell(app: &mut App, current_exe: &std::path::Path) -> DashboardOutcome {
+    opened(
+        app.enter_selected_shell(current_exe),
+        app,
+        "cannot enter shell",
+    )
+}
+
+/// Turns an attempt to open a workspace into an outcome the dashboard loop can act on,
+/// leaving the banner behind when it did not open.
+fn opened(
+    opened: io::Result<WorkspaceDrive>,
     app: &mut App,
-    current_exe: &std::path::Path,
-    terminal: &mut DashboardTerminal,
-) {
-    if let Err(error) = app.force_enter_selected_agent(current_exe) {
-        app.banner = Some(format!("cannot take over agent: {error}"));
+    failure: &'static str,
+) -> DashboardOutcome {
+    match opened {
+        Ok(drive) => DashboardOutcome::Workspace {
+            drive: Box::new(drive),
+            failure,
+        },
+        Err(error) => {
+            app.banner = Some(format!("{failure}: {error}"));
+            DashboardOutcome::Continue
+        }
     }
-    let _ = execute!(
-        terminal.backend_mut(),
-        EnableMouseCapture,
-        Clear(ClearType::All)
-    );
-    terminal.swap_buffers();
-}
-
-fn attach_shell(app: &mut App, current_exe: &std::path::Path, terminal: &mut DashboardTerminal) {
-    if let Err(error) = app.enter_selected_shell(current_exe) {
-        app.banner = Some(format!("cannot enter shell: {error}"));
-    }
-    let _ = execute!(
-        terminal.backend_mut(),
-        EnableMouseCapture,
-        Clear(ClearType::All)
-    );
-    terminal.swap_buffers();
 }
 
 fn draw(frame: &mut Frame, app: &App) {
@@ -806,10 +987,53 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ));
     }
+    let mut lines = vec![Line::from(spans)];
+    if let Some(line) = web_status_line(app.web_status()) {
+        lines.push(line);
+    }
     frame.render_widget(
-        Paragraph::new(Line::from(spans)).block(Block::default().borders(Borders::BOTTOM)),
+        Paragraph::new(lines).block(Block::default().borders(Borders::BOTTOM)),
         area,
     );
+}
+
+/// The header's second line: where the web UI is, or why it is not there.
+///
+/// The header is three rows tall with only a bottom border, so this line already had room --
+/// and it is the full width of the terminal, which is what lets it carry the whole tokened
+/// URL without truncating the token.
+fn web_status_line(status: &WebStatus) -> Option<Line<'static>> {
+    match status {
+        WebStatus::Disabled => None,
+        WebStatus::Serving { url, auth, exposed } => {
+            let mut spans = vec![
+                Span::styled(" web ", Style::default().fg(Color::Black).bg(Color::Blue)),
+                Span::raw(" "),
+                Span::styled(url.clone(), Style::default().fg(Color::Cyan)),
+            ];
+            // Before the credential description, not after it: this line runs off the right
+            // edge on a narrow terminal, and the exposure warning is the half that must
+            // survive being clipped.
+            if *exposed {
+                spans.push(Span::styled(
+                    "  ⚠ reachable from the network",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Red)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            spans.push(Span::styled(
+                format!("   {auth}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+            Some(Line::from(spans))
+        }
+        WebStatus::Unavailable(reason) => Some(Line::from(vec![
+            Span::styled(" web ", Style::default().fg(Color::Black).bg(Color::Red)),
+            Span::styled(format!(" off · {reason}"), Style::default().fg(Color::Red)),
+        ])),
+    }
 }
 
 fn draw_sessions(frame: &mut Frame, area: Rect, app: &App) {
@@ -1776,27 +2000,6 @@ mod tests {
     }
 
     #[test]
-    fn workspace_completion_lists_only_matching_directories_and_preserves_tilde() {
-        let root = tempdir().unwrap();
-        fs::create_dir_all(root.path().join("alpha-one")).unwrap();
-        fs::create_dir_all(root.path().join("alpha-two")).unwrap();
-        fs::write(root.path().join("alpha-file"), "not a directory").unwrap();
-
-        let absolute = format!("{}/alpha", root.path().display());
-        assert_eq!(
-            workspace_directory_completions(&absolute, Some(root.path())),
-            vec![
-                format!("{}/alpha-one/", root.path().display()),
-                format!("{}/alpha-two/", root.path().display()),
-            ]
-        );
-        assert_eq!(
-            workspace_directory_completions("~/alpha", Some(root.path())),
-            vec!["~/alpha-one/", "~/alpha-two/"]
-        );
-    }
-
-    #[test]
     fn accepting_workspace_completion_keeps_the_field_active_for_child_completion() {
         let root = tempdir().unwrap();
         fs::create_dir_all(root.path().join("alpha-one")).unwrap();
@@ -1922,6 +2125,54 @@ mod tests {
         assert!(rendered.contains("SESSION OVERVIEW"));
         assert!(rendered.contains("▸ Cdx"));
         assert!(!rendered.contains("LATEST ACTIVITY"));
+    }
+
+    /// The web address belongs in the help panel too, and it has to land in the DASHBOARD
+    /// column: that column is `help_lines()` up to the first `WORKSPACE ...` heading, so a
+    /// block appended at the end would show up under "child viewport" bindings instead.
+    #[test]
+    fn help_panel_carries_the_web_address_in_the_dashboard_column() {
+        let backend = TestBackend::new(140, 34);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::test_fixture();
+        app.set_web_status(WebStatus::Serving {
+            url: "http://127.0.0.1:7878/?token=abc".into(),
+            auth: "HTTP Basic auth as user \"alice\"".into(),
+            exposed: false,
+        });
+        app.help_open = true;
+
+        let lines = app.help_lines();
+        let web = lines
+            .iter()
+            .position(|line| line == "WEB UI")
+            .expect("the help panel names the web server");
+        let workspace = lines
+            .iter()
+            .position(|line| line.starts_with("WORKSPACE"))
+            .expect("the workspace headings are what split the columns");
+        assert!(web < workspace, "the web block has to stay in column one");
+        assert!(lines[web + 1].contains("http://127.0.0.1:7878"));
+        assert!(
+            !lines[web + 1].contains("token"),
+            "a token clipped by the column boundary is worse than none: {}",
+            lines[web + 1]
+        );
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("WEB UI"));
+        assert!(rendered.contains("http://127.0.0.1:7878"));
+        // The bindings the panel existed for are still all there.
+        assert!(rendered.contains("WORKSPACE · DIRECT"));
+        assert!(rendered.contains("CHILD VIEWPORT"));
+        assert!(rendered.contains("quit"));
     }
 
     #[test]
@@ -2138,5 +2389,157 @@ mod tests {
         assert!(help.starts_with(&format!("Agent Console {}\n", env!("CARGO_PKG_VERSION"))));
         assert!(help.contains("agent-console --help"));
         assert!(help.contains("agent-console --version"));
+    }
+
+    /// The dashboard serving the web UI is not discoverable unless the help says so, and
+    /// `web` has to stay documented for the headless case rather than look retired.
+    #[test]
+    fn cli_help_documents_the_embedded_server_and_keeps_the_web_subcommand() {
+        let help = cli_help();
+        for expected in [
+            "--host",
+            "--port",
+            "--auth",
+            "--no-web",
+            "agent-console web",
+            "AGENT_CONSOLE_WEB_HOST",
+            "AGENT_CONSOLE_WEB_AUTH",
+            "[web] host/port/auth/\n",
+        ] {
+            assert!(help.contains(expected), "cli_help is missing {expected}");
+        }
+        assert!(
+            help.contains("visible in `ps`"),
+            "the help has to say why a password does not belong in argv"
+        );
+    }
+
+    fn parsed(args: &[&str], allow_disable: bool) -> web::WebOverrides {
+        let args = args.iter().map(|arg| (*arg).to_owned());
+        match parse_web_options(args, "option", allow_disable).unwrap() {
+            ParsedOptions::Options(overrides) => overrides,
+            ParsedOptions::Help => panic!("expected options, got help"),
+        }
+    }
+
+    #[test]
+    fn the_dashboard_takes_the_same_web_options_the_subcommand_does() {
+        let overrides = parsed(
+            &[
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "8080",
+                "--auth",
+                "alice:hunter2",
+            ],
+            true,
+        );
+
+        assert_eq!(overrides.host.as_deref(), Some("0.0.0.0"));
+        assert_eq!(overrides.port, Some(8080));
+        assert_eq!(overrides.auth.as_deref(), Some("alice:hunter2"));
+        assert_eq!(overrides.enabled, None, "nothing said, nothing overridden");
+    }
+
+    /// `--no-web` means something on the dashboard and nothing on `agent-console web`,
+    /// where the server *is* the command -- so it is rejected there rather than ignored.
+    #[test]
+    fn only_the_dashboard_accepts_no_web() {
+        assert_eq!(parsed(&["--no-web"], true).enabled, Some(false));
+
+        let rejected = parse_web_options(["--no-web".to_owned()].into_iter(), "web option", false)
+            .unwrap_err();
+        assert_eq!(rejected.kind(), io::ErrorKind::InvalidInput);
+        assert!(rejected.to_string().contains("unknown web option"));
+    }
+
+    #[test]
+    fn a_flag_missing_its_value_or_given_a_bad_one_is_reported() {
+        for args in [vec!["--host"], vec!["--port"], vec!["--auth"]] {
+            let error = parse_web_options(args.iter().map(|arg| (*arg).to_owned()), "option", true)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("requires a value"),
+                "{args:?} -> {error}"
+            );
+        }
+        let error = parse_web_options(
+            ["--port".to_owned(), "http".to_owned()].into_iter(),
+            "option",
+            true,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid --port value: http"));
+    }
+
+    #[test]
+    fn help_is_recognized_wherever_it_appears_in_the_options() {
+        assert!(matches!(
+            parse_web_options(
+                ["--port".to_owned(), "1".to_owned(), "--help".to_owned()].into_iter(),
+                "option",
+                true,
+            )
+            .unwrap(),
+            ParsedOptions::Help
+        ));
+    }
+
+    /// The header line is the only place an auto-started server can announce itself: the
+    /// terminal is in the alternate screen, so anything printed to stdout is already gone.
+    #[test]
+    fn the_header_web_line_carries_the_url_the_token_and_the_exposure() {
+        assert_eq!(web_status_line(&WebStatus::Disabled), None);
+
+        let serving = web_status_line(&WebStatus::Serving {
+            url: "http://127.0.0.1:7878/?token=abc".into(),
+            auth: "random token in the URL".into(),
+            exposed: false,
+        })
+        .expect("a running server has to show its address");
+        let text = serving
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("http://127.0.0.1:7878/?token=abc"));
+        assert!(!text.contains("reachable from the network"));
+
+        let exposed = web_status_line(&WebStatus::Serving {
+            url: "http://0.0.0.0:7878/".into(),
+            auth: "HTTP Basic auth as user \"alice\"".into(),
+            exposed: true,
+        })
+        .expect("a running server has to show its address");
+        let spans = exposed
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>();
+        let warning = spans
+            .iter()
+            .position(|span| span.contains("reachable from the network"))
+            .expect("a non-loopback bind has to be marked on screen");
+        let credential = spans
+            .iter()
+            .position(|span| span.contains("alice"))
+            .expect("the header names the credential");
+        assert!(
+            warning < credential,
+            "the exposure warning goes first so a narrow terminal clips the credential instead"
+        );
+
+        let off = web_status_line(&WebStatus::Unavailable(
+            "127.0.0.1:7878 is already in use".into(),
+        ))
+        .expect("a server that did not start has to say so");
+        let text = off
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("off"));
+        assert!(text.contains("already in use"));
     }
 }
