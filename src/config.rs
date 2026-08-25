@@ -20,7 +20,26 @@ pub struct AgentConsoleConfig {
     #[serde(default)]
     pub(crate) summary: SummaryConfig,
     #[serde(default)]
+    pub(crate) web: WebConfig,
+    #[serde(default)]
     keys: KeyConfig,
+}
+
+/// The `[web]` section. Every key is optional and every one of them is only a *default*:
+/// the command line and the environment override it (see `web::settings`), so this file is
+/// the lowest-priority source rather than the authoritative one.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebConfig {
+    /// Whether the dashboard starts its embedded web server. Unset means enabled.
+    pub(crate) enabled: Option<bool>,
+    /// Bind address. A hostname (`localhost`) is as valid as a literal (`0.0.0.0`); it is
+    /// resolved at bind time, not here.
+    pub(crate) host: Option<String>,
+    pub(crate) port: Option<u16>,
+    /// HTTP Basic credentials as `user:password`. Everything after the first colon is the
+    /// password, so a password may itself contain colons.
+    pub(crate) auth: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
