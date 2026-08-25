@@ -18,8 +18,8 @@ use crate::{
     events::{self, NormalizedEvent},
     model::{AgentKind, Session, SessionStatus, SessionSummary, unix_timestamp},
     pty::{
-        TerminalManager, WorkspaceChrome, WorkspaceExit, WorkspaceFocus, WorkspaceSearchUpdate,
-        bracketed_paste, staged_shell_text,
+        TerminalManager, WorkspaceChrome, WorkspaceExit, WorkspaceFocus, WorkspaceInputOutcome,
+        WorkspaceSearchUpdate, WorkspaceSession, bracketed_paste, staged_shell_text,
     },
     store::StateStore,
     summary::{SummaryBackend, SummaryJob, SummaryWorker},
@@ -87,10 +87,25 @@ struct SessionFilter {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeNotification {
+    /// Stable across the whole life of the entry, and unique even after a restart, so a web
+    /// client can remember which alerts *it* has seen without a per-process counter that
+    /// would restart at zero and silently suppress fresh alerts.
+    pub id: String,
     pub session_key: String,
     pub status: SessionStatus,
     pub message: String,
+    /// Unix seconds, so several clients can order and de-duplicate the same queue.
+    pub created_at: u64,
     read: bool,
+}
+
+impl RuntimeNotification {
+    /// The shared, TUI-facing read flag. It is deliberately not settable from outside this
+    /// module: only entering a session, leaving a critical status, or an explicit
+    /// `mark_notification_read` clears it.
+    pub fn is_read(&self) -> bool {
+        self.read
+    }
 }
 
 struct DiscoveryWorker {
@@ -201,10 +216,104 @@ pub struct RuntimeState {
     summary_policy: SummaryPolicy,
     observed_statuses: HashMap<String, SessionStatus>,
     notifications: VecDeque<RuntimeNotification>,
+    /// Whether an alert is dropped for the session the dashboard already has selected.
+    /// True for the TUI, where that session is on screen and an alert about it is noise.
+    /// The web server turns it off: it has many clients and no single selected session, so
+    /// the suppression would only lose alerts nobody ever saw.
+    suppress_selected_notifications: bool,
     filter: SessionFilter,
     store: StateStore,
     event_index: events::EventIndex,
     summary_worker: SummaryWorker,
+}
+
+/// What the dashboard says about the web server running beside it.
+///
+/// The dashboard owns the terminal, so a server that started (or failed to) has nowhere else
+/// to say so: anything printed to stdout is hidden the moment the alternate screen opens.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum WebStatus {
+    /// Not started, because it was switched off with `--no-web` or `[web] enabled = false`.
+    #[default]
+    Disabled,
+    Serving {
+        /// The address to open, carrying the token when the server runs in token mode --
+        /// without it an auto-started server would be unusable.
+        url: String,
+        /// Which credential it asks for. Never contains a password.
+        auth: String,
+        /// Whether the bind is reachable from beyond this machine.
+        exposed: bool,
+    },
+    /// It could not start. The string is the reason, e.g. a port already in use.
+    Unavailable(String),
+}
+
+/// One open workspace, from the dashboard's point of view.
+///
+/// It owns what the workspace loop used to keep on the stack: the session and focus the
+/// current attach is on, the attach itself, and the bookkeeping that has to outlive a single
+/// attach. Keeping it out of `App` is the point -- the caller holds this while the `App` lock
+/// it needs for each frame is repeatedly taken and dropped.
+pub struct WorkspaceDrive {
+    session: Session,
+    focus: WorkspaceFocus,
+    force_takeover: bool,
+    touched_agents: HashSet<String>,
+    /// The agent keys that were alive when the current attach opened, which is what lets a
+    /// tick tell a rekeyed session from a new one.
+    alive: HashSet<String>,
+    pending_rekeys: Vec<(String, String)>,
+    attached: Option<WorkspaceSession>,
+}
+
+impl WorkspaceDrive {
+    /// Applies polled input against this session's terminals, with the `App` unlocked.
+    pub fn apply_input(&mut self) -> io::Result<WorkspaceInputOutcome> {
+        match &mut self.attached {
+            Some(attached) => attached.apply_input(&self.session),
+            None => Ok(WorkspaceInputOutcome::default()),
+        }
+    }
+
+    /// Repaints, with the `App` unlocked. `chrome` came from [`App::workspace_chrome`].
+    pub fn render(&mut self, chrome: WorkspaceChrome) -> io::Result<Option<WorkspaceExit>> {
+        match &mut self.attached {
+            Some(attached) => attached.render(chrome),
+            None => Ok(Some(WorkspaceExit::Dashboard)),
+        }
+    }
+
+    /// Waits for the next workspace input with the `App` unlocked. See
+    /// [`crate::pty::WorkspaceSession::wait`].
+    pub fn wait(&mut self, timeout: Duration) -> io::Result<()> {
+        match &mut self.attached {
+            Some(attached) => attached.wait(timeout),
+            None => Ok(()),
+        }
+    }
+}
+
+/// What a workspace frame calls to refresh its session list, preview and notifications.
+///
+/// Discovery can rename a session under an open workspace; the rename is recorded here and
+/// applied once the attach closes, because the attach itself is addressed by the old key.
+fn observe_workspace(
+    runtime: &mut RuntimeState,
+    alive: &mut HashSet<String>,
+    pending_rekeys: &mut Vec<(String, String)>,
+    search_update: Option<WorkspaceSearchUpdate>,
+) -> WorkspaceChrome {
+    if let Some(search_update) = search_update {
+        runtime.apply_workspace_search(search_update);
+    }
+    for (old_key, new_key) in runtime.tick(alive) {
+        if alive.remove(&old_key) {
+            alive.insert(new_key.clone());
+        }
+        pending_rekeys.push((old_key, new_key));
+    }
+    runtime.workspace_chrome()
 }
 
 pub struct App {
@@ -215,6 +324,7 @@ pub struct App {
     startup_cwd: PathBuf,
     pub terminals: TerminalManager,
     config: AgentConsoleConfig,
+    web_status: WebStatus,
 }
 
 impl Deref for App {
@@ -285,6 +395,7 @@ impl App {
                 summary_policy,
                 observed_statuses: HashMap::new(),
                 notifications: VecDeque::new(),
+                suppress_selected_notifications: true,
                 filter: SessionFilter::default(),
                 store,
                 event_index,
@@ -296,6 +407,7 @@ impl App {
             startup_cwd,
             terminals: TerminalManager::new(config.clone()),
             config,
+            web_status: WebStatus::Disabled,
         };
         app.normalize_selection();
         app.observe_changes();
@@ -382,8 +494,39 @@ impl App {
             .unwrap_or_else(|| "unbound".into())
     }
 
+    /// The key bindings, with the web server's address spliced into the dashboard column.
+    ///
+    /// Splicing rather than appending: the help panel splits these lines into columns at the
+    /// `WORKSPACE · ...` headings, so anything added after them lands in the wrong column and
+    /// anything added before the first heading breaks the split.
     pub fn help_lines(&self) -> Vec<String> {
-        self.config.help_bindings()
+        let mut lines = self.config.help_bindings();
+        let web = match &self.web_status {
+            WebStatus::Disabled => return lines,
+            WebStatus::Serving { url, auth, exposed } => {
+                let mut web = vec!["WEB UI".to_owned(), short_url(url)];
+                web.push(auth.clone());
+                if *exposed {
+                    web.push("reachable from the network".to_owned());
+                }
+                web
+            }
+            WebStatus::Unavailable(reason) => vec!["WEB UI".to_owned(), format!("off: {reason}")],
+        };
+        let at = lines
+            .iter()
+            .position(|line| line.starts_with("WORKSPACE"))
+            .unwrap_or(lines.len());
+        lines.splice(at..at, web);
+        lines
+    }
+
+    pub fn set_web_status(&mut self, status: WebStatus) {
+        self.web_status = status;
+    }
+
+    pub fn web_status(&self) -> &WebStatus {
+        &self.web_status
     }
 
     pub fn open_search_dialog(&mut self) {
@@ -517,6 +660,33 @@ impl App {
         self.runtime.store.archived(&session.key)
     }
 
+    /// The alias a session was renamed to, if any.
+    pub fn session_alias(&self, key: &str) -> Option<&str> {
+        self.runtime.store.alias(key)
+    }
+
+    /// Sets or clears a session's alias, exactly as the TUI's rename dialog does in
+    /// `commit_text_dialog`: the value is trimmed, an empty value clears the alias, and the
+    /// change is written through `StateStore` immediately so a rename made in the browser is
+    /// the title the TUI shows too.
+    ///
+    /// Keyed rather than selection-based, so renaming from one client cannot move the
+    /// selection other clients are reading.
+    pub fn set_session_alias(&mut self, key: &str, alias: Option<&str>) -> Result<(), String> {
+        if !self.sessions.iter().any(|session| session.key == key) {
+            return Err(format!("no session with key {key}"));
+        }
+        let alias = alias
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        self.runtime.store.set_alias(key, alias);
+        self.runtime
+            .store
+            .save_incremental()
+            .map_err(|error| error.to_string())
+    }
+
     pub fn session_shell_count(&self, session: &Session) -> usize {
         self.terminals.shell_count(&session.key)
     }
@@ -578,11 +748,11 @@ impl App {
         Ok(())
     }
 
-    pub fn enter_selected_agent(&mut self, current_exe: &Path) -> io::Result<()> {
+    pub fn enter_selected_agent(&mut self, current_exe: &Path) -> io::Result<WorkspaceDrive> {
         self.enter_selected_agent_with_takeover(current_exe, false)
     }
 
-    pub fn force_enter_selected_agent(&mut self, current_exe: &Path) -> io::Result<()> {
+    pub fn force_enter_selected_agent(&mut self, current_exe: &Path) -> io::Result<WorkspaceDrive> {
         self.enter_selected_agent_with_takeover(current_exe, true)
     }
 
@@ -590,19 +760,16 @@ impl App {
         &mut self,
         current_exe: &Path,
         force_takeover: bool,
-    ) -> io::Result<()> {
+    ) -> io::Result<WorkspaceDrive> {
         let session = self.prepare_agent_entry(current_exe)?;
-        let touched =
-            self.run_workspace(current_exe, session, WorkspaceFocus::Agent, force_takeover)?;
-        self.finish_workspace(&touched)?;
-        Ok(())
+        self.open_workspace(session, WorkspaceFocus::Agent, force_takeover)
     }
 
     fn prepare_agent_entry(&mut self, current_exe: &Path) -> io::Result<Session> {
         self.activate_workspace_agent(current_exe)
     }
 
-    pub fn enter_selected_shell(&mut self, current_exe: &Path) -> io::Result<()> {
+    pub fn enter_selected_shell(&mut self, current_exe: &Path) -> io::Result<WorkspaceDrive> {
         let session = self.prepare_selected_view(current_exe)?;
         if !session.cwd.is_dir() {
             return Err(io::Error::new(
@@ -612,109 +779,135 @@ impl App {
         }
         let size = crossterm::terminal::size().unwrap_or((80, 24));
         self.terminals.add_shell(&session, size)?;
-        let touched = self.run_workspace(current_exe, session, WorkspaceFocus::Shell, false)?;
-        self.finish_workspace(&touched)?;
-        Ok(())
+        self.open_workspace(session, WorkspaceFocus::Shell, false)
     }
 
-    fn run_workspace(
+    /// Opens a workspace and hands it back instead of running it here.
+    ///
+    /// The caller steps it with [`App::step_workspace`], which is what lets the lock it took
+    /// to reach this `App` be dropped between frames rather than held for the whole time a
+    /// session is open.
+    fn open_workspace(
         &mut self,
-        current_exe: &Path,
-        mut session: Session,
-        mut focus: WorkspaceFocus,
-        mut force_takeover: bool,
-    ) -> io::Result<HashSet<String>> {
+        session: Session,
+        focus: WorkspaceFocus,
+        force_takeover: bool,
+    ) -> io::Result<WorkspaceDrive> {
         let mut touched_agents = HashSet::new();
         if focus == WorkspaceFocus::Agent {
             touched_agents.insert(session.key.clone());
         }
-        loop {
-            match self.attach_workspace(&session, focus, force_takeover)? {
-                WorkspaceExit::Dashboard => return Ok(touched_agents),
-                WorkspaceExit::Alert => {
-                    self.runtime.jump_to_next_notification();
-                    return Ok(touched_agents);
+        let mut drive = WorkspaceDrive {
+            session,
+            focus,
+            force_takeover,
+            touched_agents,
+            alive: HashSet::new(),
+            pending_rekeys: Vec::new(),
+            attached: None,
+        };
+        self.attach_workspace(&mut drive)?;
+        Ok(drive)
+    }
+
+    /// Applies one workspace exit, reporting whether the workspace as a whole is finished.
+    ///
+    /// This is the body of the loop that used to wrap the attach: every arm either chooses the
+    /// next session and focus to attach, or leaves for the dashboard.
+    fn advance_workspace(
+        &mut self,
+        drive: &mut WorkspaceDrive,
+        exit: WorkspaceExit,
+        current_exe: &Path,
+    ) -> io::Result<bool> {
+        match exit {
+            WorkspaceExit::Dashboard => return Ok(true),
+            WorkspaceExit::Alert => {
+                self.runtime.jump_to_next_notification();
+                return Ok(true);
+            }
+            WorkspaceExit::ActivateSession => match self.activate_workspace_agent(current_exe) {
+                Ok(selected) => {
+                    drive.session = selected;
+                    drive.focus = WorkspaceFocus::Agent;
+                    drive.touched_agents.insert(drive.session.key.clone());
                 }
-                WorkspaceExit::ActivateSession => {
-                    match self.activate_workspace_agent(current_exe) {
-                        Ok(selected) => {
-                            session = selected;
-                            focus = WorkspaceFocus::Agent;
-                            touched_agents.insert(session.key.clone());
-                        }
+                Err(error) => {
+                    drive.session = self.prepare_selected_view(current_exe)?;
+                    self.terminals
+                        .set_notice(&drive.session.key, format!("cannot open agent: {error}"));
+                    drive.focus = WorkspaceFocus::Sessions;
+                }
+            },
+            WorkspaceExit::FocusShell => {
+                drive.session = self.prepare_selected_view(current_exe)?;
+                drive.focus = WorkspaceFocus::Shell;
+            }
+            WorkspaceExit::NewSession => {
+                self.open_new_dialog_at(&drive.session.cwd);
+                return Ok(true);
+            }
+            WorkspaceExit::OpenShell => {
+                drive.session = self.prepare_selected_view(current_exe)?;
+                if !drive.session.cwd.is_dir() {
+                    self.terminals.set_notice(
+                        &drive.session.key,
+                        "cannot open shell: working directory no longer exists".into(),
+                    );
+                    drive.focus = WorkspaceFocus::Sessions;
+                } else {
+                    let size = crossterm::terminal::size().unwrap_or((80, 24));
+                    match self.terminals.add_shell(&drive.session, size) {
+                        Ok(_) => drive.focus = WorkspaceFocus::Shell,
                         Err(error) => {
-                            session = self.prepare_selected_view(current_exe)?;
-                            self.terminals
-                                .set_notice(&session.key, format!("cannot open agent: {error}"));
-                            focus = WorkspaceFocus::Sessions;
+                            self.terminals.set_notice(
+                                &drive.session.key,
+                                format!("cannot open shell: {error}"),
+                            );
+                            drive.focus = WorkspaceFocus::Sessions;
                         }
-                    }
-                }
-                WorkspaceExit::FocusShell => {
-                    session = self.prepare_selected_view(current_exe)?;
-                    focus = WorkspaceFocus::Shell;
-                }
-                WorkspaceExit::NewSession => {
-                    self.open_new_dialog_at(&session.cwd);
-                    return Ok(touched_agents);
-                }
-                WorkspaceExit::OpenShell => {
-                    session = self.prepare_selected_view(current_exe)?;
-                    if !session.cwd.is_dir() {
-                        self.terminals.set_notice(
-                            &session.key,
-                            "cannot open shell: working directory no longer exists".into(),
-                        );
-                        focus = WorkspaceFocus::Sessions;
-                    } else {
-                        let size = crossterm::terminal::size().unwrap_or((80, 24));
-                        match self.terminals.add_shell(&session, size) {
-                            Ok(_) => focus = WorkspaceFocus::Shell,
-                            Err(error) => {
-                                self.terminals.set_notice(
-                                    &session.key,
-                                    format!("cannot open shell: {error}"),
-                                );
-                                focus = WorkspaceFocus::Sessions;
-                            }
-                        }
-                    }
-                }
-                WorkspaceExit::ToggleArchive => {
-                    let notice = match self.toggle_selected_archive() {
-                        Ok(true) => "SESSION ARCHIVED · moved to the Archived group".into(),
-                        Ok(false) => "SESSION RESTORED · returned to its workspace group".into(),
-                        Err(error) => format!("cannot change archive state: {error}"),
-                    };
-                    session = self.prepare_selected_view(current_exe)?;
-                    self.terminals.set_notice(&session.key, notice);
-                    focus = WorkspaceFocus::Sessions;
-                }
-                WorkspaceExit::RefreshSessions => {
-                    if self.selected_session().is_some() {
-                        session = self.prepare_selected_view(current_exe)?;
-                    }
-                    focus = WorkspaceFocus::Sessions;
-                }
-                WorkspaceExit::PreviousSession(next_focus) => {
-                    self.select_previous();
-                    focus = next_focus;
-                    session = self.prepare_workspace_target(current_exe, focus)?;
-                    if focus == WorkspaceFocus::Agent && self.terminals.agent_alive(&session.key) {
-                        touched_agents.insert(session.key.clone());
-                    }
-                }
-                WorkspaceExit::NextSession(next_focus) => {
-                    self.select_next();
-                    focus = next_focus;
-                    session = self.prepare_workspace_target(current_exe, focus)?;
-                    if focus == WorkspaceFocus::Agent && self.terminals.agent_alive(&session.key) {
-                        touched_agents.insert(session.key.clone());
                     }
                 }
             }
-            force_takeover = false;
+            WorkspaceExit::ToggleArchive => {
+                let notice = match self.toggle_selected_archive() {
+                    Ok(true) => "SESSION ARCHIVED · moved to the Archived group".into(),
+                    Ok(false) => "SESSION RESTORED · returned to its workspace group".into(),
+                    Err(error) => format!("cannot change archive state: {error}"),
+                };
+                drive.session = self.prepare_selected_view(current_exe)?;
+                self.terminals.set_notice(&drive.session.key, notice);
+                drive.focus = WorkspaceFocus::Sessions;
+            }
+            WorkspaceExit::RefreshSessions => {
+                if self.selected_session().is_some() {
+                    drive.session = self.prepare_selected_view(current_exe)?;
+                }
+                drive.focus = WorkspaceFocus::Sessions;
+            }
+            WorkspaceExit::PreviousSession(next_focus) => {
+                self.select_previous();
+                drive.focus = next_focus;
+                drive.session = self.prepare_workspace_target(current_exe, next_focus)?;
+                if next_focus == WorkspaceFocus::Agent
+                    && self.terminals.agent_alive(&drive.session.key)
+                {
+                    drive.touched_agents.insert(drive.session.key.clone());
+                }
+            }
+            WorkspaceExit::NextSession(next_focus) => {
+                self.select_next();
+                drive.focus = next_focus;
+                drive.session = self.prepare_workspace_target(current_exe, next_focus)?;
+                if next_focus == WorkspaceFocus::Agent
+                    && self.terminals.agent_alive(&drive.session.key)
+                {
+                    drive.touched_agents.insert(drive.session.key.clone());
+                }
+            }
         }
+        drive.force_takeover = false;
+        Ok(false)
     }
 
     fn prepare_workspace_target(
@@ -736,37 +929,78 @@ impl App {
         }
     }
 
-    fn attach_workspace(
+    /// Opens the next attach of an already-running workspace.
+    fn attach_workspace(&mut self, drive: &mut WorkspaceDrive) -> io::Result<()> {
+        drive.alive = self.terminals.alive_keys().into_iter().collect();
+        drive.pending_rekeys.clear();
+        let chrome = self.workspace_frame_chrome(drive, None);
+        drive.attached = Some(self.terminals.begin_workspace(
+            &drive.session,
+            drive.focus,
+            drive.force_takeover,
+            chrome,
+        )?);
+        Ok(())
+    }
+
+    /// The `App`-lock half of a workspace frame, and the only part of one that needs this
+    /// lock at all: a tick of the shared runtime, plus the session list, preview and alerts
+    /// the frame is about to draw.
+    ///
+    /// It is a snapshot on purpose. Everything else a frame does -- polling the daemon,
+    /// parsing output, writing a screen -- then runs against that snapshot with this lock
+    /// released, which is what keeps the web API answering while a busy agent repaints.
+    pub fn workspace_frame_chrome(
         &mut self,
-        session: &Session,
-        focus: WorkspaceFocus,
-        force_takeover: bool,
-    ) -> io::Result<WorkspaceExit> {
-        let mut alive = self
-            .terminals
-            .alive_keys()
-            .into_iter()
-            .collect::<HashSet<_>>();
-        let mut pending_rekeys = Vec::new();
-        let result =
-            self.terminals
-                .attach_workspace(session, focus, force_takeover, |search_update| {
-                    if let Some(search_update) = search_update {
-                        self.runtime.apply_workspace_search(search_update);
-                    }
-                    let rekeys = self.runtime.tick(&alive);
-                    for (old_key, new_key) in rekeys {
-                        if alive.remove(&old_key) {
-                            alive.insert(new_key.clone());
-                        }
-                        pending_rekeys.push((old_key, new_key));
-                    }
-                    self.runtime.workspace_chrome()
-                });
-        for (old_key, new_key) in pending_rekeys {
+        drive: &mut WorkspaceDrive,
+        search: Option<WorkspaceSearchUpdate>,
+    ) -> WorkspaceChrome {
+        observe_workspace(
+            &mut self.runtime,
+            &mut drive.alive,
+            &mut drive.pending_rekeys,
+            search,
+        )
+    }
+
+    /// Applies a workspace exit: closes the current attach, moves to whatever the exit asked
+    /// for, and opens the next one. `true` means the workspace as a whole is finished.
+    pub fn advance_workspace_attach(
+        &mut self,
+        drive: &mut WorkspaceDrive,
+        exit: WorkspaceExit,
+        current_exe: &Path,
+    ) -> io::Result<bool> {
+        self.close_attach(drive)?;
+        if self.advance_workspace(drive, exit, current_exe)? {
+            self.finish_workspace(&drive.touched_agents)?;
+            return Ok(true);
+        }
+        self.attach_workspace(drive)?;
+        Ok(false)
+    }
+
+    /// Ends the current attach: restores the terminal, drops the input lease, and applies the
+    /// session rekeys discovery reported while it was up.
+    ///
+    /// Rekeying waits until here rather than happening as it is discovered because the open
+    /// attach is looked up by session key every frame; moving that key out from under it
+    /// mid-attach would lose the terminal.
+    fn close_attach(&mut self, drive: &mut WorkspaceDrive) -> io::Result<()> {
+        let finished = drive
+            .attached
+            .take()
+            .map_or(Ok(()), WorkspaceSession::finish);
+        for (old_key, new_key) in std::mem::take(&mut drive.pending_rekeys) {
             self.terminals.rekey(&old_key, new_key);
         }
-        result
+        finished
+    }
+
+    /// Tears down a workspace whose step reported an error, so neither the terminal nor the
+    /// input lease is left in workspace mode. The caller reports the original error.
+    pub fn abandon_workspace(&mut self, mut drive: WorkspaceDrive) -> io::Result<()> {
+        self.close_attach(&mut drive)
     }
 
     fn prepare_selected_agent(&mut self, current_exe: &Path) -> io::Result<Session> {
@@ -1195,9 +1429,23 @@ impl RuntimeState {
     }
 
     fn session_is_visible(&self, session: &Session) -> bool {
-        if self.filter.query.is_empty() {
+        self.session_matches(session, &self.filter.query)
+    }
+
+    /// Whether a session matches a search query, using exactly the fields and the
+    /// case-insensitive substring rule the TUI's own search dialog applies.
+    ///
+    /// Takes the query as an argument rather than reading `self.filter` so a caller can
+    /// filter for one request without changing what anyone else sees -- the web server has
+    /// many clients, and one browser's search must not reorder another's list.
+    pub fn session_matches(&self, session: &Session, query: &str) -> bool {
+        // Checked before lowercasing: this runs for every session on every dashboard render,
+        // and an unfiltered dashboard is the common case.
+        let query = query.trim();
+        if query.is_empty() {
             return true;
         }
+        let query = query.to_lowercase();
         let alias = self.store.alias(&session.key).unwrap_or_default();
         let haystack = format!(
             "{alias} {} {} {} {} {} {} {} {} {}",
@@ -1216,7 +1464,7 @@ impl RuntimeState {
             }
         )
         .to_lowercase();
-        haystack.contains(&self.filter.query)
+        haystack.contains(&query)
     }
 
     fn session_title(&self, session: &Session) -> String {
@@ -1336,8 +1584,9 @@ impl RuntimeState {
 
     fn capture_notifications(&mut self) {
         let selected_key = self
-            .sessions
-            .get(self.selected)
+            .suppress_selected_notifications
+            .then(|| self.sessions.get(self.selected))
+            .flatten()
             .map(|session| session.key.clone());
         let current = self
             .sessions
@@ -1377,9 +1626,11 @@ impl RuntimeState {
                 && selected_key.as_deref() != Some(&key)
             {
                 self.notifications.push_back(RuntimeNotification {
+                    id: Uuid::new_v4().to_string(),
                     session_key: key,
                     status,
                     message,
+                    created_at: unix_timestamp(),
                     read: false,
                 });
             }
@@ -1396,6 +1647,47 @@ impl RuntimeState {
             .iter()
             .filter(|notification| !notification.read)
             .count()
+    }
+
+    /// The retained alert queue, oldest first -- the order `jump_to_next_notification`
+    /// walks it in. Entries stay after being read (up to the 100-entry cap), so a client
+    /// that arrives late still sees the recent history rather than an empty list.
+    pub fn notifications(&self) -> impl ExactSizeIterator<Item = &RuntimeNotification> {
+        self.notifications.iter()
+    }
+
+    /// Marks one alert read by id. Idempotent, and reports whether the id was known so a
+    /// caller can answer 404 for an id from a queue this process no longer retains.
+    pub fn mark_notification_read(&mut self, id: &str) -> bool {
+        let Some(notification) = self
+            .notifications
+            .iter_mut()
+            .find(|notification| notification.id == id)
+        else {
+            return false;
+        };
+        notification.read = true;
+        true
+    }
+
+    /// Marks every retained alert read and reports how many were still unread, which is what
+    /// a "clear all" acknowledges.
+    pub fn mark_all_notifications_read(&mut self) -> usize {
+        let mut cleared = 0;
+        for notification in &mut self.notifications {
+            if !notification.read {
+                notification.read = true;
+                cleared += 1;
+            }
+        }
+        cleared
+    }
+
+    /// Turns off dropping an alert for the currently selected session. The TUI wants that
+    /// suppression (the session is on screen); a multi-client server does not, because
+    /// "selected" there is an artefact of whichever request last moved it.
+    pub fn set_selected_notification_suppression(&mut self, suppress: bool) {
+        self.suppress_selected_notifications = suppress;
     }
 
     pub fn active_notification(&self) -> Option<&RuntimeNotification> {
@@ -1588,10 +1880,24 @@ impl RuntimeState {
     }
 
     pub fn retry_selected_summary(&mut self) -> Result<(), String> {
-        let session = self
+        let key = self
             .sessions
             .get(self.selected)
+            .map(|session| session.key.clone())
             .ok_or_else(|| "no selected session".to_owned())?;
+        self.retry_summary(&key)
+    }
+
+    /// Retries one session's summary by key, clearing the same per-session backoff and
+    /// per-provider circuit breaker `retry_selected_summary` clears and jumping it to the
+    /// front of the queue. Keyed rather than selection-based so a request can name its own
+    /// session instead of moving a selection several clients share.
+    pub fn retry_summary(&mut self, key: &str) -> Result<(), String> {
+        let session = self
+            .sessions
+            .iter()
+            .find(|session| session.key == key)
+            .ok_or_else(|| format!("no session with key {key}"))?;
         let key = session.key.clone();
         let provider = session.agent;
         self.summary_retry_at.remove(&key);
@@ -1796,6 +2102,7 @@ impl App {
                 summary_policy: SummaryPolicy::from(&AgentConsoleConfig::default()),
                 observed_statuses: HashMap::new(),
                 notifications: VecDeque::new(),
+                suppress_selected_notifications: true,
                 filter: SessionFilter::default(),
                 store,
                 event_index,
@@ -1807,6 +2114,7 @@ impl App {
             startup_cwd: "/tmp".into(),
             terminals: TerminalManager::default(),
             config: AgentConsoleConfig::default(),
+            web_status: WebStatus::Disabled,
         }
     }
 }
@@ -1862,6 +2170,17 @@ fn managed_agent_refresh(
     } else {
         ManagedAgentRefresh::Conflict
     }
+}
+
+/// The address without its query string, for the help panel's narrow column.
+///
+/// The full URL, token and all, is on the dashboard's own header line; a token clipped in
+/// half by a column boundary would be worse than not showing one at all.
+fn short_url(url: &str) -> String {
+    url.split_once('?')
+        .map_or(url, |(base, _)| base)
+        .trim_end_matches('/')
+        .to_owned()
 }
 
 fn expand_tilde(value: &str) -> PathBuf {
@@ -1928,6 +2247,7 @@ mod tests {
                 summary_policy: SummaryPolicy::from(&AgentConsoleConfig::default()),
                 observed_statuses: HashMap::new(),
                 notifications: VecDeque::new(),
+                suppress_selected_notifications: true,
                 filter: SessionFilter::default(),
                 store,
                 event_index,
@@ -1939,6 +2259,7 @@ mod tests {
             startup_cwd: root.path().to_owned(),
             terminals: TerminalManager::default(),
             config: AgentConsoleConfig::default(),
+            web_status: WebStatus::Disabled,
         };
         // Provisional sessions are retained by refresh.
         app.refresh_now();

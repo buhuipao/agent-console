@@ -6,17 +6,26 @@ use std::{
     time::{Duration, Instant},
 };
 
+use serde::Serialize;
 use uuid::Uuid;
 
 use crate::{
     config::AgentConsoleConfig,
+    diagnostics,
     events::{self, EventIndex},
     model::AgentKind,
-    pty,
+    providers, pty, store,
     store::StateStore,
 };
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Every capability `doctor` probes, in the order it probes them.
+pub const CAPABILITIES: [ProviderCapability; 3] = [
+    ProviderCapability::Resume,
+    ProviderCapability::Hooks,
+    ProviderCapability::Summary,
+];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderStatus {
@@ -93,6 +102,164 @@ pub fn check_provider_capability(
     } else {
         ProviderStatus::Unavailable(format!("help is missing {}", missing.join(", ")))
     }
+}
+
+impl VersionSupport {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Supported => "supported",
+            Self::TooOld => "too_old",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Everything `agent-console doctor` checks, as data.
+///
+/// The CLI and the web endpoint both render this rather than each running their own
+/// sequence of probes, so the two can never disagree about what "healthy" means.
+#[derive(Clone, Debug, Serialize)]
+pub struct DoctorReport {
+    pub version: &'static str,
+    pub providers_enabled: Vec<&'static str>,
+    pub providers: Vec<ProviderReport>,
+    /// Where each enabled provider's transcripts are looked for. Empty when the home
+    /// directory cannot be resolved, which is the one case `doctor` prints nothing for.
+    pub discovery: Vec<PathReport>,
+    pub checks: Vec<CheckReport>,
+    pub diagnostics_path: Option<String>,
+    pub failures: usize,
+    /// True under exactly the condition that makes `agent-console doctor` exit zero: at
+    /// least one provider answered `--version`, and no required capability failed.
+    pub ok: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProviderReport {
+    pub name: &'static str,
+    pub available: bool,
+    /// The version line when the provider answered, otherwise why it did not.
+    pub detail: String,
+    /// Absent for a provider that never answered, since there is no version to judge.
+    pub version_support: Option<&'static str>,
+    pub capabilities: Vec<CheckReport>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PathReport {
+    pub name: &'static str,
+    pub path: String,
+    pub exists: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CheckReport {
+    pub name: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+impl CheckReport {
+    fn new(name: impl Into<String>, status: ProviderStatus) -> Self {
+        let (ok, detail) = match status {
+            ProviderStatus::Available(detail) => (true, detail),
+            ProviderStatus::Unavailable(detail) => (false, detail),
+        };
+        Self {
+            name: name.into(),
+            ok,
+            detail,
+        }
+    }
+}
+
+/// Runs every probe once and collects the results.
+///
+/// Blocking and slow by nature -- it spawns provider binaries with an 8s timeout each -- so
+/// an async caller has to run it off the request thread.
+pub fn report() -> io::Result<DoctorReport> {
+    let config = AgentConsoleConfig::load()?;
+    let enabled = providers::enabled();
+    let mut provider_reports = Vec::new();
+    let mut available = 0;
+    let mut failures = 0;
+
+    for provider in enabled.iter().map(|adapter| adapter.kind) {
+        let name = provider.label();
+        match check_configured_provider(&config, provider) {
+            ProviderStatus::Available(version) => {
+                available += 1;
+                let support = version_support(provider, &version);
+                if support == VersionSupport::TooOld {
+                    failures += 1;
+                }
+                let capabilities = CAPABILITIES
+                    .iter()
+                    .map(|capability| {
+                        CheckReport::new(
+                            format!("{name} {}", capability.label()),
+                            check_provider_capability(&config, provider, *capability),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                failures += capabilities.iter().filter(|check| !check.ok).count();
+                provider_reports.push(ProviderReport {
+                    name,
+                    available: true,
+                    detail: version,
+                    version_support: Some(support.label()),
+                    capabilities,
+                });
+            }
+            // Not a failure: an uninstalled provider is a fact about this machine, not a
+            // broken install. Only "no provider at all" is fatal.
+            ProviderStatus::Unavailable(error) => provider_reports.push(ProviderReport {
+                name,
+                available: false,
+                detail: error,
+                version_support: None,
+                capabilities: Vec::new(),
+            }),
+        }
+    }
+
+    let discovery = crate::discovery::DiscoveryPaths::from_environment()
+        .map(|paths| {
+            [
+                (AgentKind::Codex, "Codex sessions", paths.codex_sessions),
+                (AgentKind::Claude, "Claude projects", paths.claude_projects),
+            ]
+            .into_iter()
+            .filter(|(kind, _, _)| providers::is_enabled(*kind))
+            .map(|(_, name, path)| PathReport {
+                name,
+                exists: path.is_dir(),
+                path: path.display().to_string(),
+            })
+            .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let state = store::state_dir()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "cannot resolve state directory"))?;
+    let checks = vec![
+        CheckReport::new("state permissions/SQLite", check_state(&state)),
+        CheckReport::new("hook ingress/index", check_hook_ingress(&state)),
+        CheckReport::new("clipboard", check_clipboard()),
+        CheckReport::new("PTY daemon", check_daemon(&state)),
+    ];
+    failures += checks.iter().filter(|check| !check.ok).count();
+
+    Ok(DoctorReport {
+        version: env!("CARGO_PKG_VERSION"),
+        providers_enabled: enabled.iter().map(|adapter| adapter.kind.label()).collect(),
+        providers: provider_reports,
+        discovery,
+        checks,
+        diagnostics_path: diagnostics::path().map(|path| path.display().to_string()),
+        failures,
+        ok: available > 0 && failures == 0,
+    })
 }
 
 pub fn version_support(provider: AgentKind, version: &str) -> VersionSupport {
