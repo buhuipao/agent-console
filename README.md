@@ -92,6 +92,98 @@ Check provider and terminal prerequisites without opening the dashboard:
 agent-console doctor
 ```
 
+## Browser access
+
+`agent-console` serves the web UI while the dashboard runs -- one process, one
+set of sessions, no second command:
+
+```
+ web  http://127.0.0.1:7878/?token=<token>   random token in the URL (set --auth for HTTP Basic)
+```
+
+That line is the dashboard's second header row, and the address is also in the
+help panel (`?`). Open it and the page stores the token and drops it from the
+address bar. On a phone, browse to `http://<your-machine-ip>:<port>/` and paste
+the token when prompted.
+
+The address and credentials are configurable on the command line, in the
+environment, and in the config file, in that order of precedence:
+
+```sh
+agent-console --host 0.0.0.0 --port 8080     # reachable from your phone
+agent-console --auth alice:hunter2           # HTTP Basic instead of a token
+agent-console --no-web                       # dashboard only
+```
+
+| Setting | Command line | Environment | `config.toml` |
+| --- | --- | --- | --- |
+| Bind address | `--host <H>` | `AGENT_CONSOLE_WEB_HOST` | `[web] host` |
+| Bind port | `--port <P>` | `AGENT_CONSOLE_WEB_PORT` | `[web] port` |
+| Credentials | `--auth <user>:<pass>` | `AGENT_CONSOLE_WEB_AUTH` | `[web] auth` |
+| On/off | `--no-web` | `AGENT_CONSOLE_WEB_ENABLED` | `[web] enabled` |
+
+```toml
+[web]
+host = "0.0.0.0"
+port = 8080
+auth = "alice:hunter2"
+enabled = true
+```
+
+`host` takes a hostname (`localhost`) as readily as a literal (`0.0.0.0`, `::`,
+`192.168.0.103`); it is resolved at bind time and an unresolvable name is
+reported as such. Everything after the *first* colon in `auth` is the password,
+so passwords may contain colons.
+
+Prefer `AGENT_CONSOLE_WEB_AUTH` or the config file over `--auth`: a password on
+the command line is visible in `ps` output to every other user on the machine.
+
+With credentials configured the server uses **HTTP Basic**, and the browser
+draws the credential prompt itself. With none configured it falls back to the
+random per-process URL token shown above. It is never unauthenticated.
+
+If the port is already in use the dashboard still starts; the header says
+`web  off · 127.0.0.1:7878 is already in use` and nothing is served. Nothing
+silently moves to a different port.
+
+For a machine with no terminal attached, the server still runs on its own:
+
+```sh
+agent-console web --host 0.0.0.0 --port 8080 --auth alice:hunter2
+```
+
+The page is an installable PWA, so "Add to Home Screen" gives it a standalone
+window and an offline app shell; sessions themselves always need the server.
+
+The browser gets the same session list, and can create, attach to, archive and
+terminate sessions. Each session has three views. **Conversation** reads the
+transcript and sends prompts. **Shell** is a login shell in the session's working
+directory -- several per session, switchable, and the same daemon terminals the
+dashboard's shell panes use, so a shell opened in either place shows up in the
+other. **Agent TUI** streams the agent's own PTY, so its terminal UI renders as
+it does in the dashboard; that is where its blocking dialogs get answered.
+The layout adapts to phone or desktop, and because a phone keyboard has no Esc,
+Tab, Ctrl or arrows, a touch toolbar supplies them, with Ctrl as a sticky
+modifier.
+
+The websocket is an unrestricted PTY channel: anyone who gets past the
+credential check gets full shell access to the machine, every session shares one
+credential, and there is no built-in TLS. Binding to anything other than
+localhost prints a warning and marks the dashboard header. Put a reverse proxy
+with TLS in front of it before exposing it beyond a network you trust.
+
+### Known limits
+
+The dashboard and the browser share one set of sessions, so a session open in the
+dashboard stays usable from a phone; a frame's expensive work runs behind that
+session's own lock rather than the shared one.
+
+Alerts live in memory and start empty after a restart -- "what happened since I
+last looked" reaches back only as far as the running process.
+
+A program that takes the alternate screen (`vim`, `less`) has no scrollback to
+recover, in the browser or the dashboard; the agents themselves do not use it.
+
 ## Provider commands
 
 Use `~/.config/agent-console/config.toml` when a provider needs a wrapper,
