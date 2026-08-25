@@ -47,6 +47,9 @@ const LEASE_STALE_AFTER: Duration = Duration::from_millis(500);
 const ALTERNATE_REPAINT_SETTLE: Duration = Duration::from_millis(120);
 const ALTERNATE_SCROLL_TIMEOUT: Duration = Duration::from_millis(350);
 const ALTERNATE_SCROLL_QUEUE_LIMIT: usize = 4;
+/// Capacity of `sockaddr_un.sun_path`, which a Unix socket path is copied into whole (plus a
+/// NUL). 104 bytes on macOS/BSD, 108 on Linux.
+const SUN_PATH_CAPACITY: usize = if cfg!(target_os = "linux") { 108 } else { 104 };
 const ENABLE_MOUSE_REPORTING: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 const DISABLE_MOUSE_REPORTING: &[u8] =
     b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l";
@@ -107,6 +110,7 @@ struct TerminalOutputDelta {
     bytes: Vec<u8>,
     checkpoint: Option<Vec<u8>>,
     status_bar_rows: Option<Vec<Vec<u8>>>,
+    scrollback: Option<String>,
     exit: Option<String>,
 }
 
@@ -437,6 +441,52 @@ fn terminal_retained_rows(
     rows
 }
 
+/// Whether a raw poll carries the rows retained *above* the terminal's current screen.
+///
+/// A client attaching for the first time needs them. A checkpoint is exactly one screenful,
+/// so on its own it leaves the client's emulator with an empty scrollback and nothing above
+/// the fold -- everything printed before the client arrived is simply not there. Every later
+/// poll of the same connection must say [`Scrollback::Omit`], or the client would be handed
+/// the same rows again on top of the ones it already has.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Scrollback {
+    Omit,
+    Include,
+}
+
+/// The rows this terminal retains above its current screen, oldest first, ANSI-formatted and
+/// CRLF-joined -- ready to be written into an emulator immediately before a checkpoint.
+///
+/// The two halves come from one parser under one lock, at one instant: this is
+/// [`terminal_retained_rows`] with the visible screen -- which the checkpoint already carries
+/// -- dropped off the end. That is what makes them a partition of a single snapshot rather
+/// than two reads that have to be aligned afterwards, and it is why no band of lines can end
+/// up duplicated or missing where they meet.
+///
+/// Each row closes its own colour: `rows_formatted` emits only the attributes a row needs, so
+/// a row that ends mid-colour would otherwise bleed into the next one.
+fn terminal_scrollback_snapshot(
+    parser: &mut vt100::Parser,
+    status_bar_scrollback: &StatusBarScrollback,
+) -> Option<String> {
+    let height = usize::from(parser.screen().size().0);
+    let mut rows = terminal_retained_rows(parser, status_bar_scrollback);
+    rows.truncate(rows.len().saturating_sub(height));
+    // A bounded scrollback evicts its blank starting rows before it ever evicts a line of
+    // text, so the oldest rows are usually padding. Left in, they make the top of the
+    // history look empty; anything blank further down is real spacing and stays.
+    let first = rows
+        .iter()
+        .position(|row| !plain_text(row).trim().is_empty())?;
+    Some(
+        rows[first..]
+            .iter()
+            .map(|row| format!("{}\u{1b}[m", String::from_utf8_lossy(row)))
+            .collect::<Vec<_>>()
+            .join("\r\n"),
+    )
+}
+
 fn selected_row_text(formatted: Option<&[u8]>, cols: u16, first: u16, last: u16) -> String {
     let width = last - first + 1;
     let mut row_parser = vt100::Parser::new(1, cols, 0);
@@ -566,8 +616,25 @@ fn terminal_state_checkpoint(
     checkpoint
 }
 
+/// A session we spawn is a new, independent agent session -- it is not a child of whatever
+/// session happened to launch the console. Inheriting these makes the provider believe
+/// otherwise: `CLAUDE_CODE_CHILD_SESSION` silently turns transcript saving off, which leaves
+/// discovery and the whole conversation view permanently empty, and the rest point the child
+/// at the launcher's session id and IPC socket.
+const INHERITED_SESSION_VARS: [&str; 5] = [
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_CODE_ENTRYPOINT",
+];
+
 struct LocalTerminal {
-    master: Box<dyn MasterPty + Send>,
+    /// Behind a mutex only so this terminal is `Sync`: a `MasterPty` is `Send` but not
+    /// `Sync`, and without this the whole terminal could not be shared through an `Arc` --
+    /// which is what lets a websocket and a workspace hold the same terminal and use it with
+    /// no lock of their own held.
+    master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     output: Arc<Mutex<OutputState>>,
@@ -593,6 +660,9 @@ impl LocalTerminal {
         command.cwd(&spec.cwd);
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
+        for name in INHERITED_SESSION_VARS {
+            command.env_remove(name);
+        }
         let child = pair
             .slave
             .spawn_command(command)
@@ -664,7 +734,7 @@ impl LocalTerminal {
             .map_err(io::Error::other)?;
 
         Ok(Self {
-            master: pair.master,
+            master: Mutex::new(pair.master),
             writer,
             child: Arc::new(Mutex::new(child)),
             output,
@@ -786,6 +856,12 @@ impl LocalTerminal {
         self.parser.lock().unwrap().screen().alternate_screen()
     }
 
+    fn size(&self) -> (u16, u16) {
+        let parser = self.parser.lock().unwrap();
+        let (rows, cols) = parser.screen().size();
+        (cols, rows)
+    }
+
     fn selection_cell(&self, cell: TerminalCell) -> Option<TerminalBufferCell> {
         let mut parser = self.parser.lock().unwrap();
         let scrollback = self.status_bar_scrollback.lock().unwrap();
@@ -811,6 +887,8 @@ impl LocalTerminal {
     pub fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
         let (cols, rows) = normalized_size((cols, rows));
         self.master
+            .lock()
+            .unwrap()
             .resize(PtySize {
                 rows,
                 cols,
@@ -835,19 +913,32 @@ impl LocalTerminal {
         }
     }
 
-    fn output_since(&self, requested: u64) -> TerminalOutputDelta {
-        let parser = self.parser.lock().unwrap();
+    /// The output a caller has not seen yet, and -- for a caller attaching from nothing --
+    /// the rows above the current screen as well.
+    ///
+    /// The two answers are exclusive by construction. Either the requested offset is still
+    /// inside the retained ring, in which case the bytes returned start at the terminal's
+    /// very first byte and rebuild the whole history on their own; or it is not, in which
+    /// case a checkpoint stands in for the screen and [`Scrollback::Include`] adds the rows
+    /// above it. Both halves of that second answer are taken here, under one parser lock, at
+    /// one instant -- which is what leaves no seam between them to align.
+    fn output_since(&self, requested: u64, scrollback_wanted: Scrollback) -> TerminalOutputDelta {
+        let mut parser = self.parser.lock().unwrap();
         let scrollback = self.status_bar_scrollback.lock().unwrap();
         let state = self.output.lock().unwrap();
         let end = state.base_offset.saturating_add(state.raw.len() as u64);
         if requested < state.base_offset || requested > end {
             let checkpoint = terminal_state_checkpoint(&parser, &scrollback);
+            let retained = (scrollback_wanted == Scrollback::Include)
+                .then(|| terminal_scrollback_snapshot(&mut parser, &scrollback))
+                .flatten();
             return TerminalOutputDelta {
                 start: end,
                 end,
                 bytes: Vec::new(),
                 checkpoint: Some(checkpoint),
                 status_bar_rows: Some(scrollback.rows.iter().cloned().collect()),
+                scrollback: retained,
                 exit: state.exit_description.clone(),
             };
         }
@@ -860,7 +951,24 @@ impl LocalTerminal {
             bytes,
             checkpoint: None,
             status_bar_rows: None,
+            scrollback: None,
             exit: state.exit_description.clone(),
+        }
+    }
+
+    /// Backend-agnostic raw poll for a caller that owns its own offset cursor and does not
+    /// share this terminal's parser/output state (e.g. the web server).
+    pub(crate) fn poll_raw(&self, offset: u64, scrollback: Scrollback) -> RawPoll {
+        let alive = self.is_alive();
+        let delta = self.output_since(offset, scrollback);
+        RawPoll {
+            start: delta.start,
+            end: delta.end,
+            bytes: delta.bytes,
+            checkpoint: delta.checkpoint,
+            scrollback: delta.scrollback,
+            alive,
+            exit: delta.exit,
         }
     }
 }
@@ -1044,6 +1152,10 @@ enum DaemonRequest {
     Poll {
         id: String,
         offset: u64,
+        /// Whether the answer should carry the rows above the current screen. Defaulted so
+        /// a daemon left running by an older build still understands a newer client's poll.
+        #[serde(default)]
+        scrollback: bool,
     },
     Write {
         id: String,
@@ -1092,6 +1204,8 @@ enum DaemonResponse {
         checkpoint: Option<Vec<u8>>,
         #[serde(default)]
         status_bar_rows: Option<Vec<Vec<u8>>>,
+        #[serde(default)]
+        scrollback: Option<String>,
         alive: bool,
         exit: Option<String>,
     },
@@ -1147,7 +1261,11 @@ impl PtyDaemonState {
                 }
                 DaemonResponse::Ok
             }
-            DaemonRequest::Poll { id, offset } => {
+            DaemonRequest::Poll {
+                id,
+                offset,
+                scrollback,
+            } => {
                 let Some(terminal) = self.terminals.get(&id) else {
                     return (
                         DaemonResponse::Error(format!("unknown terminal {id}")),
@@ -1155,13 +1273,19 @@ impl PtyDaemonState {
                     );
                 };
                 let alive = terminal.is_alive();
-                let delta = terminal.output_since(offset);
+                let wanted = if scrollback {
+                    Scrollback::Include
+                } else {
+                    Scrollback::Omit
+                };
+                let delta = terminal.output_since(offset, wanted);
                 DaemonResponse::Poll {
                     start: delta.start,
                     end: delta.end,
                     bytes: delta.bytes,
                     checkpoint: delta.checkpoint,
                     status_bar_rows: delta.status_bar_rows,
+                    scrollback: delta.scrollback,
                     alive,
                     exit: delta.exit,
                 }
@@ -1176,7 +1300,7 @@ impl PtyDaemonState {
                     .as_deref()
                     .is_some_and(|key| !self.owner_can_write(key, &owner_id))
                 {
-                    DaemonResponse::Error("session lease is owned by another TUI".into())
+                    DaemonResponse::Error(LEASE_DENIED_MESSAGE.into())
                 } else {
                     match self.terminals.get(&id) {
                         Some(terminal) => terminal
@@ -1289,7 +1413,7 @@ impl PtyDaemonState {
                     self.lease_seen.insert(session_key, Instant::now());
                     DaemonResponse::Ok
                 } else {
-                    DaemonResponse::Error("session lease is owned by another TUI".into())
+                    DaemonResponse::Error(LEASE_DENIED_MESSAGE.into())
                 }
             }
             DaemonRequest::Shutdown => return (DaemonResponse::Ok, true),
@@ -1346,9 +1470,21 @@ fn daemon_request(_socket: &Path, _request: &DaemonRequest) -> io::Result<Daemon
     ))
 }
 
+/// What the daemon says when a write or a lease validation loses to whoever holds the
+/// session lease. Named so both the daemon and the callers that have to recognise it agree
+/// on one string instead of two copies drifting apart.
+pub const LEASE_DENIED_MESSAGE: &str = "session lease is owned by another TUI";
+
 fn response_ok(response: DaemonResponse) -> io::Result<()> {
     match response {
         DaemonResponse::Ok => Ok(()),
+        // Reported as `PermissionDenied` -- the same kind `attach_workspace` already uses for
+        // a denied lease -- so a caller can tell "another surface owns this session, offer a
+        // takeover" apart from a genuine terminal failure without matching on prose.
+        DaemonResponse::Error(error) if error == LEASE_DENIED_MESSAGE => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            LEASE_DENIED_MESSAGE,
+        )),
         DaemonResponse::Error(error) => Err(io::Error::other(error)),
         other => Err(io::Error::other(format!(
             "unexpected daemon response: {other:?}"
@@ -1485,6 +1621,9 @@ impl RemoteTerminal {
             &DaemonRequest::Poll {
                 id: self.id.lock().unwrap().clone(),
                 offset: requested,
+                // The TUI rebuilds its own scrollback from the bytes and the status-bar rows
+                // as it always has; only a client attaching from nothing needs the snapshot.
+                scrollback: false,
             },
         )?;
         let DaemonResponse::Poll {
@@ -1493,6 +1632,7 @@ impl RemoteTerminal {
             bytes,
             checkpoint,
             status_bar_rows,
+            scrollback: _,
             alive,
             exit,
         } = response
@@ -1548,6 +1688,48 @@ impl RemoteTerminal {
             self.output_generation.fetch_add(1, Ordering::Relaxed);
         }
         Ok(alive)
+    }
+
+    /// Backend-agnostic raw poll that issues `DaemonRequest::Poll` directly, mirroring
+    /// `sync()`, but WITHOUT touching `self.parser`/`self.offset`/`self.output`/
+    /// `self.status_bar_scrollback`. Those back the TUI's own view of this terminal, so an
+    /// independent poller (e.g. the web server) must not mutate them.
+    fn poll_raw(&self, offset: u64, scrollback: Scrollback) -> io::Result<RawPoll> {
+        let response = daemon_request(
+            &self.socket,
+            &DaemonRequest::Poll {
+                id: self.id.lock().unwrap().clone(),
+                offset,
+                scrollback: scrollback == Scrollback::Include,
+            },
+        )?;
+        let DaemonResponse::Poll {
+            start,
+            end,
+            bytes,
+            checkpoint,
+            status_bar_rows: _,
+            scrollback,
+            alive,
+            exit,
+        } = response
+        else {
+            return match response {
+                DaemonResponse::Error(error) => Err(io::Error::other(error)),
+                other => Err(io::Error::other(format!(
+                    "unexpected daemon response: {other:?}"
+                ))),
+            };
+        };
+        Ok(RawPoll {
+            start,
+            end,
+            bytes,
+            checkpoint,
+            scrollback,
+            alive,
+            exit,
+        })
     }
 
     fn is_alive(&self) -> bool {
@@ -1663,6 +1845,13 @@ impl RemoteTerminal {
         self.parser.lock().unwrap().screen().alternate_screen()
     }
 
+    /// The size this terminal was last resized to. Read straight off the stored value rather
+    /// than the parser, so asking for the size never syncs and never disturbs the shared
+    /// screen state the TUI and the websocket render from.
+    fn size(&self) -> (u16, u16) {
+        *self.size.lock().unwrap()
+    }
+
     fn selection_cell(&self, cell: TerminalCell) -> Option<TerminalBufferCell> {
         let _ = self.sync();
         let mut parser = self.parser.lock().unwrap();
@@ -1729,6 +1918,33 @@ impl RemoteTerminal {
             *id = format!("{new_prefix}{suffix}");
         }
     }
+}
+
+/// Raw output delta for a backend-agnostic poller (e.g. the web server) that owns its own
+/// offset cursor and does not share a terminal's parser/output state with the TUI.
+pub struct RawPoll {
+    pub start: u64,
+    pub end: u64,
+    pub bytes: Vec<u8>,
+    /// ANSI-formatted full-screen resync (`vt100::Screen::state_formatted()`), present when
+    /// the caller's offset fell outside the retained buffer and needs a fresh screen.
+    pub checkpoint: Option<Vec<u8>>,
+    /// Everything this terminal retains *above* `checkpoint`, oldest first, ANSI-formatted
+    /// and CRLF-joined, present only when the caller asked for [`Scrollback::Include`].
+    ///
+    /// A checkpoint is exactly one screenful, so a client that got only that starts with an
+    /// empty scrollback: every line printed before it attached is missing, and there is
+    /// nothing above the fold to scroll to. These are those lines -- both the ones `vt100`
+    /// holds for the normal screen and the ones `pty.rs` captures out of a top-anchored
+    /// partial scroll region, which is how a TUI pins a composer to the bottom.
+    ///
+    /// Written immediately before `checkpoint`, they land in the client emulator's own
+    /// scrollback and the checkpoint repaints the screen over them. Both come from one
+    /// parser under one lock at one instant, so the join between them cannot duplicate or
+    /// drop a band of lines.
+    pub scrollback: Option<String>,
+    pub alive: bool,
+    pub exit: Option<String>,
 }
 
 pub struct ManagedTerminal {
@@ -1851,6 +2067,17 @@ impl ManagedTerminal {
         }
     }
 
+    /// The size this terminal is currently running at, as `(cols, rows)`.
+    ///
+    /// A caller that keeps its own parser (see `poll_raw`) needs this to size that parser the
+    /// same way, or the text it reads back wraps differently from what the agent drew.
+    pub fn size(&self) -> (u16, u16) {
+        match &self.backend {
+            TerminalBackend::Local(terminal) => terminal.size(),
+            TerminalBackend::Remote(terminal) => terminal.size(),
+        }
+    }
+
     fn selection_cell(&self, cell: TerminalCell) -> Option<TerminalBufferCell> {
         match &self.backend {
             TerminalBackend::Local(terminal) => terminal.selection_cell(cell),
@@ -1890,6 +2117,15 @@ impl ManagedTerminal {
         }
     }
 
+    /// Raw poll for a caller that owns its own offset cursor, independent of the TUI's
+    /// view of this terminal (see `RawPoll`). Used by the web server.
+    pub fn poll_raw(&self, offset: u64, scrollback: Scrollback) -> io::Result<RawPoll> {
+        match &self.backend {
+            TerminalBackend::Local(terminal) => Ok(terminal.poll_raw(offset, scrollback)),
+            TerminalBackend::Remote(terminal) => terminal.poll_raw(offset, scrollback),
+        }
+    }
+
     fn output_generation(&self) -> u64 {
         match &self.backend {
             TerminalBackend::Local(terminal) => terminal.output_generation.load(Ordering::Relaxed),
@@ -1905,17 +2141,54 @@ impl ManagedTerminal {
 }
 
 struct ShellPane {
-    terminal: ManagedTerminal,
+    /// Names this shell to callers outside this module (the web API's `/shells` routes).
+    /// It is the unique suffix of the daemon id `shell|<session key>|<id>` rather than the
+    /// whole id, so a `rekey` -- which rewrites only the `shell|<session key>|` prefix --
+    /// leaves it valid.
+    id: String,
+    terminal: Arc<ManagedTerminal>,
     name: String,
     capture_prefix: String,
 }
 
+/// Who currently owns a session's input lease, for a caller outside this module that has to
+/// name the conflict to a user. A projection of the daemon's own `LeaseOwner`, kept separate
+/// so the wire type stays private to this module.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeaseHolder {
+    pub pid: u32,
+    pub instance_id: String,
+    pub started_at: u64,
+}
+
+/// The answer to asking the daemon for a session's input lease.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LeaseOutcome {
+    Granted,
+    Denied(LeaseHolder),
+}
+
+/// One shell's identity, for a caller outside this module that has to name a specific shell.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShellInfo {
+    pub id: String,
+    pub name: String,
+}
+
 impl ShellPane {
-    fn new(terminal: ManagedTerminal, name: String) -> Self {
+    fn new(id: String, terminal: ManagedTerminal, name: String) -> Self {
         Self {
-            terminal,
+            id,
+            terminal: Arc::new(terminal),
             name,
             capture_prefix: String::new(),
+        }
+    }
+
+    fn info(&self) -> ShellInfo {
+        ShellInfo {
+            id: self.id.clone(),
+            name: self.name.clone(),
         }
     }
 
@@ -1935,7 +2208,7 @@ fn command_block_after(capture: &str, prefix: &str) -> String {
 
 #[derive(Default)]
 pub struct SessionTerminals {
-    pub agent: Option<ManagedTerminal>,
+    pub agent: Option<Arc<ManagedTerminal>>,
     shells: Vec<ShellPane>,
     pub selected_shell: usize,
     selection: Option<TerminalSelection>,
@@ -1991,6 +2264,161 @@ pub enum WorkspaceSearchUpdate {
         query: String,
         selected_session_key: Option<String>,
     },
+}
+
+/// Everything one open workspace needs between frames.
+///
+/// It exists so the workspace can be *stepped*. The loop that used to own these as locals ran
+/// until the user left the session, so its caller -- the dashboard, holding the `App` mutex it
+/// shares with the embedded web server -- could not let go of that mutex while a session was
+/// open. Since "a session is open" is the normal way the TUI is used, that made every web
+/// request time out exactly when the web UI is worth having. Handing the state back to the
+/// caller lets it take the lock for one frame at a time.
+///
+/// The two things a frame does that are unbounded -- the daemon lease round-trip and the wait
+/// for a keystroke -- are deliberately *not* part of a step; see [`WorkspaceSession::wait`].
+pub struct WorkspaceSession {
+    /// This attach's own handle on the session's terminals. Holding it is what lets a frame
+    /// run without the `App` lock: everything a repaint touches is behind this.
+    handle: SessionHandle,
+    lease: WorkspaceLease,
+    stdout: io::StdoutLock<'static>,
+    pending_input: Option<PolledTerminalInput>,
+    size: (u16, u16),
+    keyboard_enhancement_enabled: bool,
+    exit: WorkspaceExit,
+    focus: WorkspaceFocus,
+    render_bindings: WorkspaceBindings,
+    input_router: WorkspaceInputRouter,
+    last_signature: Vec<u64>,
+    last_layout_key: Option<WorkspaceLayoutKey>,
+    clear_next_frame: bool,
+    search: Option<WorkspaceSearch>,
+    help_open: bool,
+    chrome: WorkspaceChrome,
+    /// Kept from the last repaint because mouse and scroll input are resolved against the
+    /// layout the user is actually looking at, which is the one the previous frame drew.
+    layout: WorkspaceLayout,
+}
+
+/// What has to change before the panes are re-measured and the screen is cleared.
+type WorkspaceLayoutKey = ((u16, u16), usize, usize, Option<PaneTarget>, i16);
+
+/// What one frame's input asked its caller to do, once the caller has the `App` lock back.
+///
+/// Search is the one thing a keystroke does that the session's own terminals cannot answer:
+/// it filters the *session list*, which lives in the `App`. Reporting it instead of calling
+/// back into the `App` from inside a frame is what keeps the lock order one-way.
+#[derive(Default)]
+pub struct WorkspaceInputOutcome {
+    pub search: Option<WorkspaceSearchUpdate>,
+    pub exit: Option<WorkspaceExit>,
+}
+
+impl WorkspaceSession {
+    /// Applies whatever the last [`Self::wait`] polled.
+    ///
+    /// Takes this session's terminal lock and nothing else, so the `App` stays free for the
+    /// web server while a keystroke is written to a daemon in another process.
+    pub fn apply_input(&mut self, session: &Session) -> io::Result<WorkspaceInputOutcome> {
+        let mut outcome = WorkspaceInputOutcome::default();
+        let Some(input) = self.pending_input.take() else {
+            return Ok(outcome);
+        };
+        let handle = Arc::clone(&self.handle);
+        let terminals = &mut *handle.lock().unwrap();
+        outcome.exit = terminals.apply_workspace_input(self, session, input, &mut outcome)?;
+        Ok(outcome)
+    }
+
+    /// Repaints the workspace from `chrome`, which the caller refreshed under the `App` lock.
+    ///
+    /// This is where a frame spends nearly all of its time -- polling the daemon for new
+    /// output, parsing it, and writing a screen -- and it is deliberately all behind this
+    /// session's own lock rather than the `App`'s.
+    pub fn render(&mut self, chrome: WorkspaceChrome) -> io::Result<Option<WorkspaceExit>> {
+        let handle = Arc::clone(&self.handle);
+        let terminals = &mut *handle.lock().unwrap();
+        terminals.render_workspace(self, chrome)
+    }
+
+    /// Waits for the next input, with the caller's lock released.
+    ///
+    /// Both halves block: validating the lease is a round-trip to a daemon in another process,
+    /// and the poll waits out `timeout` for a keystroke. Neither reads session state, so
+    /// neither belongs inside a step -- doing them here is what keeps the shared `App` mutex
+    /// free for all but the microseconds a repaint takes.
+    pub fn wait(&mut self, timeout: Duration) -> io::Result<()> {
+        self.lease.validate()?;
+        self.pending_input = Some(poll_terminal_input(timeout)?);
+        Ok(())
+    }
+
+    /// Puts the terminal back the way the dashboard expects it and drops the input lease.
+    ///
+    /// Call this on the error paths too: skipping it leaves mouse reporting and the keyboard
+    /// enhancement flags on, and leaves the session leased to a workspace nobody is in.
+    pub fn finish(mut self) -> io::Result<()> {
+        if self.keyboard_enhancement_enabled {
+            self.stdout.write_all(DISABLE_KEYBOARD_ENHANCEMENT)
+        } else {
+            Ok(())
+        }
+        .and_then(|()| self.stdout.write_all(DISABLE_MOUSE_REPORTING))
+        .and_then(|()| self.stdout.write_all(b"\x1b[0m\x1b[?25h"))
+        .and_then(|()| self.stdout.flush())
+    }
+}
+
+/// A session's terminals, shared between whatever surfaces are looking at them.
+pub type SessionHandle = Arc<Mutex<SessionTerminals>>;
+
+/// The session input lease an attach holds.
+///
+/// It carries its own copy of everything the daemon needs, so validating and releasing it
+/// never touches the terminal map -- and therefore never needs the lock the terminal map
+/// lives behind.
+struct WorkspaceLease {
+    socket: Option<PathBuf>,
+    session_key: String,
+    owner_id: String,
+    held: bool,
+}
+
+impl WorkspaceLease {
+    fn validate(&self) -> io::Result<()> {
+        if self.held
+            && let Some(socket) = &self.socket
+        {
+            response_ok(daemon_request(
+                socket,
+                &DaemonRequest::ValidateLease {
+                    session_key: self.session_key.clone(),
+                    owner_id: self.owner_id.clone(),
+                },
+            )?)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Releasing on drop rather than at one call site is what makes every way out of an attach --
+/// a clean exit, a failed repaint, a terminal that never opened -- give the session back.
+impl Drop for WorkspaceLease {
+    fn drop(&mut self) {
+        if self.held
+            && let Some(socket) = &self.socket
+        {
+            let _ = daemon_request(
+                socket,
+                &DaemonRequest::Release {
+                    session_key: self.session_key.clone(),
+                    owner_id: self.owner_id.clone(),
+                },
+            );
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3608,20 +4036,29 @@ impl SessionTerminals {
         )
     }
 
-    fn spawn_shell(&self, session: &Session, size: (u16, u16)) -> io::Result<ManagedTerminal> {
-        if let Some(socket) = &self.daemon_socket {
-            let id = format!("shell|{}|{}", session.key, Uuid::new_v4());
-            let spec = shell_command(&session.cwd);
+    /// Starts a shell in the session's working directory, paired with the id that names it
+    /// from outside this module. With the daemon up that id is the unique suffix of the
+    /// daemon terminal id, which is what lets a shell started here and one started by another
+    /// surface (a TUI, a browser) refer to the same terminal.
+    fn spawn_shell(
+        &self,
+        session: &Session,
+        size: (u16, u16),
+    ) -> io::Result<(String, ManagedTerminal)> {
+        let id = Uuid::new_v4().to_string();
+        let spec = shell_command(&session.cwd);
+        let terminal = if let Some(socket) = &self.daemon_socket {
             ManagedTerminal::ensure_remote(
                 socket.clone(),
-                id,
+                format!("shell|{}|{id}", session.key),
                 self.lease_owner_id.clone(),
                 &spec,
                 size,
-            )
+            )?
         } else {
-            spawn_shell(session, size)
-        }
+            spawn_shell(session, size)?
+        };
+        Ok((id, terminal))
     }
 
     fn toggle_workspace_focus(
@@ -4179,8 +4616,8 @@ impl SessionTerminals {
 
     fn terminal(&self, pane: PaneTarget) -> Option<&ManagedTerminal> {
         match pane {
-            PaneTarget::Agent => self.agent.as_ref(),
-            PaneTarget::Shell(index) => self.shells.get(index).map(|pane| &pane.terminal),
+            PaneTarget::Agent => self.agent.as_deref(),
+            PaneTarget::Shell(index) => self.shells.get(index).map(|pane| pane.terminal.as_ref()),
         }
     }
 
@@ -4210,442 +4647,460 @@ impl SessionTerminals {
             .unwrap_or_default()
     }
 
-    fn attach_workspace<F, G>(
-        &mut self,
-        session: &Session,
-        mut focus: WorkspaceFocus,
+    /// Opens a workspace attach, handing back the state its caller steps one frame at a time.
+    ///
+    /// This used to be one `attach_workspace` loop that ran until the user left the workspace,
+    /// with every field below as a local. That shape forced whoever called it to keep the
+    /// borrow -- in practice the shared `App` lock -- for as long as a session was open, which
+    /// is exactly the state the embedded web server exists to report on. Keeping the state out
+    /// here instead lets the caller re-acquire the lock per frame and drop it in between.
+    fn begin_workspace(
+        handle: SessionHandle,
+        focus: WorkspaceFocus,
         bindings: WorkspaceBindings,
-        mut observe: F,
-        mut validate_lease: G,
-    ) -> io::Result<WorkspaceExit>
-    where
-        F: FnMut(Option<WorkspaceSearchUpdate>) -> WorkspaceChrome,
-        G: FnMut() -> io::Result<()>,
-    {
-        let mut size = normalized_size(crossterm::terminal::size().unwrap_or((120, 40)));
+        lease: WorkspaceLease,
+        chrome: WorkspaceChrome,
+    ) -> io::Result<WorkspaceSession> {
+        let owned = Arc::clone(&handle);
+        let self_ = &mut *owned.lock().unwrap();
+        let size = normalized_size(crossterm::terminal::size().unwrap_or((120, 40)));
         let mut stdout = io::stdout().lock();
         let mut keyboard_enhancement_enabled = false;
         stdout.write_all(ENABLE_MOUSE_REPORTING)?;
         sync_keyboard_enhancement(&mut stdout, &mut keyboard_enhancement_enabled, focus)?;
         stdout.write_all(b"\x1b[2J\x1b[H")?;
         stdout.flush()?;
-        let result = (|| {
-            let mut exit = WorkspaceExit::Dashboard;
-            let render_bindings = bindings.clone();
-            let mut input_router = WorkspaceInputRouter {
+        let mut layout =
+            WorkspaceLayout::new(size.0, size.1, self_.shells.len(), self_.selected_shell);
+        layout.apply_options(self_.maximized, self_.shell_height_adjust);
+        Ok(WorkspaceSession {
+            handle,
+            lease,
+            stdout,
+            pending_input: None,
+            size,
+            keyboard_enhancement_enabled,
+            exit: WorkspaceExit::Dashboard,
+            focus,
+            render_bindings: bindings.clone(),
+            input_router: WorkspaceInputRouter {
                 pending: Vec::new(),
                 bindings,
+            },
+            last_signature: Vec::new(),
+            last_layout_key: None,
+            clear_next_frame: true,
+            search: None,
+            help_open: false,
+            chrome,
+            layout,
+        })
+    }
+
+    /// The half of a frame that reacts to the keyboard and the mouse.
+    fn apply_workspace_input(
+        &mut self,
+        state: &mut WorkspaceSession,
+        session: &Session,
+        input: PolledTerminalInput,
+        outcome: &mut WorkspaceInputOutcome,
+    ) -> io::Result<Option<WorkspaceExit>> {
+        let input = match input {
+            PolledTerminalInput::Pending => {
+                if let Some(bytes) = state.input_router.flush() {
+                    self.write_focused(state.focus, &bytes)?;
+                }
+                return Ok(None);
+            }
+            PolledTerminalInput::EndOfFile => return Ok(Some(state.exit)),
+            PolledTerminalInput::Bytes(input) => input,
+        };
+        if state.help_open {
+            if input == b"\x1b"
+                || state.render_bindings.command(&input) == Some(WorkspaceCommand::Help)
+            {
+                state.help_open = false;
+            }
+            state.last_signature.clear();
+            return Ok(None);
+        }
+        if let Some(active_search) = state.search.as_mut() {
+            let (search_input, changed) = apply_workspace_search_input(active_search, &input);
+            match search_input {
+                WorkspaceSearchInput::Cancel => {
+                    outcome.search = Some(WorkspaceSearchUpdate::Cancel {
+                        query: active_search.original_query.clone(),
+                        selected_session_key: active_search.original_selected_session_key.clone(),
+                    });
+                    state.exit = WorkspaceExit::RefreshSessions;
+                    return Ok(Some(state.exit));
+                }
+                WorkspaceSearchInput::Commit => {
+                    if changed {
+                        outcome.search =
+                            Some(WorkspaceSearchUpdate::Preview(active_search.value.clone()));
+                    }
+                    state.search = None;
+                }
+                WorkspaceSearchInput::Editing if changed => {
+                    outcome.search =
+                        Some(WorkspaceSearchUpdate::Preview(active_search.value.clone()));
+                }
+                WorkspaceSearchInput::Editing => {}
+            }
+            state.last_signature.clear();
+            return Ok(None);
+        }
+        for routed in state.input_router.route(&input, state.focus) {
+            if let WorkspaceInput::Mouse(event) = routed {
+                self.handle_mouse(&state.layout, event)?;
+                state.last_signature.clear();
+                continue;
+            }
+            let WorkspaceInput::Command(command) = routed else {
+                if let WorkspaceInput::Forward(bytes) = routed {
+                    if state.focus == WorkspaceFocus::Sessions {
+                        match session_list_input(&bytes) {
+                            Some(SessionListInput::Previous) => {
+                                state.exit = WorkspaceExit::PreviousSession(state.focus);
+                                return Ok(Some(state.exit));
+                            }
+                            Some(SessionListInput::Next) => {
+                                state.exit = WorkspaceExit::NextSession(state.focus);
+                                return Ok(Some(state.exit));
+                            }
+                            Some(SessionListInput::Activate) => {
+                                state.exit = WorkspaceExit::ActivateSession;
+                                return Ok(Some(state.exit));
+                            }
+                            Some(SessionListInput::NewSession) => {
+                                state.exit = WorkspaceExit::NewSession;
+                                return Ok(Some(state.exit));
+                            }
+                            Some(SessionListInput::OpenShell) => {
+                                state.exit = WorkspaceExit::OpenShell;
+                                return Ok(Some(state.exit));
+                            }
+                            Some(SessionListInput::ToggleArchive) => {
+                                state.exit = WorkspaceExit::ToggleArchive;
+                                return Ok(Some(state.exit));
+                            }
+                            None => {}
+                        }
+                        continue;
+                    }
+                    if self
+                        .focused_terminal(state.focus)
+                        .is_some_and(|terminal| terminal.scrollback_offset() > 0)
+                    {
+                        self.focused_terminal(state.focus)
+                            .unwrap()
+                            .scroll_to_live_tail();
+                    }
+                    self.write_focused(state.focus, &bytes)?;
+                }
+                continue;
             };
-            let mut last_signature = Vec::new();
-            let mut last_layout_key = None;
-            let mut clear_next_frame = true;
-            let mut search = None;
-            let mut help_open = false;
-            let mut chrome = observe(None);
-            'workspace: loop {
-                validate_lease()?;
-                if focus == WorkspaceFocus::Agent {
-                    match self.agent.as_ref() {
-                        Some(agent) if agent.is_alive() => {}
-                        Some(agent) => {
-                            self.notice = Some(agent.exit_description().map_or_else(
-                                || "agent exited; showing the latest session preview".into(),
-                                |exit| {
-                                    format!(
-                                        "agent exited ({exit}); showing the latest session preview"
-                                    )
-                                },
-                            ));
-                            focus = WorkspaceFocus::Sessions;
-                            last_signature.clear();
+            match command {
+                WorkspaceCommand::Dashboard => return Ok(Some(state.exit)),
+                WorkspaceCommand::Alert => {
+                    state.exit = WorkspaceExit::Alert;
+                    return Ok(Some(state.exit));
+                }
+                WorkspaceCommand::Search => {
+                    state.search = Some(WorkspaceSearch {
+                        value: state.chrome.search_query.clone(),
+                        original_query: state.chrome.search_query.clone(),
+                        original_selected_session_key: state.chrome.selected_session_key.clone(),
+                    });
+                }
+                WorkspaceCommand::Help => {
+                    state.help_open = true;
+                }
+                WorkspaceCommand::PreviousSession => {
+                    state.exit = WorkspaceExit::PreviousSession(state.focus);
+                    return Ok(Some(state.exit));
+                }
+                WorkspaceCommand::NextSession => {
+                    state.exit = WorkspaceExit::NextSession(state.focus);
+                    return Ok(Some(state.exit));
+                }
+                WorkspaceCommand::SelectShell(index) => {
+                    if index < self.shells.len() {
+                        self.selected_shell = index;
+                        state.focus = WorkspaceFocus::Shell;
+                        self.notice = Some(format!("selected {}", self.shells[index].name));
+                        if self.maximized.is_some() {
+                            self.maximized = Some(PaneTarget::Shell(index));
                         }
-                        None => {
-                            exit = WorkspaceExit::ActivateSession;
-                            break 'workspace;
-                        }
+                    } else {
+                        self.notice = Some(format!("shell {} does not exist", index + 1));
                     }
                 }
-                sync_keyboard_enhancement(&mut stdout, &mut keyboard_enhancement_enabled, focus)?;
-                let next_chrome = observe(None);
-                if next_chrome != chrome {
-                    chrome = next_chrome;
-                    last_signature.clear();
+                WorkspaceCommand::ToggleMaximize => {
+                    if self.shells.is_empty() {
+                        self.notice = Some("no shell is available to maximize".into());
+                        continue;
+                    }
+                    self.maximized = Some(PaneTarget::Shell(self.selected_shell));
+                    self.notice = Some(format!(
+                        "shell maximized · {} returns to sessions",
+                        state.render_bindings.label("focus")
+                    ));
+                    state.exit = WorkspaceExit::FocusShell;
+                    return Ok(Some(state.exit));
                 }
-                if self.shells.is_empty() {
-                    self.selected_shell = 0;
-                    if focus == WorkspaceFocus::Shell {
-                        focus = if self.agent.is_some() {
-                            WorkspaceFocus::Agent
-                        } else {
-                            WorkspaceFocus::Sessions
+                WorkspaceCommand::ToggleShellArea => {
+                    self.maximized = Some(PaneTarget::Agent);
+                    self.notice = Some(format!(
+                        "agent maximized · {} changes focus",
+                        state.render_bindings.label("focus")
+                    ));
+                    state.exit = WorkspaceExit::ActivateSession;
+                    return Ok(Some(state.exit));
+                }
+                WorkspaceCommand::GrowShell => {
+                    if self.maximized.is_none() && !self.shells.is_empty() {
+                        self.shell_height_adjust =
+                            self.shell_height_adjust.saturating_add(2).min(20);
+                        self.notice = Some("shell area enlarged".into());
+                        state.clear_next_frame = true;
+                    }
+                }
+                WorkspaceCommand::ShrinkShell => {
+                    if self.maximized.is_none() && !self.shells.is_empty() {
+                        self.shell_height_adjust =
+                            self.shell_height_adjust.saturating_sub(2).max(-10);
+                        self.notice = Some("shell area reduced".into());
+                        state.clear_next_frame = true;
+                    }
+                }
+                WorkspaceCommand::CopyCommandBlock => {
+                    self.notice = self
+                        .shells
+                        .get(self.selected_shell)
+                        .map(ShellPane::command_capture)
+                        .filter(|capture| !capture.trim().is_empty())
+                        .map_or_else(
+                            || "current shell has no command block".into(),
+                            |capture| match clipboard::copy(&capture) {
+                                Ok(()) => "command block copied".into(),
+                                Err(error) => format!("copy failed: {error}"),
+                            },
+                        )
+                        .into();
+                }
+                WorkspaceCommand::ToggleFocus => {
+                    if state.focus == WorkspaceFocus::Sessions {
+                        state.exit = WorkspaceExit::ActivateSession;
+                        return Ok(Some(state.exit));
+                    }
+                    state.focus = self.toggle_workspace_focus(session, state.focus)?;
+                    if self.maximized.is_some() {
+                        self.maximized = match state.focus {
+                            WorkspaceFocus::Sessions => None,
+                            WorkspaceFocus::Agent => Some(PaneTarget::Agent),
+                            WorkspaceFocus::Shell => Some(PaneTarget::Shell(self.selected_shell)),
                         };
                     }
-                } else {
-                    self.selected_shell = self.selected_shell.min(self.shells.len() - 1);
                 }
-
-                let new_size = normalized_size(crossterm::terminal::size().unwrap_or(size));
-                if new_size != size {
-                    size = new_size;
-                    last_signature.clear();
-                    clear_next_frame = true;
-                }
-                let mut layout =
-                    WorkspaceLayout::new(size.0, size.1, self.shells.len(), self.selected_shell);
-                layout.apply_options(self.maximized, self.shell_height_adjust);
-                let layout_key = (
-                    size,
-                    self.shells.len(),
-                    self.selected_shell,
-                    self.maximized,
-                    self.shell_height_adjust,
-                );
-                if last_layout_key != Some(layout_key) {
-                    self.resize_workspace(&layout)?;
-                    last_layout_key = Some(layout_key);
-                    last_signature.clear();
-                    clear_next_frame = true;
-                }
-                let alternate_changed = self.refresh_alternate_selection()?;
-                let selection_copied = self.finish_pending_alternate_copy();
-                if alternate_changed || selection_copied {
-                    last_signature.clear();
-                }
-                let signature = self.render_signature(size, &layout, focus);
-                if signature != last_signature {
-                    render_workspace_with_bindings(
-                        &mut stdout,
-                        self,
-                        &chrome,
-                        &layout,
-                        WorkspaceRenderState {
-                            focus,
-                            search: search
-                                .as_ref()
-                                .map(|search: &WorkspaceSearch| search.value.as_str()),
-                            help: help_open,
-                        },
-                        &render_bindings,
-                        clear_next_frame,
-                    )?;
-                    last_signature = signature;
-                    clear_next_frame = false;
-                }
-
-                let input = match poll_terminal_input(Duration::from_millis(10))? {
-                    PolledTerminalInput::Pending => {
-                        if let Some(bytes) = input_router.flush() {
-                            self.write_focused(focus, &bytes)?;
-                        }
-                        continue;
+                WorkspaceCommand::NewShell => {
+                    if state.focus == WorkspaceFocus::Sessions {
+                        state.exit = WorkspaceExit::OpenShell;
+                        return Ok(Some(state.exit));
                     }
-                    PolledTerminalInput::EndOfFile => break,
-                    PolledTerminalInput::Bytes(input) => input,
-                };
-                if help_open {
-                    if input == b"\x1b"
-                        || render_bindings.command(&input) == Some(WorkspaceCommand::Help)
-                    {
-                        help_open = false;
+                    let name = self.next_shell_name();
+                    let (id, terminal) = self.spawn_shell(session, (80, 12))?;
+                    self.shells.push(ShellPane::new(id, terminal, name));
+                    self.selected_shell = self.shells.len() - 1;
+                    state.focus = WorkspaceFocus::Shell;
+                    if self.maximized.is_some() {
+                        self.maximized = Some(PaneTarget::Shell(self.selected_shell));
                     }
-                    last_signature.clear();
-                    continue 'workspace;
                 }
-                if let Some(active_search) = search.as_mut() {
-                    let (search_input, changed) =
-                        apply_workspace_search_input(active_search, &input);
-                    match search_input {
-                        WorkspaceSearchInput::Cancel => {
-                            let update = WorkspaceSearchUpdate::Cancel {
-                                query: active_search.original_query.clone(),
-                                selected_session_key: active_search
-                                    .original_selected_session_key
-                                    .clone(),
-                            };
-                            let _ = observe(Some(update));
-                            exit = WorkspaceExit::RefreshSessions;
-                            break 'workspace;
-                        }
-                        WorkspaceSearchInput::Commit => {
-                            if changed {
-                                chrome = observe(Some(WorkspaceSearchUpdate::Preview(
-                                    active_search.value.clone(),
-                                )));
-                            }
-                            search = None;
-                        }
-                        WorkspaceSearchInput::Editing if changed => {
-                            chrome = observe(Some(WorkspaceSearchUpdate::Preview(
-                                active_search.value.clone(),
-                            )));
-                        }
-                        WorkspaceSearchInput::Editing => {}
-                    }
-                    last_signature.clear();
-                    continue 'workspace;
-                }
-                for routed in input_router.route(&input, focus) {
-                    if let WorkspaceInput::Mouse(event) = routed {
-                        self.handle_mouse(&layout, event)?;
-                        last_signature.clear();
-                        continue;
-                    }
-                    let WorkspaceInput::Command(command) = routed else {
-                        if let WorkspaceInput::Forward(bytes) = routed {
-                            if focus == WorkspaceFocus::Sessions {
-                                match session_list_input(&bytes) {
-                                    Some(SessionListInput::Previous) => {
-                                        exit = WorkspaceExit::PreviousSession(focus);
-                                        break 'workspace;
-                                    }
-                                    Some(SessionListInput::Next) => {
-                                        exit = WorkspaceExit::NextSession(focus);
-                                        break 'workspace;
-                                    }
-                                    Some(SessionListInput::Activate) => {
-                                        exit = WorkspaceExit::ActivateSession;
-                                        break 'workspace;
-                                    }
-                                    Some(SessionListInput::NewSession) => {
-                                        exit = WorkspaceExit::NewSession;
-                                        break 'workspace;
-                                    }
-                                    Some(SessionListInput::OpenShell) => {
-                                        exit = WorkspaceExit::OpenShell;
-                                        break 'workspace;
-                                    }
-                                    Some(SessionListInput::ToggleArchive) => {
-                                        exit = WorkspaceExit::ToggleArchive;
-                                        break 'workspace;
-                                    }
-                                    None => {}
-                                }
-                                continue;
-                            }
-                            if self
-                                .focused_terminal(focus)
-                                .is_some_and(|terminal| terminal.scrollback_offset() > 0)
-                            {
-                                self.focused_terminal(focus).unwrap().scroll_to_live_tail();
-                            }
-                            self.write_focused(focus, &bytes)?;
-                        }
-                        continue;
-                    };
-                    match command {
-                        WorkspaceCommand::Dashboard => break 'workspace,
-                        WorkspaceCommand::Alert => {
-                            exit = WorkspaceExit::Alert;
-                            break 'workspace;
-                        }
-                        WorkspaceCommand::Search => {
-                            search = Some(WorkspaceSearch {
-                                value: chrome.search_query.clone(),
-                                original_query: chrome.search_query.clone(),
-                                original_selected_session_key: chrome.selected_session_key.clone(),
-                            });
-                        }
-                        WorkspaceCommand::Help => {
-                            help_open = true;
-                        }
-                        WorkspaceCommand::PreviousSession => {
-                            exit = WorkspaceExit::PreviousSession(focus);
-                            break 'workspace;
-                        }
-                        WorkspaceCommand::NextSession => {
-                            exit = WorkspaceExit::NextSession(focus);
-                            break 'workspace;
-                        }
-                        WorkspaceCommand::SelectShell(index) => {
-                            if index < self.shells.len() {
-                                self.selected_shell = index;
-                                focus = WorkspaceFocus::Shell;
-                                self.notice = Some(format!("selected {}", self.shells[index].name));
-                                if self.maximized.is_some() {
-                                    self.maximized = Some(PaneTarget::Shell(index));
-                                }
-                            } else {
-                                self.notice = Some(format!("shell {} does not exist", index + 1));
-                            }
-                        }
-                        WorkspaceCommand::ToggleMaximize => {
-                            if self.shells.is_empty() {
-                                self.notice = Some("no shell is available to maximize".into());
-                                continue;
-                            }
+                WorkspaceCommand::PreviousShell => {
+                    if !self.shells.is_empty() {
+                        self.selected_shell = self
+                            .selected_shell
+                            .checked_sub(1)
+                            .unwrap_or(self.shells.len() - 1);
+                        state.focus = WorkspaceFocus::Shell;
+                        if self.maximized.is_some() {
                             self.maximized = Some(PaneTarget::Shell(self.selected_shell));
-                            self.notice = Some(format!(
-                                "shell maximized · {} returns to sessions",
-                                render_bindings.label("focus")
-                            ));
-                            exit = WorkspaceExit::FocusShell;
-                            break 'workspace;
                         }
-                        WorkspaceCommand::ToggleShellArea => {
-                            self.maximized = Some(PaneTarget::Agent);
-                            self.notice = Some(format!(
-                                "agent maximized · {} changes focus",
-                                render_bindings.label("focus")
-                            ));
-                            exit = WorkspaceExit::ActivateSession;
-                            break 'workspace;
+                    } else {
+                        self.notice = Some(format!(
+                            "no shell is open; press {} to create one",
+                            state.render_bindings.label("new_shell")
+                        ));
+                    }
+                }
+                WorkspaceCommand::NextShell => {
+                    if !self.shells.is_empty() {
+                        self.selected_shell = (self.selected_shell + 1) % self.shells.len();
+                        state.focus = WorkspaceFocus::Shell;
+                        if self.maximized.is_some() {
+                            self.maximized = Some(PaneTarget::Shell(self.selected_shell));
                         }
-                        WorkspaceCommand::GrowShell => {
-                            if self.maximized.is_none() && !self.shells.is_empty() {
-                                self.shell_height_adjust =
-                                    self.shell_height_adjust.saturating_add(2).min(20);
-                                self.notice = Some("shell area enlarged".into());
-                                clear_next_frame = true;
-                            }
+                    } else {
+                        self.notice = Some(format!(
+                            "no shell is open; press {} to create one",
+                            state.render_bindings.label("new_shell")
+                        ));
+                    }
+                }
+                WorkspaceCommand::CloseShell => {
+                    if self.shells.is_empty() {
+                        self.notice = Some("no shell to close".into());
+                        continue;
+                    }
+                    match shell_close_action(state.focus) {
+                        ShellCloseAction::Ignore => {
+                            self.notice = Some("focus a shell before closing it".into());
                         }
-                        WorkspaceCommand::ShrinkShell => {
-                            if self.maximized.is_none() && !self.shells.is_empty() {
-                                self.shell_height_adjust =
-                                    self.shell_height_adjust.saturating_sub(2).max(-10);
-                                self.notice = Some("shell area reduced".into());
-                                clear_next_frame = true;
-                            }
-                        }
-                        WorkspaceCommand::CopyCommandBlock => {
-                            self.notice = self
-                                .shells
-                                .get(self.selected_shell)
-                                .map(ShellPane::command_capture)
-                                .filter(|capture| !capture.trim().is_empty())
-                                .map_or_else(
-                                    || "current shell has no command block".into(),
-                                    |capture| match clipboard::copy(&capture) {
-                                        Ok(()) => "command block copied".into(),
-                                        Err(error) => format!("copy failed: {error}"),
-                                    },
-                                )
-                                .into();
-                        }
-                        WorkspaceCommand::ToggleFocus => {
-                            if focus == WorkspaceFocus::Sessions {
-                                exit = WorkspaceExit::ActivateSession;
-                                break 'workspace;
-                            }
-                            focus = self.toggle_workspace_focus(session, focus)?;
-                            if self.maximized.is_some() {
-                                self.maximized = match focus {
-                                    WorkspaceFocus::Sessions => None,
-                                    WorkspaceFocus::Agent => Some(PaneTarget::Agent),
-                                    WorkspaceFocus::Shell => {
-                                        Some(PaneTarget::Shell(self.selected_shell))
-                                    }
-                                };
-                            }
-                        }
-                        WorkspaceCommand::NewShell => {
-                            if focus == WorkspaceFocus::Sessions {
-                                exit = WorkspaceExit::OpenShell;
-                                break 'workspace;
-                            }
-                            let name = self.next_shell_name();
-                            self.shells
-                                .push(ShellPane::new(self.spawn_shell(session, (80, 12))?, name));
-                            self.selected_shell = self.shells.len() - 1;
-                            focus = WorkspaceFocus::Shell;
-                            if self.maximized.is_some() {
-                                self.maximized = Some(PaneTarget::Shell(self.selected_shell));
-                            }
-                        }
-                        WorkspaceCommand::PreviousShell => {
-                            if !self.shells.is_empty() {
-                                self.selected_shell = self
-                                    .selected_shell
-                                    .checked_sub(1)
-                                    .unwrap_or(self.shells.len() - 1);
-                                focus = WorkspaceFocus::Shell;
-                                if self.maximized.is_some() {
-                                    self.maximized = Some(PaneTarget::Shell(self.selected_shell));
-                                }
-                            } else {
-                                self.notice = Some(format!(
-                                    "no shell is open; press {} to create one",
-                                    render_bindings.label("new_shell")
-                                ));
-                            }
-                        }
-                        WorkspaceCommand::NextShell => {
-                            if !self.shells.is_empty() {
-                                self.selected_shell = (self.selected_shell + 1) % self.shells.len();
-                                focus = WorkspaceFocus::Shell;
-                                if self.maximized.is_some() {
-                                    self.maximized = Some(PaneTarget::Shell(self.selected_shell));
-                                }
-                            } else {
-                                self.notice = Some(format!(
-                                    "no shell is open; press {} to create one",
-                                    render_bindings.label("new_shell")
-                                ));
-                            }
-                        }
-                        WorkspaceCommand::CloseShell => {
+                        ShellCloseAction::Close => {
+                            self.shells.remove(self.selected_shell).terminal.terminate();
                             if self.shells.is_empty() {
-                                self.notice = Some("no shell to close".into());
-                                continue;
-                            }
-                            match shell_close_action(focus) {
-                                ShellCloseAction::Ignore => {
-                                    self.notice = Some("focus a shell before closing it".into());
+                                self.selected_shell = 0;
+                                state.focus = WorkspaceFocus::Agent;
+                                self.maximized = None;
+                            } else {
+                                self.selected_shell =
+                                    self.selected_shell.min(self.shells.len() - 1);
+                                if self.maximized.is_some() {
+                                    self.maximized = Some(PaneTarget::Shell(self.selected_shell));
                                 }
-                                ShellCloseAction::Close => {
-                                    self.shells.remove(self.selected_shell).terminal.terminate();
-                                    if self.shells.is_empty() {
-                                        self.selected_shell = 0;
-                                        focus = WorkspaceFocus::Agent;
-                                        self.maximized = None;
-                                    } else {
-                                        self.selected_shell =
-                                            self.selected_shell.min(self.shells.len() - 1);
-                                        if self.maximized.is_some() {
-                                            self.maximized =
-                                                Some(PaneTarget::Shell(self.selected_shell));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        WorkspaceCommand::ScrollUp => {
-                            if let Some(terminal) = self.focused_terminal(focus) {
-                                terminal
-                                    .scroll_viewport(
-                                        focused_viewport_height(&layout, self, focus) as isize
-                                    );
-                            }
-                        }
-                        WorkspaceCommand::ScrollDown => {
-                            if let Some(terminal) = self.focused_terminal(focus) {
-                                terminal.scroll_viewport(
-                                    -(focused_viewport_height(&layout, self, focus) as isize),
-                                );
-                            }
-                        }
-                        WorkspaceCommand::LiveTail => {
-                            if let Some(terminal) = self.focused_terminal(focus) {
-                                terminal.scroll_to_live_tail();
                             }
                         }
                     }
                 }
-                last_signature.clear();
+                WorkspaceCommand::ScrollUp => {
+                    if let Some(terminal) = self.focused_terminal(state.focus) {
+                        terminal.scroll_viewport(focused_viewport_height(
+                            &state.layout,
+                            self,
+                            state.focus,
+                        ) as isize);
+                    }
+                }
+                WorkspaceCommand::ScrollDown => {
+                    if let Some(terminal) = self.focused_terminal(state.focus) {
+                        terminal.scroll_viewport(
+                            -(focused_viewport_height(&state.layout, self, state.focus) as isize),
+                        );
+                    }
+                }
+                WorkspaceCommand::LiveTail => {
+                    if let Some(terminal) = self.focused_terminal(state.focus) {
+                        terminal.scroll_to_live_tail();
+                    }
+                }
             }
-            Ok(exit)
-        })();
-        let restore = if keyboard_enhancement_enabled {
-            stdout.write_all(DISABLE_KEYBOARD_ENHANCEMENT)
+        }
+        state.last_signature.clear();
+        Ok(None)
+    }
+
+    /// The half of a frame that repaints, and the only place a workspace decides on its own
+    /// that it is over -- when the agent it was showing has gone.
+    fn render_workspace(
+        &mut self,
+        state: &mut WorkspaceSession,
+        chrome: WorkspaceChrome,
+    ) -> io::Result<Option<WorkspaceExit>> {
+        if state.focus == WorkspaceFocus::Agent {
+            match self.agent.as_ref() {
+                Some(agent) if agent.is_alive() => {}
+                Some(agent) => {
+                    self.notice = Some(agent.exit_description().map_or_else(
+                        || "agent exited; showing the latest session preview".into(),
+                        |exit| format!("agent exited ({exit}); showing the latest session preview"),
+                    ));
+                    state.focus = WorkspaceFocus::Sessions;
+                    state.last_signature.clear();
+                }
+                None => {
+                    state.exit = WorkspaceExit::ActivateSession;
+                    return Ok(Some(state.exit));
+                }
+            }
+        }
+        sync_keyboard_enhancement(
+            &mut state.stdout,
+            &mut state.keyboard_enhancement_enabled,
+            state.focus,
+        )?;
+        if chrome != state.chrome {
+            state.chrome = chrome;
+            state.last_signature.clear();
+        }
+        if self.shells.is_empty() {
+            self.selected_shell = 0;
+            if state.focus == WorkspaceFocus::Shell {
+                state.focus = if self.agent.is_some() {
+                    WorkspaceFocus::Agent
+                } else {
+                    WorkspaceFocus::Sessions
+                };
+            }
         } else {
-            Ok(())
+            self.selected_shell = self.selected_shell.min(self.shells.len() - 1);
         }
-        .and_then(|()| stdout.write_all(DISABLE_MOUSE_REPORTING))
-        .and_then(|()| stdout.write_all(b"\x1b[0m\x1b[?25h"))
-        .and_then(|()| stdout.flush());
-        match result {
-            Ok(exit) => restore.map(|()| exit),
-            Err(error) => Err(error),
+
+        let new_size = normalized_size(crossterm::terminal::size().unwrap_or(state.size));
+        if new_size != state.size {
+            state.size = new_size;
+            state.last_signature.clear();
+            state.clear_next_frame = true;
         }
+        let mut layout = WorkspaceLayout::new(
+            state.size.0,
+            state.size.1,
+            self.shells.len(),
+            self.selected_shell,
+        );
+        layout.apply_options(self.maximized, self.shell_height_adjust);
+        state.layout = layout;
+        let layout_key = (
+            state.size,
+            self.shells.len(),
+            self.selected_shell,
+            self.maximized,
+            self.shell_height_adjust,
+        );
+        if state.last_layout_key != Some(layout_key) {
+            self.resize_workspace(&state.layout)?;
+            state.last_layout_key = Some(layout_key);
+            state.last_signature.clear();
+            state.clear_next_frame = true;
+        }
+        let alternate_changed = self.refresh_alternate_selection()?;
+        let selection_copied = self.finish_pending_alternate_copy();
+        if alternate_changed || selection_copied {
+            state.last_signature.clear();
+        }
+        let signature = self.render_signature(state.size, &state.layout, state.focus);
+        if signature != state.last_signature {
+            render_workspace_with_bindings(
+                &mut state.stdout,
+                self,
+                &state.chrome,
+                &state.layout,
+                WorkspaceRenderState {
+                    focus: state.focus,
+                    search: state
+                        .search
+                        .as_ref()
+                        .map(|search: &WorkspaceSearch| search.value.as_str()),
+                    help: state.help_open,
+                },
+                &state.render_bindings,
+                state.clear_next_frame,
+            )?;
+            state.last_signature = signature;
+            state.clear_next_frame = false;
+        }
+        Ok(None)
     }
 
     fn resize_workspace(&mut self, layout: &WorkspaceLayout) -> io::Result<()> {
@@ -4687,11 +5142,11 @@ impl SessionTerminals {
     fn focused_terminal(&self, focus: WorkspaceFocus) -> Option<&ManagedTerminal> {
         match focus {
             WorkspaceFocus::Sessions => None,
-            WorkspaceFocus::Agent => self.agent.as_ref(),
+            WorkspaceFocus::Agent => self.agent.as_deref(),
             WorkspaceFocus::Shell => self
                 .shells
                 .get(self.selected_shell)
-                .map(|pane| &pane.terminal),
+                .map(|pane| pane.terminal.as_ref()),
         }
     }
 
@@ -4713,7 +5168,7 @@ impl SessionTerminals {
             },
             self.agent
                 .as_ref()
-                .map_or(0, ManagedTerminal::output_generation),
+                .map_or(0, |agent| agent.output_generation()),
         ];
         signature.extend(
             layout
@@ -4727,6 +5182,53 @@ impl SessionTerminals {
 
 fn spawn_shell(session: &Session, size: (u16, u16)) -> io::Result<ManagedTerminal> {
     ManagedTerminal::spawn(&shell_command(&session.cwd), size)
+}
+
+/// The part of a daemon terminal id that names one shell: the `<id>` of
+/// `shell|<session key>|<id>`. Session keys themselves contain `|`, so this splits from the
+/// right, the same way `terminal_session_key` does.
+fn shell_id_of(terminal_id: &str) -> Option<&str> {
+    terminal_id
+        .strip_prefix("shell|")
+        .and_then(|rest| rest.rsplit_once('|'))
+        .map(|(_, id)| id)
+}
+
+/// Connects to every shell the daemon is holding for this session that `terminals` has not
+/// adopted yet. Shell terminals live in the daemon, not in any one process, so this is what
+/// makes a shell opened in the TUI and one opened in a browser the same terminal.
+fn adopt_daemon_shells(
+    terminals: &mut SessionTerminals,
+    socket: &Path,
+    session_key: &str,
+    owner_id: &str,
+    size: (u16, u16),
+) -> io::Result<()> {
+    let DaemonResponse::List(ids) = daemon_request(
+        socket,
+        &DaemonRequest::List {
+            prefix: format!("shell|{session_key}|"),
+        },
+    )?
+    else {
+        return Ok(());
+    };
+    for id in ids {
+        let Some(shell_id) = shell_id_of(&id) else {
+            continue;
+        };
+        if terminals.shells.iter().any(|shell| shell.id == shell_id) {
+            continue;
+        }
+        let shell_id = shell_id.to_owned();
+        let name = terminals.next_shell_name();
+        terminals.shells.push(ShellPane::new(
+            shell_id,
+            ManagedTerminal::connect_remote(socket.to_path_buf(), id, owner_id.to_owned(), size)?,
+            name,
+        ));
+    }
+    Ok(())
 }
 
 fn shell_command(cwd: &Path) -> CommandSpec {
@@ -4811,7 +5313,7 @@ fn render_workspace_frame(
         let agent_label = if show_live_agent {
             pane_label_with_scrollback(
                 &format!("AGENT · {selected_label}"),
-                terminals.agent.as_ref(),
+                terminals.agent.as_deref(),
             )
         } else {
             format!("SESSION PREVIEW · {selected_label}")
@@ -4866,7 +5368,10 @@ fn render_workspace_frame(
             rect.width,
             &pane_label_with_scrollback(
                 &terminals.shell_label(*index),
-                terminals.shells.get(*index).map(|pane| &pane.terminal),
+                terminals
+                    .shells
+                    .get(*index)
+                    .map(|pane| pane.terminal.as_ref()),
             ),
             focus == WorkspaceFocus::Shell && selected,
         )?;
@@ -5463,7 +5968,20 @@ fn fit_text(value: &str, width: u16) -> String {
 #[derive(Default)]
 pub struct TerminalManager {
     config: AgentConsoleConfig,
-    terminals: HashMap<String, SessionTerminals>,
+    /// One lock per session rather than one for the map's contents.
+    ///
+    /// A workspace frame is almost entirely terminal work -- polling the daemon for new
+    /// output, feeding it through vt100, writing a screen to a terminal that may be applying
+    /// back-pressure -- and under a busy agent that adds up to hundreds of milliseconds. None
+    /// of it reads the session list, the notifications or anything else the `App` owns, so
+    /// none of it should be holding the `App` mutex that the web server needs to answer at
+    /// all. Handing the attach its own handle is what takes that work off that lock.
+    ///
+    /// Lock order is always `App` first, then a session: `TerminalManager`'s own methods are
+    /// reached through the `App` and take a session lock inside it, while an attached
+    /// workspace takes only the session lock. Nothing takes the `App` lock while holding a
+    /// session's.
+    terminals: HashMap<String, SessionHandle>,
     use_daemon: bool,
     daemon_socket: Option<PathBuf>,
     lease_owner: LeaseOwner,
@@ -5504,6 +6022,7 @@ impl TerminalManager {
         })?;
         ensure_private_dir(&state_dir)?;
         let socket = state_dir.join("pty-daemon.sock");
+        check_socket_path(&socket)?;
         if !matches!(
             daemon_request(&socket, &DaemonRequest::Ping),
             Ok(DaemonResponse::Ok)
@@ -5551,12 +6070,17 @@ impl TerminalManager {
         Ok(Some(socket))
     }
 
-    pub fn agent(&self, key: &str) -> Option<&ManagedTerminal> {
-        self.terminals.get(key)?.agent.as_ref()
+    /// A handle on a session's agent terminal.
+    ///
+    /// Owned rather than borrowed, so a caller can go on using it -- polling the daemon,
+    /// writing a keystroke -- with every lock released. That is what keeps a websocket's
+    /// round-trips off the locks the dashboard needs for a repaint.
+    pub fn agent(&self, key: &str) -> Option<Arc<ManagedTerminal>> {
+        self.terminals.get(key)?.lock().unwrap().agent.clone()
     }
 
     pub fn shell_capture(&self, key: &str) -> Option<String> {
-        let terminals = self.terminals.get(key)?;
+        let terminals = self.terminals.get(key)?.lock().unwrap();
         terminals
             .shells
             .get(terminals.selected_shell)
@@ -5566,18 +6090,85 @@ impl TerminalManager {
     pub fn shell_count(&self, key: &str) -> usize {
         self.terminals
             .get(key)
-            .map_or(0, |terminal| terminal.shells.len())
+            .map_or(0, |terminals| terminals.lock().unwrap().shells.len())
+    }
+
+    /// Every shell this process has open for a session, in the order they are shown.
+    pub fn shells(&self, key: &str) -> Vec<ShellInfo> {
+        self.terminals.get(key).map_or_else(Vec::new, |terminals| {
+            terminals
+                .lock()
+                .unwrap()
+                .shells
+                .iter()
+                .map(ShellPane::info)
+                .collect()
+        })
+    }
+
+    /// One session's shell, for a caller that streams it with `ManagedTerminal::poll_raw`.
+    pub fn shell(&self, key: &str, id: &str) -> Option<Arc<ManagedTerminal>> {
+        self.terminals
+            .get(key)?
+            .lock()
+            .unwrap()
+            .shells
+            .iter()
+            .find(|shell| shell.id == id)
+            .map(|shell| Arc::clone(&shell.terminal))
+    }
+
+    /// Kills a shell and drops its pane, mirroring the TUI's own close: the daemon forgets
+    /// the terminal, so no surface sees it again. Reports whether there was one to close.
+    pub fn close_shell(&mut self, key: &str, id: &str) -> bool {
+        let Some(terminals) = self.terminals.get(key) else {
+            return false;
+        };
+        let mut terminals = terminals.lock().unwrap();
+        let Some(index) = terminals.shells.iter().position(|shell| shell.id == id) else {
+            return false;
+        };
+        terminals.shells.remove(index).terminal.terminate();
+        terminals.selected_shell = terminals
+            .selected_shell
+            .min(terminals.shells.len().saturating_sub(1));
+        true
+    }
+
+    /// Adopts shells another surface opened for this session, then reports the full list.
+    ///
+    /// Costs a daemon round trip, so it is for a caller that is about to show the list --
+    /// `shells` alone answers from what this process already knows.
+    pub fn refresh_shells(
+        &mut self,
+        session: &Session,
+        current_exe: &Path,
+        size: (u16, u16),
+    ) -> io::Result<Vec<ShellInfo>> {
+        self.ensure_session_view(session, current_exe, size)?;
+        if let Some(socket) = self.daemon_socket.clone() {
+            let owner_id = self.lease_owner.instance_id.clone();
+            let handle = Arc::clone(self.terminals.entry(session.key.clone()).or_default());
+            let mut terminals = handle.lock().unwrap();
+            adopt_daemon_shells(&mut terminals, &socket, &session.key, &owner_id, size)?;
+        }
+        Ok(self.shells(&session.key))
     }
 
     pub fn set_notice(&mut self, key: &str, notice: String) {
-        self.terminals.entry(key.to_owned()).or_default().notice = Some(notice);
+        self.terminals
+            .entry(key.to_owned())
+            .or_default()
+            .lock()
+            .unwrap()
+            .notice = Some(notice);
     }
 
     pub fn terminate_agent(&mut self, key: &str) {
         if let Some(agent) = self
             .terminals
-            .get_mut(key)
-            .and_then(|terminals| terminals.agent.take())
+            .get(key)
+            .and_then(|terminals| terminals.lock().unwrap().agent.take())
         {
             agent.terminate();
         }
@@ -5590,7 +6181,8 @@ impl TerminalManager {
         size: (u16, u16),
     ) -> io::Result<()> {
         let daemon_socket = self.ensure_daemon(current_exe)?;
-        let terminals = self.terminals.entry(session.key.clone()).or_default();
+        let handle = Arc::clone(self.terminals.entry(session.key.clone()).or_default());
+        let terminals = &mut *handle.lock().unwrap();
         terminals.daemon_socket.clone_from(&daemon_socket);
         terminals
             .lease_owner_id
@@ -5599,26 +6191,17 @@ impl TerminalManager {
             return Ok(());
         };
 
-        if terminals.shells.is_empty()
-            && let DaemonResponse::List(ids) = daemon_request(
+        // Only when nothing is open yet: this runs on every session activation, and a daemon
+        // round trip per call would sit in the path of every prompt and screen read. A caller
+        // that is about to *show* the list pays for the refresh explicitly (`refresh_shells`).
+        if terminals.shells.is_empty() {
+            adopt_daemon_shells(
+                &mut *terminals,
                 socket,
-                &DaemonRequest::List {
-                    prefix: format!("shell|{}|", session.key),
-                },
-            )?
-        {
-            for id in ids {
-                let name = terminals.next_shell_name();
-                terminals.shells.push(ShellPane::new(
-                    ManagedTerminal::connect_remote(
-                        socket.clone(),
-                        id,
-                        self.lease_owner.instance_id.clone(),
-                        size,
-                    )?,
-                    name,
-                ));
-            }
+                &session.key,
+                &self.lease_owner.instance_id,
+                size,
+            )?;
         }
 
         if terminals.agent.is_none()
@@ -5632,12 +6215,12 @@ impl TerminalManager {
                 .into_iter()
                 .find(|id| id == &format!("agent|{}", session.key))
         {
-            terminals.agent = Some(ManagedTerminal::connect_remote(
+            terminals.agent = Some(Arc::new(ManagedTerminal::connect_remote(
                 socket.clone(),
                 id,
                 self.lease_owner.instance_id.clone(),
                 size,
-            )?);
+            )?));
         }
         Ok(())
     }
@@ -5648,18 +6231,19 @@ impl TerminalManager {
         current_exe: &Path,
         new_session: bool,
         size: (u16, u16),
-    ) -> io::Result<&ManagedTerminal> {
+    ) -> io::Result<Arc<ManagedTerminal>> {
         self.ensure_session_view(session, current_exe, size)?;
         let daemon_socket = self.daemon_socket.clone();
         let agent_id = format!("agent|{}", session.key);
-        let terminals = self.terminals.get_mut(&session.key).unwrap();
+        let handle = Arc::clone(&self.terminals[&session.key]);
+        let terminals = &mut *handle.lock().unwrap();
         let needs_spawn = terminals
             .agent
             .as_ref()
             .is_none_or(|value| !value.is_alive());
         if needs_spawn {
             let spec = agent_command(&self.config, session, current_exe, new_session);
-            terminals.agent = Some(if let Some(socket) = daemon_socket {
+            terminals.agent = Some(Arc::new(if let Some(socket) = daemon_socket {
                 ManagedTerminal::ensure_remote(
                     socket,
                     agent_id,
@@ -5669,33 +6253,79 @@ impl TerminalManager {
                 )?
             } else {
                 ManagedTerminal::spawn(&spec, size)?
-            });
+            }));
         }
-        Ok(terminals.agent.as_ref().unwrap())
+        Ok(Arc::clone(terminals.agent.as_ref().unwrap()))
     }
 
-    pub fn add_shell(&mut self, session: &Session, size: (u16, u16)) -> io::Result<usize> {
-        let terminals = self.terminals.entry(session.key.clone()).or_default();
+    pub fn add_shell(&mut self, session: &Session, size: (u16, u16)) -> io::Result<ShellInfo> {
+        let handle = Arc::clone(self.terminals.entry(session.key.clone()).or_default());
+        let terminals = &mut *handle.lock().unwrap();
         let name = terminals.next_shell_name();
-        let shell = terminals.spawn_shell(session, size)?;
-        terminals.shells.push(ShellPane::new(shell, name));
+        let (id, shell) = terminals.spawn_shell(session, size)?;
+        terminals.shells.push(ShellPane::new(id, shell, name));
         terminals.selected_shell = terminals.shells.len() - 1;
-        Ok(terminals.selected_shell)
+        Ok(terminals.shells[terminals.selected_shell].info())
     }
 
-    pub fn attach_workspace<F>(
+    /// Claims the session's input lease for this process, so its writes stop losing to
+    /// whoever holds it.
+    ///
+    /// This is the piece of `attach_workspace`'s takeover that a surface without a
+    /// full-screen attach loop still needs: the web server never calls `attach_workspace`,
+    /// so a browser had no way past a lease a TUI was holding. `force` is the same flag the
+    /// TUI's takeover key sets.
+    ///
+    /// A non-forced call is also the only way to *ask* who holds the lease -- the daemon has
+    /// no read-only lease query -- and it is safe to ask, because the daemon only denies
+    /// while the holder is alive and has validated within `LEASE_STALE_AFTER`.
+    pub fn acquire_lease(
+        &mut self,
+        session_key: &str,
+        current_exe: &Path,
+        force: bool,
+    ) -> io::Result<LeaseOutcome> {
+        // No daemon means every terminal is process-local, so there is nothing to contend
+        // for and nothing that could have denied a write in the first place.
+        let Some(socket) = self.ensure_daemon(current_exe)? else {
+            return Ok(LeaseOutcome::Granted);
+        };
+        match daemon_request(
+            &socket,
+            &DaemonRequest::Acquire {
+                session_key: session_key.to_owned(),
+                owner: self.lease_owner.clone(),
+                force,
+            },
+        )? {
+            DaemonResponse::LeaseGranted => Ok(LeaseOutcome::Granted),
+            DaemonResponse::LeaseDenied { owner } => Ok(LeaseOutcome::Denied(LeaseHolder {
+                pid: owner.pid,
+                instance_id: owner.instance_id,
+                started_at: owner.started_at,
+            })),
+            DaemonResponse::Error(error) => Err(io::Error::other(error)),
+            other => Err(io::Error::other(format!(
+                "unexpected lease response: {other:?}"
+            ))),
+        }
+    }
+
+    /// Claims the session lease and opens a workspace on it.
+    ///
+    /// The returned [`WorkspaceSession`] is stepped by the caller rather than run to
+    /// completion here, so that the caller can release whatever it locked to reach this
+    /// manager between frames.
+    pub fn begin_workspace(
         &mut self,
         session: &Session,
         focus: WorkspaceFocus,
         force_takeover: bool,
-        observe: F,
-    ) -> io::Result<WorkspaceExit>
-    where
-        F: FnMut(Option<WorkspaceSearchUpdate>) -> WorkspaceChrome,
-    {
+        chrome: WorkspaceChrome,
+    ) -> io::Result<WorkspaceSession> {
         let bindings = WorkspaceBindings::from_config(&self.config);
         let needs_lease = focus != WorkspaceFocus::Sessions;
-        let leased = if needs_lease && let Some(socket) = &self.daemon_socket {
+        let held = if needs_lease && let Some(socket) = &self.daemon_socket {
             match daemon_request(
                 socket,
                 &DaemonRequest::Acquire {
@@ -5726,36 +6356,18 @@ impl TerminalManager {
         } else {
             false
         };
-        let lease_socket = self.daemon_socket.clone();
-        let lease_session_key = session.key.clone();
-        let lease_owner_id = self.lease_owner.instance_id.clone();
-        let terminals = self
+        let lease = WorkspaceLease {
+            socket: self.daemon_socket.clone(),
+            session_key: session.key.clone(),
+            owner_id: self.lease_owner.instance_id.clone(),
+            held,
+        };
+        let handle = self
             .terminals
-            .get_mut(&session.key)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "agent terminal is not open"))?;
-        let result = terminals.attach_workspace(session, focus, bindings, observe, || {
-            if leased && let Some(socket) = &lease_socket {
-                response_ok(daemon_request(
-                    socket,
-                    &DaemonRequest::ValidateLease {
-                        session_key: lease_session_key.clone(),
-                        owner_id: lease_owner_id.clone(),
-                    },
-                )?)
-            } else {
-                Ok(())
-            }
-        });
-        if leased && let Some(socket) = &self.daemon_socket {
-            let _ = daemon_request(
-                socket,
-                &DaemonRequest::Release {
-                    session_key: session.key.clone(),
-                    owner_id: self.lease_owner.instance_id.clone(),
-                },
-            );
-        }
-        result
+            .get(&session.key)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "agent terminal is not open"))
+            .map(Arc::clone)?;
+        SessionTerminals::begin_workspace(handle, focus, bindings, lease, chrome)
     }
 
     pub fn alive_keys(&self) -> Vec<String> {
@@ -5763,16 +6375,18 @@ impl TerminalManager {
             .iter()
             .filter(|(_, terminals)| {
                 terminals
+                    .lock()
+                    .unwrap()
                     .agent
                     .as_ref()
-                    .is_some_and(ManagedTerminal::is_alive)
+                    .is_some_and(|agent| agent.is_alive())
             })
             .map(|(key, _)| key.clone())
             .collect()
     }
 
     pub fn agent_alive(&self, key: &str) -> bool {
-        self.agent(key).is_some_and(ManagedTerminal::is_alive)
+        self.agent(key).is_some_and(|agent| agent.is_alive())
     }
 
     pub fn shutdown(&mut self) {
@@ -5803,6 +6417,7 @@ impl TerminalManager {
                         new_prefix: new_shell.clone(),
                     },
                 );
+                let terminals = terminals.lock().unwrap();
                 if let Some(agent) = &terminals.agent {
                     agent.rekey_prefix(&old_agent, &new_agent);
                 }
@@ -5911,6 +6526,28 @@ pub fn staged_shell_text(cwd: &Path, capture: &str) -> Option<String> {
     ))
 }
 
+/// Rejects a daemon socket path the kernel cannot bind.
+///
+/// The path is copied into a fixed-size `sun_path` buffer, and a path over the limit makes
+/// `bind` fail inside the freshly spawned daemon -- where nothing is watching. The parent then
+/// waits out its readiness timeout and every session silently streams nothing. Failing here
+/// turns that into one message that names the fix.
+fn check_socket_path(path: &Path) -> io::Result<()> {
+    let length = path.as_os_str().len();
+    if length < SUN_PATH_CAPACITY {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "PTY daemon socket path is {length} bytes, over this platform's {} byte limit: {}\n\
+             Set AGENT_CONSOLE_STATE_DIR to a shorter directory and start again.",
+            SUN_PATH_CAPACITY - 1,
+            path.display()
+        ),
+    ))
+}
+
 pub fn bracketed_paste(value: &str) -> Vec<u8> {
     let safe = value.replace('\x1b', "");
     let mut output = Vec::with_capacity(safe.len() + 12);
@@ -5920,7 +6557,11 @@ pub fn bracketed_paste(value: &str) -> Vec<u8> {
     output
 }
 
-fn plain_text(bytes: &[u8]) -> String {
+/// Decodes raw terminal output into the plain, de-duplicated, bounded text the TUI copies
+/// and stages. Public so a caller holding raw bytes of its own -- the web server, which
+/// collects them through `ManagedTerminal::poll_raw` rather than the shared parser -- renders
+/// them identically instead of growing a second, drifting decoder.
+pub fn plain_text(bytes: &[u8]) -> String {
     let mut stripped = Vec::with_capacity(bytes.len());
     let mut state = 0_u8;
     for &byte in bytes {
@@ -6187,6 +6828,51 @@ mod tests {
     }
 
     #[test]
+    fn a_spawned_agent_does_not_inherit_the_launching_session_markers() {
+        // Launching the console from inside an agent session used to leak these into every
+        // agent it spawned. CLAUDE_CODE_CHILD_SESSION turns the provider's transcript saving
+        // off, which leaves discovery -- and the conversation view -- silently empty.
+        let root = tempdir().unwrap();
+        let script = root.path().join("env.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf 'child=[%s] id=[%s] keep=[%s]\\n' \
+             \"$CLAUDE_CODE_CHILD_SESSION\" \"$CLAUDE_CODE_SESSION_ID\" \"$AGENT_CONSOLE_KEEP\"\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).unwrap();
+        }
+        // SAFETY: single-threaded test setup, before any spawn observes the environment.
+        unsafe {
+            env::set_var("CLAUDE_CODE_CHILD_SESSION", "1");
+            env::set_var("CLAUDE_CODE_SESSION_ID", "parent-session");
+            env::set_var("AGENT_CONSOLE_KEEP", "kept");
+        }
+        let terminal =
+            ManagedTerminal::spawn(&CommandSpec::new(script.as_os_str(), root.path()), (0, 0))
+                .unwrap();
+        let capture = wait_for_capture(&terminal, "child=");
+        unsafe {
+            env::remove_var("CLAUDE_CODE_CHILD_SESSION");
+            env::remove_var("CLAUDE_CODE_SESSION_ID");
+            env::remove_var("AGENT_CONSOLE_KEEP");
+        }
+        assert!(
+            capture.contains("child=[] id=[]"),
+            "session markers leaked into the spawned agent: {capture}"
+        );
+        assert!(
+            capture.contains("keep=[kept]"),
+            "unrelated environment should still be inherited: {capture}"
+        );
+    }
+
+    #[test]
     fn pty_captures_output_accepts_input_and_outlives_detach_state() {
         let root = tempdir().unwrap();
         let script = root.path().join("echo.sh");
@@ -6254,6 +6940,7 @@ mod tests {
                 .handle(DaemonRequest::Poll {
                     id: "agent|test".into(),
                     offset,
+                    scrollback: false,
                 })
                 .0
             {
@@ -6283,6 +6970,7 @@ mod tests {
                 .handle(DaemonRequest::Poll {
                     id: "agent|test".into(),
                     offset,
+                    scrollback: false,
                 })
                 .0
             {
@@ -6388,7 +7076,7 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
 
-        let delta = terminal.output_since(0);
+        let delta = terminal.output_since(0, Scrollback::Omit);
         assert!(delta.start > 0);
         let checkpoint = delta
             .checkpoint
@@ -6453,12 +7141,39 @@ mod tests {
             .rows
             .push_back(b"retained-before-128-kib".to_vec());
 
-        let delta = terminal.output_since(0);
+        let delta = terminal.output_since(0, Scrollback::Omit);
         assert!(delta.checkpoint.is_some());
         assert_eq!(
             delta.status_bar_rows,
             Some(vec![b"retained-before-128-kib".to_vec()])
         );
+    }
+
+    #[test]
+    fn managed_terminal_poll_raw_reports_offsets_and_bytes_since_the_cursor() {
+        let root = tempdir().unwrap();
+        let terminal = ManagedTerminal::spawn(
+            &CommandSpec::new("/bin/sh", root.path())
+                .arg("-c")
+                .arg("printf hello; sleep 10"),
+            (40, 6),
+        )
+        .unwrap();
+        terminal.wait_for_first_output(Duration::from_secs(5));
+
+        let first = terminal.poll_raw(0, Scrollback::Omit).unwrap();
+        assert_eq!(first.start, 0);
+        assert!(first.end > first.start);
+        assert!(String::from_utf8_lossy(&first.bytes).contains("hello"));
+        assert!(first.checkpoint.is_none());
+        assert!(first.alive);
+        assert!(first.exit.is_none());
+
+        let second = terminal.poll_raw(first.end, Scrollback::Omit).unwrap();
+        assert_eq!(second.start, first.end);
+        assert!(second.bytes.is_empty());
+
+        terminal.terminate();
     }
 
     #[test]
@@ -6533,6 +7248,35 @@ mod tests {
                 .0,
             DaemonResponse::Error(error) if error.contains("another TUI")
         ));
+    }
+
+    #[test]
+    fn a_socket_path_within_sun_path_is_accepted() {
+        let short = PathBuf::from("/tmp/agent-console/pty-daemon.sock");
+        assert!(short.as_os_str().len() < SUN_PATH_CAPACITY);
+        assert!(check_socket_path(&short).is_ok());
+    }
+
+    /// A deep `AGENT_CONSOLE_STATE_DIR` used to spawn a daemon that could never bind, leaving
+    /// every session streaming nothing with no error anywhere.
+    #[test]
+    fn an_over_long_socket_path_fails_with_the_length_the_limit_and_the_fix() {
+        let long = PathBuf::from(format!("/tmp/{}/pty-daemon.sock", "deep".repeat(30)));
+        let error = check_socket_path(&long).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let message = error.to_string();
+        for expected in [
+            &long.as_os_str().len().to_string(),
+            &(SUN_PATH_CAPACITY - 1).to_string(),
+            &long.display().to_string(),
+            &"AGENT_CONSOLE_STATE_DIR".to_owned(),
+        ] {
+            assert!(
+                message.contains(expected.as_str()),
+                "the message has to name {expected}: {message}"
+            );
+        }
     }
 
     #[test]
@@ -6739,7 +7483,7 @@ mod tests {
         .unwrap();
         agent.wait_for_first_output(Duration::from_secs(1));
         let mut terminals = SessionTerminals {
-            agent: Some(agent),
+            agent: Some(Arc::new(agent)),
             ..SessionTerminals::default()
         };
         let layout = WorkspaceLayout::new(120, 30, 0, 0);
@@ -6772,7 +7516,7 @@ mod tests {
         .unwrap();
         agent.wait_for_first_output(Duration::from_secs(1));
         let mut terminals = SessionTerminals {
-            agent: Some(agent),
+            agent: Some(Arc::new(agent)),
             ..SessionTerminals::default()
         };
         let layout = WorkspaceLayout::new(120, 30, 0, 0);
@@ -6817,7 +7561,7 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         let mut terminals = SessionTerminals {
-            agent: Some(agent),
+            agent: Some(Arc::new(agent)),
             ..SessionTerminals::default()
         };
         let layout = WorkspaceLayout::new(120, 30, 0, 0);
@@ -6908,7 +7652,7 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         let mut terminals = SessionTerminals {
-            agent: Some(agent),
+            agent: Some(Arc::new(agent)),
             ..SessionTerminals::default()
         };
         let layout = WorkspaceLayout::new(120, 30, 0, 0);
@@ -6953,7 +7697,7 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         let mut terminals = SessionTerminals {
-            agent: Some(agent),
+            agent: Some(Arc::new(agent)),
             ..SessionTerminals::default()
         };
         let layout = WorkspaceLayout::new(120, 30, 0, 0);
@@ -7009,7 +7753,7 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         let mut terminals = SessionTerminals {
-            agent: Some(agent),
+            agent: Some(Arc::new(agent)),
             ..SessionTerminals::default()
         };
         let layout = WorkspaceLayout::new(120, 30, 0, 0);
@@ -7052,7 +7796,7 @@ mod tests {
         .unwrap();
         agent.wait_for_first_output(Duration::from_secs(1));
         let mut terminals = SessionTerminals {
-            agent: Some(agent),
+            agent: Some(Arc::new(agent)),
             ..SessionTerminals::default()
         };
         let layout = WorkspaceLayout::new(120, 30, 0, 0);
@@ -7194,7 +7938,7 @@ mod tests {
         .unwrap();
         agent.wait_for_first_output(Duration::from_secs(1));
         let mut terminals = SessionTerminals {
-            agent: Some(agent),
+            agent: Some(Arc::new(agent)),
             ..SessionTerminals::default()
         };
         let layout = WorkspaceLayout::new(120, 30, 0, 0);
@@ -7240,7 +7984,7 @@ mod tests {
         .unwrap();
         agent.wait_for_first_output(Duration::from_secs(1));
         let mut terminals = SessionTerminals {
-            agent: Some(agent),
+            agent: Some(Arc::new(agent)),
             ..SessionTerminals::default()
         };
         let layout = WorkspaceLayout::new(120, 30, 0, 0);
@@ -7288,7 +8032,7 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         let mut terminals = SessionTerminals {
-            agent: Some(agent),
+            agent: Some(Arc::new(agent)),
             ..SessionTerminals::default()
         };
         let layout = WorkspaceLayout::new(120, 30, 0, 0);
@@ -7365,7 +8109,7 @@ mod tests {
         .unwrap();
         agent.wait_for_first_output(Duration::from_secs(1));
         let mut terminals = SessionTerminals {
-            agent: Some(agent),
+            agent: Some(Arc::new(agent)),
             ..SessionTerminals::default()
         };
         let layout = WorkspaceLayout::new(120, 30, 0, 0);
@@ -7442,7 +8186,7 @@ mod tests {
         .unwrap();
         agent.wait_for_first_output(Duration::from_secs(1));
         let mut terminals = SessionTerminals {
-            agent: Some(agent),
+            agent: Some(Arc::new(agent)),
             ..SessionTerminals::default()
         };
         terminals
@@ -7549,7 +8293,7 @@ mod tests {
         .unwrap();
         agent.wait_for_first_output(Duration::from_secs(1));
         let mut terminals = SessionTerminals {
-            agent: Some(agent),
+            agent: Some(Arc::new(agent)),
             ..SessionTerminals::default()
         };
         let layout = WorkspaceLayout::new(120, 30, 0, 0);
@@ -8241,7 +8985,7 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         let mut terminals = SessionTerminals {
-            agent: Some(agent),
+            agent: Some(Arc::new(agent)),
             ..SessionTerminals::default()
         };
         let layout = WorkspaceLayout::new(120, 30, 0, 0);
@@ -8327,7 +9071,7 @@ mod tests {
         .unwrap();
         agent.wait_for_first_output(Duration::from_secs(1));
         let mut terminals = SessionTerminals {
-            agent: Some(agent),
+            agent: Some(Arc::new(agent)),
             ..SessionTerminals::default()
         };
         let layout = WorkspaceLayout::new(120, 30, 0, 0);
@@ -8393,7 +9137,7 @@ mod tests {
         .unwrap();
         agent.wait_for_first_output(Duration::from_secs(1));
         let mut terminals = SessionTerminals {
-            agent: Some(agent),
+            agent: Some(Arc::new(agent)),
             ..SessionTerminals::default()
         };
         let layout = WorkspaceLayout::new(120, 30, 0, 0);
@@ -8438,7 +9182,7 @@ mod tests {
             .position(|row| String::from_utf8_lossy(row).contains("shell-copy"))
             .unwrap() as u16;
         let mut terminals = SessionTerminals {
-            shells: vec![ShellPane::new(shell, "shell 1".into())],
+            shells: vec![ShellPane::new("one".into(), shell, "shell 1".into())],
             ..SessionTerminals::default()
         };
         let layout = WorkspaceLayout::new(120, 30, 1, 0);
@@ -8652,10 +9396,8 @@ mod tests {
         assert_eq!(agent, WorkspaceFocus::Agent);
 
         // With a shell present: Agent -> Shell -> Sessions -> Agent
-        terminals.shells.push(ShellPane::new(
-            terminals.spawn_shell(&session, (80, 12)).unwrap(),
-            "1".into(),
-        ));
+        let (id, shell) = terminals.spawn_shell(&session, (80, 12)).unwrap();
+        terminals.shells.push(ShellPane::new(id, shell, "1".into()));
         terminals.selected_shell = 0;
 
         let shell = terminals
@@ -9016,7 +9758,7 @@ mod tests {
         .unwrap();
         shell.wait_for_first_output(Duration::from_secs(1));
         let terminals = SessionTerminals {
-            shells: vec![ShellPane::new(shell, "shell 1".into())],
+            shells: vec![ShellPane::new("one".into(), shell, "shell 1".into())],
             ..SessionTerminals::default()
         };
         let chrome = WorkspaceChrome {
@@ -9334,7 +10076,7 @@ mod tests {
         .unwrap();
         agent.wait_for_first_output(Duration::from_secs(1));
         let terminals = SessionTerminals {
-            agent: Some(agent),
+            agent: Some(Arc::new(agent)),
             maximized: Some(PaneTarget::Agent),
             ..SessionTerminals::default()
         };
@@ -9380,7 +10122,7 @@ mod tests {
         agent.wait_for_first_output(Duration::from_secs(1));
         agent.scroll_viewport(2);
         let terminals = SessionTerminals {
-            agent: Some(agent),
+            agent: Some(Arc::new(agent)),
             ..SessionTerminals::default()
         };
         let chrome = WorkspaceChrome {
@@ -9502,5 +10244,403 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         assert_eq!(terminal_event_bytes(Event::Mouse(event)), b"\x1b[<65;10;5M");
+    }
+
+    /// A cheap stand-in for a real login shell: `add_shell` would run `$SHELL -l`, whose
+    /// startup files differ per machine, and none of that is what these assertions are about.
+    fn idle_terminal(cwd: &Path) -> ManagedTerminal {
+        ManagedTerminal::spawn(
+            &CommandSpec::new("/bin/sh", cwd).arg("-c").arg("sleep 30"),
+            (80, 24),
+        )
+        .unwrap()
+    }
+
+    fn manager_with_shells(key: &str, ids: &[&str], cwd: &Path) -> TerminalManager {
+        let mut terminals = SessionTerminals::default();
+        for (index, id) in ids.iter().enumerate() {
+            terminals.shells.push(ShellPane::new(
+                (*id).to_owned(),
+                idle_terminal(cwd),
+                format!("shell {}", index + 1),
+            ));
+        }
+        let mut manager = TerminalManager::new_local(AgentConsoleConfig::default());
+        manager
+            .terminals
+            .insert(key.to_owned(), Arc::new(Mutex::new(terminals)));
+        manager
+    }
+
+    /// Two lookups have to be the *same* terminal, not two views of one.
+    ///
+    /// The handle is what lets a websocket poll a terminal while an attached workspace is
+    /// repainting it, each holding no lock the other needs. That only works while both are
+    /// looking at one object; a copy would give the browser a terminal that quietly diverged
+    /// from the one on screen.
+    #[test]
+    fn a_shell_handle_is_the_same_terminal_every_surface_gets() {
+        let root = tempdir().unwrap();
+        let manager = manager_with_shells("claude:one", &["aaa"], root.path());
+
+        let first = manager.shell("claude:one", "aaa").unwrap();
+        let second = manager.shell("claude:one", "aaa").unwrap();
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "each lookup handed out a different terminal"
+        );
+    }
+
+    #[test]
+    fn a_sessions_shells_are_listed_with_the_ids_that_address_them() {
+        let root = tempdir().unwrap();
+        let manager = manager_with_shells("claude:one", &["aaa", "bbb"], root.path());
+
+        assert_eq!(
+            manager.shells("claude:one"),
+            vec![
+                ShellInfo {
+                    id: "aaa".into(),
+                    name: "shell 1".into()
+                },
+                ShellInfo {
+                    id: "bbb".into(),
+                    name: "shell 2".into()
+                },
+            ]
+        );
+        assert!(
+            manager.shells("claude:absent").is_empty(),
+            "a session with no terminals has no shells rather than panicking"
+        );
+    }
+
+    #[test]
+    fn a_shell_is_borrowed_by_id_and_only_from_its_own_session() {
+        let root = tempdir().unwrap();
+        let manager = manager_with_shells("claude:one", &["aaa", "bbb"], root.path());
+
+        assert!(manager.shell("claude:one", "bbb").is_some());
+        assert!(manager.shell("claude:one", "zzz").is_none());
+        assert!(
+            manager.shell("claude:other", "aaa").is_none(),
+            "a shell id must not address a shell belonging to a different session"
+        );
+    }
+
+    #[test]
+    fn closing_one_shell_leaves_the_others_alive_and_keeps_the_selection_in_range() {
+        let root = tempdir().unwrap();
+        let mut manager = manager_with_shells("claude:one", &["aaa", "bbb"], root.path());
+        manager
+            .terminals
+            .get_mut("claude:one")
+            .unwrap()
+            .lock()
+            .unwrap()
+            .selected_shell = 1;
+
+        assert!(manager.close_shell("claude:one", "aaa"));
+        assert!(
+            !manager.close_shell("claude:one", "aaa"),
+            "closing the same shell twice reports that there was nothing left to close"
+        );
+
+        assert_eq!(
+            manager
+                .shells("claude:one")
+                .into_iter()
+                .map(|shell| shell.id)
+                .collect::<Vec<_>>(),
+            vec!["bbb".to_owned()]
+        );
+        assert!(
+            manager
+                .shell("claude:one", "bbb")
+                .is_some_and(|agent| agent.is_alive()),
+            "closing one shell must not disturb another"
+        );
+        assert_eq!(
+            manager.terminals["claude:one"]
+                .lock()
+                .unwrap()
+                .selected_shell,
+            0,
+            "the TUI's selection has to stay inside the shells that are left"
+        );
+    }
+
+    #[test]
+    fn a_shell_id_is_the_last_segment_of_its_daemon_id_even_when_the_session_key_has_pipes() {
+        assert_eq!(shell_id_of("shell|claude:abc123|9a3f"), Some("9a3f"));
+        assert_eq!(shell_id_of("shell|odd|key|9a3f"), Some("9a3f"));
+        assert_eq!(
+            shell_id_of("agent|claude:abc123"),
+            None,
+            "an agent terminal never names a shell"
+        );
+        assert_eq!(shell_id_of("shell|claude:abc123"), None);
+    }
+
+    // ----------------------------------------------------- the attach snapshot
+    //
+    // A client attaching to a terminal that has been running gets a checkpoint, which is
+    // exactly one screenful. These cover the other half of that answer: the rows above the
+    // screen, and the guarantee that the two halves meet without overlapping or leaving a gap.
+
+    /// A parser with a deeper scrollback than the text it is given, so the rows that scroll
+    /// off the top are retained rather than dropped.
+    fn parser_after(height: u16, cols: u16, text: &str) -> vt100::Parser {
+        let mut parser = vt100::Parser::new(height, cols, SCROLLBACK_LINES);
+        parser.process(text.as_bytes());
+        parser
+    }
+
+    fn snapshot_rows(snapshot: &str) -> Vec<String> {
+        snapshot
+            .split("\r\n")
+            .map(|row| plain_text(row.as_bytes()).trim_end().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn the_scrollback_snapshot_is_the_rows_above_the_screen_and_none_of_the_ones_on_it() {
+        let mut parser = parser_after(4, 20, "one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\n");
+
+        let snapshot =
+            terminal_scrollback_snapshot(&mut parser, &StatusBarScrollback::default()).unwrap();
+
+        assert_eq!(snapshot_rows(&snapshot), vec!["one", "two", "three"]);
+        assert!(
+            !snapshot.contains("four"),
+            "the visible screen is the checkpoint's job; carrying it here too would print it twice"
+        );
+    }
+
+    /// The seam, as an invariant rather than a hope. Whatever the terminal holds, the rows the
+    /// snapshot carries followed by the rows the checkpoint paints are the retained grid split
+    /// in two -- nothing counted twice, nothing dropped between them.
+    #[test]
+    fn the_snapshot_and_the_checkpoint_partition_the_retained_grid() {
+        let mut parser = parser_after(4, 20, "one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\n");
+        let scrollback = StatusBarScrollback::default();
+        let printed = |rows: Vec<String>| -> Vec<String> {
+            rows.into_iter().filter(|row| !row.is_empty()).collect()
+        };
+
+        let retained = printed(
+            terminal_retained_rows(&mut parser, &scrollback)
+                .iter()
+                .map(|row| plain_text(row).trim_end().to_owned())
+                .collect(),
+        );
+        let above = printed(snapshot_rows(
+            &terminal_scrollback_snapshot(&mut parser, &scrollback).unwrap(),
+        ));
+        let mut repainted = vt100::Parser::new(4, 20, 0);
+        repainted.process(&terminal_state_checkpoint(&parser, &scrollback));
+        let screen = printed(
+            repainted
+                .screen()
+                .rows_formatted(0, 20)
+                .map(|row| plain_text(&row).trim_end().to_owned())
+                .collect(),
+        );
+
+        assert_eq!([above, screen].concat(), retained);
+    }
+
+    /// A screen that starts blank evicts its blank rows before it evicts a line of text, so
+    /// the oldest rows are padding. Left in, they make the top of the history look empty.
+    #[test]
+    fn the_blank_rows_a_bounded_scrollback_starts_with_are_dropped() {
+        let mut parser = parser_after(3, 20, "\r\n\r\n\r\nfirst\r\nsecond\r\nthird\r\nfourth\r\n");
+
+        let snapshot =
+            terminal_scrollback_snapshot(&mut parser, &StatusBarScrollback::default()).unwrap();
+
+        assert_eq!(snapshot_rows(&snapshot), vec!["first", "second"]);
+    }
+
+    #[test]
+    fn a_terminal_that_has_printed_nothing_has_no_snapshot_to_send() {
+        let mut parser = vt100::Parser::new(4, 20, SCROLLBACK_LINES);
+
+        assert!(
+            terminal_scrollback_snapshot(&mut parser, &StatusBarScrollback::default()).is_none()
+        );
+    }
+
+    /// `rows_formatted` emits only the attributes a row needs, so a row that ends mid-colour
+    /// would bleed into the next one all the way down the history.
+    #[test]
+    fn each_snapshot_row_closes_its_own_colour() {
+        let mut parser = parser_after(2, 20, "\x1b[31mred\x1b[m\r\nplain\r\nlast\r\n");
+
+        let snapshot =
+            terminal_scrollback_snapshot(&mut parser, &StatusBarScrollback::default()).unwrap();
+
+        assert_eq!(snapshot_rows(&snapshot), vec!["red", "plain"]);
+        assert!(
+            snapshot.contains("\u{1b}[31m"),
+            "the colour itself survives: {snapshot:?}"
+        );
+        assert!(
+            snapshot.ends_with("\u{1b}[m"),
+            "every row closes its own colour: {snapshot:?}"
+        );
+    }
+
+    /// An application that takes the alternate screen keeps no history anywhere -- `vt100`
+    /// gives that grid no scrollback and neither does xterm.js -- so there is nothing to send
+    /// and the checkpoint stands alone rather than being preceded by rows that would land in
+    /// a buffer the application has switched away from.
+    #[test]
+    fn an_alternate_screen_has_no_rows_above_it_to_send() {
+        let mut parser = parser_after(4, 20, "\x1b[?1049hone\r\ntwo\r\nthree\r\nfour\r\nfive\r\n");
+
+        assert!(
+            terminal_scrollback_snapshot(&mut parser, &StatusBarScrollback::default()).is_none()
+        );
+    }
+
+    /// A TUI that pins its composer to the bottom scrolls a partial region, and `vt100` keeps
+    /// nothing for that -- so those rows come from the capture `pty.rs` makes for the TUI's
+    /// own scroll keys instead, through the same snapshot.
+    #[test]
+    fn a_partial_scroll_regions_captured_rows_are_the_snapshot_vt100_never_had() {
+        let mut parser = vt100::Parser::new(3, 20, SCROLLBACK_LINES);
+        let mut scrollback = StatusBarScrollback::default();
+        scrollback
+            .rows
+            .push_back(b"scrolled-out-of-the-region".to_vec());
+
+        let snapshot = terminal_scrollback_snapshot(&mut parser, &scrollback).unwrap();
+
+        assert_eq!(snapshot_rows(&snapshot), vec!["scrolled-out-of-the-region"]);
+    }
+
+    /// The point of taking the rows from the parser rather than the retained bytes: once the
+    /// raw ring has rolled over, the bytes cannot rebuild the history and the parser still can.
+    #[test]
+    fn a_resync_carries_rows_the_raw_ring_no_longer_holds_and_only_when_asked() {
+        let root = tempdir().unwrap();
+        let terminal = LocalTerminal::spawn(
+            &CommandSpec::new("/bin/sh", root.path()).arg("-c").arg(
+                "printf 'marker-alpha\\n'; \
+                 awk 'BEGIN{s=\"\"; for(i=0;i<390;i++) s=s \"x\"; for(i=0;i<350;i++) print s}'; \
+                 printf 'marker-omega\\n'; sleep 5",
+            ),
+            // Wide and short on purpose: the raw ring rolls over at 128 KiB, and rolling it
+            // over in as few rows as possible keeps the rows well inside the parser's own
+            // retention -- which is exactly the gap the snapshot is here to cover.
+            (400, 6),
+        )
+        .unwrap();
+        let start = Instant::now();
+        loop {
+            let rolled = terminal.output.lock().unwrap().base_offset > 0;
+            let finished = terminal
+                .parser
+                .lock()
+                .unwrap()
+                .screen()
+                .contents()
+                .contains("marker-omega");
+            if rolled && finished {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "terminal did not roll the raw ring over and finish printing"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let asked = terminal.output_since(0, Scrollback::Include);
+        assert!(asked.checkpoint.is_some(), "a rolled-over offset resyncs");
+        let snapshot = asked
+            .scrollback
+            .expect("a resync that was asked for the rows above the screen has to carry them");
+        assert!(
+            snapshot.contains("marker-alpha"),
+            "the first line is long gone from the retained bytes and still in the parser"
+        );
+        assert!(
+            !snapshot.contains("marker-omega"),
+            "the last line is on the screen, which the checkpoint paints"
+        );
+
+        let unasked = terminal.output_since(0, Scrollback::Omit);
+        assert!(unasked.checkpoint.is_some());
+        assert!(
+            unasked.scrollback.is_none(),
+            "every poll after the first is a delta; re-sending the history would repeat it"
+        );
+
+        terminal.terminate();
+    }
+
+    /// The other half of the exclusivity: an offset still inside the ring is answered with
+    /// every byte the terminal ever produced, which rebuilds the history on its own.
+    #[test]
+    fn a_poll_that_replays_the_whole_ring_sends_no_snapshot_beside_it() {
+        let root = tempdir().unwrap();
+        let terminal = ManagedTerminal::spawn(
+            &CommandSpec::new("/bin/sh", root.path())
+                .arg("-c")
+                .arg("printf 'one\\r\\ntwo\\r\\n'; sleep 5"),
+            (40, 6),
+        )
+        .unwrap();
+        terminal.wait_for_first_output(Duration::from_secs(5));
+
+        let poll = terminal.poll_raw(0, Scrollback::Include).unwrap();
+
+        assert!(poll.checkpoint.is_none(), "nothing has rolled over yet");
+        assert!(String::from_utf8_lossy(&poll.bytes).contains("one"));
+        assert!(
+            poll.scrollback.is_none(),
+            "the bytes start at the terminal's first byte, so the rows would be a second copy"
+        );
+
+        terminal.terminate();
+    }
+
+    /// The daemon outlives the binary that started it, so a new client can find an old daemon
+    /// and an old client a new one. Neither direction may fail to parse.
+    #[test]
+    fn a_poll_still_parses_across_a_daemon_that_predates_the_snapshot() {
+        let asked = serde_json::to_string(&DaemonRequest::Poll {
+            id: "agent|claude:one".into(),
+            offset: 7,
+            scrollback: true,
+        })
+        .unwrap();
+        assert!(asked.contains("\"scrollback\":true"), "{asked}");
+
+        let older: DaemonRequest =
+            serde_json::from_str(r#"{"Poll":{"id":"agent|claude:one","offset":7}}"#).unwrap();
+        let DaemonRequest::Poll {
+            offset, scrollback, ..
+        } = older
+        else {
+            panic!("a poll request has to parse as one");
+        };
+        assert_eq!(offset, 7);
+        assert!(
+            !scrollback,
+            "a client that never heard of the snapshot cannot be asking for one"
+        );
+
+        let older: DaemonResponse = serde_json::from_str(
+            r#"{"Poll":{"start":0,"end":0,"bytes":[],"alive":true,"exit":null}}"#,
+        )
+        .unwrap();
+        let DaemonResponse::Poll { scrollback, .. } = older else {
+            panic!("a poll response has to parse as one");
+        };
+        assert!(scrollback.is_none());
     }
 }
