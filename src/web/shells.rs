@@ -9,7 +9,7 @@
 //! terminals. `TerminalManager::refresh_shells` is what adopts the ones another surface
 //! opened, which is why listing goes through it rather than reading a local cache.
 
-use std::{fmt, io};
+use std::{fmt, io, sync::Arc};
 
 use axum::{
     extract::{Path, State},
@@ -18,7 +18,11 @@ use axum::{
 };
 use serde::Serialize;
 
-use crate::{app::App, model::Session, pty::ShellInfo};
+use crate::{
+    app::App,
+    model::Session,
+    pty::{ManagedTerminal, ShellInfo},
+};
 
 use super::AppState;
 
@@ -140,28 +144,37 @@ pub(crate) async fn delete_shell(
     }
 }
 
-/// Points an existing shell at this client's viewport.
+/// Registers this client as one of an existing shell's viewers.
 ///
-/// Same reason `agent::attach` resizes: a shell another surface started keeps its original
-/// size forever, so attaching from a wide window would render into a narrow strip of it.
+/// Same reason `agent::attach` does: a shell another surface started keeps its original size
+/// forever, so attaching from a wide window would render into a narrow strip of it -- and,
+/// equally, a phone attaching to a shell a desktop is reading must not shrink the desktop.
+/// The size that comes back is the smallest of every viewer.
 pub(super) fn attach(
     state: &AppState,
     key: &str,
     id: &str,
+    viewer: &str,
     size: (u16, u16),
-) -> Result<(), ShellError> {
-    let mut app = state.app.lock().unwrap();
-    let session = session_of(&app, key)?;
-    // A reload asks for a shell id this process may not have adopted yet -- it could have
-    // been opened by a TUI, or by this browser before the server restarted.
-    app.terminals
-        .refresh_shells(&session, &state.current_exe, size)
+) -> Result<(Arc<ManagedTerminal>, (u16, u16)), ShellError> {
+    let terminal = {
+        let mut app = state.app.lock().unwrap();
+        let session = session_of(&app, key)?;
+        // A reload asks for a shell id this process may not have adopted yet -- it could have
+        // been opened by a TUI, or by this browser before the server restarted.
+        app.terminals
+            .refresh_shells(&session, &state.current_exe, size)
+            .map_err(ShellError::Terminal)?;
+        app.terminals
+            .shell(key, id)
+            .ok_or_else(|| ShellError::UnknownShell(id.to_owned()))?
+    };
+    // The App lock is released first: the resize is a round trip to the PTY daemon, and
+    // holding the lock across it would stall every other request and the TUI's own frames.
+    let effective = terminal
+        .resize_viewer(viewer, size.0, size.1)
         .map_err(ShellError::Terminal)?;
-    app.terminals
-        .shell(key, id)
-        .ok_or_else(|| ShellError::UnknownShell(id.to_owned()))?
-        .resize(size.0, size.1)
-        .map_err(ShellError::Terminal)
+    Ok((terminal, effective))
 }
 
 #[cfg(test)]

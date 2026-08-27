@@ -39,8 +39,28 @@ use crate::{
     store::{ensure_private_dir, make_private_file},
 };
 
+/// Claude Code's switch for staying on the normal screen. Read from `claude`'s own build
+/// (it sits alongside `CLAUDE_CODE_DISABLE_MOUSE` and `CLAUDE_CODE_SCROLL_SPEED`) and
+/// verified against 2.1.247: with it set, no `\x1b[?1049h` is ever emitted.
+const CLAUDE_ALTERNATE_SCREEN_VAR: &str = "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN";
+
 const CAPTURE_LINES: usize = 200;
 const SCROLLBACK_LINES: usize = 2_000;
+
+/// Bumped whenever the daemon learns to answer something a newer client depends on.
+///
+/// The daemon outlives the binary that started it -- it owns every running agent's PTY, so
+/// nothing may restart it behind the user's back -- and the wire format tolerates a version
+/// gap field by field, which is what made an upgrade degrade in silence: an older daemon
+/// simply left `scrollback` out of its answer and browser terminals opened with no history
+/// above the fold, with nothing anywhere saying why. Asking for the version says so.
+///
+/// 2 added the viewer registry -- `Resize` carries which viewer asked and answers with the
+/// size the terminal actually ended up at, and `Detach` takes a viewer back out -- and the
+/// environment a spawn carries. A daemon at 1 resizes to whoever asked last, which is the
+/// several-viewers bug this exists to report, and starts Claude Code without the variable
+/// that keeps it out of the alternate screen, which is a terminal with no history to scroll.
+pub const DAEMON_PROTOCOL: u32 = 2;
 const CAPTURE_BYTES: usize = 16 * 1024;
 const RAW_CAPTURE_BYTES: usize = 128 * 1024;
 const LEASE_STALE_AFTER: Duration = Duration::from_millis(500);
@@ -79,6 +99,12 @@ pub struct CommandSpec {
     pub program: OsString,
     pub args: Vec<OsString>,
     pub cwd: PathBuf,
+    /// Variables set on the child on top of the inherited environment.
+    ///
+    /// Some providers are configured this way rather than by flag -- Claude Code's
+    /// alternate-screen switch is an environment variable where Codex's is `--no-alt-screen`
+    /// -- so a spec has to be able to carry one.
+    pub env: Vec<(OsString, OsString)>,
 }
 
 impl CommandSpec {
@@ -87,11 +113,17 @@ impl CommandSpec {
             program: program.into(),
             args: Vec::new(),
             cwd: cwd.into(),
+            env: Vec::new(),
         }
     }
 
     pub fn arg(mut self, value: impl Into<OsString>) -> Self {
         self.args.push(value.into());
+        self
+    }
+
+    pub fn env(mut self, name: impl Into<OsString>, value: impl Into<OsString>) -> Self {
+        self.env.push((name.into(), value.into()));
         self
     }
 }
@@ -641,6 +673,10 @@ struct LocalTerminal {
     output_generation: Arc<AtomicU64>,
     parser: Arc<Mutex<vt100::Parser>>,
     status_bar_scrollback: Arc<Mutex<StatusBarScrollback>>,
+    /// Every window currently looking at this terminal, and the size each one asked for.
+    /// See [`smallest_viewer`] for why the PTY is sized from all of them rather than from
+    /// whichever one spoke last.
+    viewers: Mutex<ViewerSizes>,
 }
 
 impl LocalTerminal {
@@ -662,6 +698,10 @@ impl LocalTerminal {
         command.env("COLORTERM", "truecolor");
         for name in INHERITED_SESSION_VARS {
             command.env_remove(name);
+        }
+        // After the removals, so a spec can deliberately set one of them back.
+        for (name, value) in &spec.env {
+            command.env(name, value);
         }
         let child = pair
             .slave
@@ -741,6 +781,7 @@ impl LocalTerminal {
             output_generation,
             parser,
             status_bar_scrollback,
+            viewers: Mutex::new(ViewerSizes::new()),
         })
     }
 
@@ -906,6 +947,42 @@ impl LocalTerminal {
         Ok(())
     }
 
+    /// Records what one viewer wants and resizes the PTY to fit every viewer, answering
+    /// with the size it actually ended up at. See [`smallest_viewer`].
+    fn resize_viewer(&self, viewer: &str, cols: u16, rows: u16) -> io::Result<(u16, u16)> {
+        let target = {
+            let mut viewers = self.viewers.lock().unwrap();
+            viewers.insert(viewer.to_owned(), normalized_size((cols, rows)));
+            drop_dead_viewers(&mut viewers);
+            smallest_viewer(&viewers)
+        };
+        self.apply_viewer_size(target)
+    }
+
+    /// Takes a viewer back out, growing the terminal again when it was the small one.
+    ///
+    /// The last viewer leaving does *not* resize: nothing is looking, so any size is as good
+    /// as another, and the agent would only be made to repaint for nobody.
+    fn detach_viewer(&self, viewer: &str) -> io::Result<(u16, u16)> {
+        let target = {
+            let mut viewers = self.viewers.lock().unwrap();
+            viewers.remove(viewer);
+            drop_dead_viewers(&mut viewers);
+            smallest_viewer(&viewers)
+        };
+        self.apply_viewer_size(target)
+    }
+
+    fn apply_viewer_size(&self, target: Option<(u16, u16)>) -> io::Result<(u16, u16)> {
+        let Some(target) = target else {
+            return Ok(self.size());
+        };
+        if self.size() != target {
+            self.resize(target.0, target.1)?;
+        }
+        Ok(target)
+    }
+
     pub fn terminate(&self) {
         let mut child = self.child.lock().unwrap();
         if child.try_wait().ok().flatten().is_none() {
@@ -967,6 +1044,7 @@ impl LocalTerminal {
             bytes: delta.bytes,
             checkpoint: delta.checkpoint,
             scrollback: delta.scrollback,
+            size: self.size(),
             alive,
             exit: delta.exit,
         }
@@ -1077,6 +1155,53 @@ fn normalized_size((cols, rows): (u16, u16)) -> (u16, u16) {
     (cols.max(2), rows.max(2))
 }
 
+/// Every viewer attached to one terminal, by [`viewer_id`], and the size each asked for.
+type ViewerSizes = HashMap<String, (u16, u16)>;
+
+/// The size a PTY runs at for a given set of viewers: the element-wise minimum of what they
+/// each asked for, or `None` when nothing is attached.
+///
+/// A PTY has one size and a session can be open in several windows at once -- a desktop
+/// browser, a phone, the dashboard's own workspace. Sizing it to whoever attached last is
+/// what squashed a 180-column desktop into 40 columns the moment a phone joined, and because
+/// a resize reflows the scrollback it mangled the history everyone else was reading at the
+/// same time. Taking the minimum is what every terminal multiplexer settled on: the output
+/// always fits every window, and the windows with room to spare letterbox the rest rather
+/// than reflowing what the agent drew.
+fn smallest_viewer(viewers: &ViewerSizes) -> Option<(u16, u16)> {
+    viewers
+        .values()
+        .copied()
+        .reduce(|(cols, rows), (other_cols, other_rows)| {
+            (cols.min(other_cols), rows.min(other_rows))
+        })
+}
+
+/// A viewer's name, unique across every process that can attach to the same daemon.
+///
+/// The pid is in front on purpose: a browser tab that dies without closing its socket cleanly
+/// is caught by the socket task's own teardown, but a whole process killed outright cannot
+/// detach at all, and a viewer nobody can remove would pin the terminal to that window's size
+/// forever. [`drop_dead_viewers`] reads the pid back out and forgets those.
+pub fn viewer_id(kind: &str) -> String {
+    format!("{}:{kind}:{}", std::process::id(), Uuid::new_v4())
+}
+
+/// Forgets viewers whose process is gone. See [`viewer_id`].
+fn drop_dead_viewers(viewers: &mut ViewerSizes) {
+    if !cfg!(unix) {
+        // `process_is_alive` cannot answer off unix, and answering "no" there would forget
+        // every viewer including the live ones.
+        return;
+    }
+    viewers.retain(|id, _| {
+        id.split(':')
+            .next()
+            .and_then(|pid| pid.parse::<u32>().ok())
+            .is_none_or(process_is_alive)
+    });
+}
+
 impl Drop for LocalTerminal {
     fn drop(&mut self) {
         self.terminate();
@@ -1088,6 +1213,11 @@ struct WireCommandSpec {
     program: String,
     args: Vec<String>,
     cwd: PathBuf,
+    /// Defaulted so a daemon older than protocol 2 still parses a newer client's spawn --
+    /// it simply starts the agent without these, which `doctor` already reports as an
+    /// out-of-date daemon.
+    #[serde(default)]
+    env: Vec<(String, String)>,
 }
 
 impl From<&CommandSpec> for WireCommandSpec {
@@ -1100,6 +1230,16 @@ impl From<&CommandSpec> for WireCommandSpec {
                 .map(|arg| arg.to_string_lossy().into_owned())
                 .collect(),
             cwd: spec.cwd.clone(),
+            env: spec
+                .env
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.to_string_lossy().into_owned(),
+                        value.to_string_lossy().into_owned(),
+                    )
+                })
+                .collect(),
         }
     }
 }
@@ -1110,6 +1250,11 @@ impl WireCommandSpec {
             program: self.program.clone().into(),
             args: self.args.iter().map(OsString::from).collect(),
             cwd: self.cwd.clone(),
+            env: self
+                .env
+                .iter()
+                .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+                .collect(),
         }
     }
 }
@@ -1143,6 +1288,9 @@ impl LeaseOwner {
 #[derive(Debug, Deserialize, Serialize)]
 enum DaemonRequest {
     Ping,
+    /// Answered with [`DAEMON_PROTOCOL`]. A daemon from before this request existed fails to
+    /// parse it and answers `Error`, which is the signal that it is the older one.
+    Version,
     Ensure {
         id: String,
         spec: WireCommandSpec,
@@ -1166,6 +1314,17 @@ enum DaemonRequest {
         id: String,
         cols: u16,
         rows: u16,
+        /// Which viewer is asking. The terminal is sized to the smallest of every viewer
+        /// attached to it, so the name is what lets a second window be counted alongside the
+        /// first instead of replacing it. Defaulted for a client older than protocol 2,
+        /// whose resize is applied as-is because it has no viewer to be one of.
+        #[serde(default)]
+        viewer: Option<String>,
+    },
+    /// Forgets one viewer, so the terminal can grow back once the small window is gone.
+    Detach {
+        id: String,
+        viewer: String,
     },
     Terminate {
         id: String,
@@ -1196,6 +1355,15 @@ enum DaemonRequest {
 #[derive(Debug, Deserialize, Serialize)]
 enum DaemonResponse {
     Ok,
+    Version {
+        protocol: u32,
+    },
+    /// The size a terminal ended up at, which is the smallest of its attached viewers rather
+    /// than whatever the caller asked for.
+    Size {
+        cols: u16,
+        rows: u16,
+    },
     Poll {
         start: u64,
         end: u64,
@@ -1206,6 +1374,12 @@ enum DaemonResponse {
         status_bar_rows: Option<Vec<Vec<u8>>>,
         #[serde(default)]
         scrollback: Option<String>,
+        /// The size the terminal is running at. Zero from a daemon older than protocol 2,
+        /// which is read as "unknown" rather than as a size.
+        #[serde(default)]
+        cols: u16,
+        #[serde(default)]
+        rows: u16,
         alive: bool,
         exit: Option<String>,
     },
@@ -1228,6 +1402,9 @@ impl PtyDaemonState {
     fn handle(&mut self, request: DaemonRequest) -> (DaemonResponse, bool) {
         let response = match request {
             DaemonRequest::Ping => DaemonResponse::Ok,
+            DaemonRequest::Version => DaemonResponse::Version {
+                protocol: DAEMON_PROTOCOL,
+            },
             DaemonRequest::Ensure {
                 id,
                 spec,
@@ -1279,6 +1456,7 @@ impl PtyDaemonState {
                     Scrollback::Omit
                 };
                 let delta = terminal.output_since(offset, wanted);
+                let (cols, rows) = terminal.size();
                 DaemonResponse::Poll {
                     start: delta.start,
                     end: delta.end,
@@ -1286,6 +1464,8 @@ impl PtyDaemonState {
                     checkpoint: delta.checkpoint,
                     status_bar_rows: delta.status_bar_rows,
                     scrollback: delta.scrollback,
+                    cols,
+                    rows,
                     alive,
                     exit: delta.exit,
                 }
@@ -1311,12 +1491,34 @@ impl PtyDaemonState {
                     }
                 }
             }
-            DaemonRequest::Resize { id, cols, rows } => match self.terminals.get(&id) {
-                Some(terminal) => terminal
-                    .resize(cols, rows)
-                    .map(|()| DaemonResponse::Ok)
-                    .unwrap_or_else(|error| DaemonResponse::Error(error.to_string())),
+            DaemonRequest::Resize {
+                id,
+                cols,
+                rows,
+                viewer,
+            } => match self.terminals.get(&id) {
+                Some(terminal) => match viewer {
+                    Some(viewer) => terminal
+                        .resize_viewer(&viewer, cols, rows)
+                        .map(|(cols, rows)| DaemonResponse::Size { cols, rows })
+                        .unwrap_or_else(|error| DaemonResponse::Error(error.to_string())),
+                    // A client from before viewers existed has no name to be counted under,
+                    // so its resize is applied the way it always was.
+                    None => terminal
+                        .resize(cols, rows)
+                        .map(|()| DaemonResponse::Ok)
+                        .unwrap_or_else(|error| DaemonResponse::Error(error.to_string())),
+                },
                 None => DaemonResponse::Error(format!("unknown terminal {id}")),
+            },
+            // A terminal that has already gone is not a failure to detach from: the viewer
+            // wanted to stop being counted, and it is not being counted.
+            DaemonRequest::Detach { id, viewer } => match self.terminals.get(&id) {
+                Some(terminal) => terminal
+                    .detach_viewer(&viewer)
+                    .map(|(cols, rows)| DaemonResponse::Size { cols, rows })
+                    .unwrap_or_else(|error| DaemonResponse::Error(error.to_string())),
+                None => DaemonResponse::Ok,
             },
             DaemonRequest::Terminate { id } => match self.terminals.remove(&id) {
                 Some(terminal) => {
@@ -1475,6 +1677,15 @@ fn daemon_request(_socket: &Path, _request: &DaemonRequest) -> io::Result<Daemon
 /// on one string instead of two copies drifting apart.
 pub const LEASE_DENIED_MESSAGE: &str = "session lease is owned by another TUI";
 
+/// The error a resize/detach answers with when the daemon said something unexpected. Shares
+/// `response_ok`'s lease handling so a resize that lost the lease is still `PermissionDenied`.
+fn resize_failure(response: DaemonResponse) -> io::Error {
+    match response_ok(response) {
+        Ok(()) => io::Error::other("daemon did not answer a resize with a size"),
+        Err(error) => error,
+    }
+}
+
 fn response_ok(response: DaemonResponse) -> io::Result<()> {
     match response {
         DaemonResponse::Ok => Ok(()),
@@ -1559,6 +1770,30 @@ pub fn daemon_health(_socket: &Path) -> io::Result<Option<()>> {
     Ok(None)
 }
 
+/// The protocol the daemon at `socket` speaks, or `None` when no daemon is running.
+///
+/// A daemon that does not recognise the request predates the version being carried at all,
+/// which is reported as protocol 0 rather than as an error: it is running and healthy, just
+/// older than this build.
+#[cfg(unix)]
+pub fn daemon_protocol(socket: &Path) -> io::Result<Option<u32>> {
+    if !socket.exists() {
+        return Ok(None);
+    }
+    match daemon_request(socket, &DaemonRequest::Version)? {
+        DaemonResponse::Version { protocol } => Ok(Some(protocol)),
+        DaemonResponse::Error(_) => Ok(Some(0)),
+        other => Err(io::Error::other(format!(
+            "unexpected daemon response: {other:?}"
+        ))),
+    }
+}
+
+#[cfg(not(unix))]
+pub fn daemon_protocol(_socket: &Path) -> io::Result<Option<u32>> {
+    Ok(None)
+}
+
 struct RemoteTerminal {
     socket: PathBuf,
     id: Mutex<String>,
@@ -1633,6 +1868,8 @@ impl RemoteTerminal {
             checkpoint,
             status_bar_rows,
             scrollback: _,
+            cols,
+            rows,
             alive,
             exit,
         } = response
@@ -1644,6 +1881,10 @@ impl RemoteTerminal {
                 ))),
             };
         };
+        // Another viewer attaching or leaving changes the PTY's size without this client
+        // asking for anything, and the bytes that follow are drawn for the new size. Adopting
+        // it here is what keeps this parser measuring them the way the agent wrote them.
+        self.adopt_size((cols, rows));
         if checkpoint.is_some() || start != requested {
             let size = *self.size.lock().unwrap();
             *self.parser.lock().unwrap() = vt100::Parser::new(size.1, size.0, SCROLLBACK_LINES);
@@ -1710,6 +1951,8 @@ impl RemoteTerminal {
             checkpoint,
             status_bar_rows: _,
             scrollback,
+            cols,
+            rows,
             alive,
             exit,
         } = response
@@ -1727,6 +1970,13 @@ impl RemoteTerminal {
             bytes,
             checkpoint,
             scrollback,
+            // Deliberately read straight off the wire rather than adopted into `self.size`:
+            // this poll belongs to a caller that shares none of this handle's state.
+            size: if cols == 0 || rows == 0 {
+                *self.size.lock().unwrap()
+            } else {
+                (cols, rows)
+            },
             alive,
             exit,
         })
@@ -1877,17 +2127,66 @@ impl RemoteTerminal {
         terminal_selected_rows(&mut parser, &scrollback, first, second)
     }
 
-    fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
-        let size = normalized_size((cols, rows));
-        response_ok(daemon_request(
+    fn resize_viewer(&self, viewer: &str, cols: u16, rows: u16) -> io::Result<(u16, u16)> {
+        self.request_resize(Some(viewer), cols, rows)
+    }
+
+    fn detach_viewer(&self, viewer: &str) -> io::Result<(u16, u16)> {
+        let response = daemon_request(
+            &self.socket,
+            &DaemonRequest::Detach {
+                id: self.id.lock().unwrap().clone(),
+                viewer: viewer.to_owned(),
+            },
+        )?;
+        match response {
+            DaemonResponse::Size { cols, rows } => {
+                self.adopt_size((cols, rows));
+                Ok((cols, rows))
+            }
+            // Either the terminal is gone, or the daemon is older than viewers. Neither is
+            // worth failing a teardown over.
+            _ => Ok(*self.size.lock().unwrap()),
+        }
+    }
+
+    fn request_resize(&self, viewer: Option<&str>, cols: u16, rows: u16) -> io::Result<(u16, u16)> {
+        let requested = normalized_size((cols, rows));
+        let response = daemon_request(
             &self.socket,
             &DaemonRequest::Resize {
                 id: self.id.lock().unwrap().clone(),
-                cols: size.0,
-                rows: size.1,
+                cols: requested.0,
+                rows: requested.1,
+                viewer: viewer.map(str::to_owned),
             },
-        )?)?;
-        *self.size.lock().unwrap() = size;
+        )?;
+        let effective = match response {
+            DaemonResponse::Size { cols, rows } => (cols, rows),
+            // A daemon older than protocol 2 answers `Ok` and resizes to exactly what was
+            // asked, which is the pre-viewer behaviour.
+            DaemonResponse::Ok => requested,
+            other => return Err(resize_failure(other)),
+        };
+        self.adopt_size(effective);
+        Ok(effective)
+    }
+
+    /// Points this handle's own parser at the size the PTY is actually running at.
+    ///
+    /// A no-op when nothing changed, because it costs the TUI a full repaint: `set_size`
+    /// reflows the screen and bumps the generation every render loop compares against.
+    fn adopt_size(&self, size: (u16, u16)) {
+        if size.0 == 0 || size.1 == 0 {
+            return;
+        }
+        {
+            let mut current = self.size.lock().unwrap();
+            if *current == size {
+                return;
+            }
+            *current = size;
+        }
         self.parser
             .lock()
             .unwrap()
@@ -1895,7 +2194,6 @@ impl RemoteTerminal {
             .set_size(size.1, size.0);
         self.status_bar_scrollback.lock().unwrap().resize(size.1);
         self.output_generation.fetch_add(1, Ordering::Relaxed);
-        Ok(())
     }
 
     fn terminate(&self) {
@@ -1943,6 +2241,11 @@ pub struct RawPoll {
     /// parser under one lock at one instant, so the join between them cannot duplicate or
     /// drop a band of lines.
     pub scrollback: Option<String>,
+    /// The size the PTY is running at right now, which is not necessarily the size this
+    /// poller asked for: it is the smallest of every attached viewer (see `smallest_viewer`).
+    /// A poller that is larger than this letterboxes the difference -- reported here so it
+    /// can do that deliberately, and so it hears about a change another viewer caused.
+    pub size: (u16, u16),
     pub alive: bool,
     pub exit: Option<String>,
 }
@@ -2103,10 +2406,27 @@ impl ManagedTerminal {
         }
     }
 
-    pub fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
+    /// Tells the terminal how big *this* window is and answers with the size it settled on.
+    ///
+    /// The answer is the smallest of every attached viewer, so it can be smaller than what
+    /// was asked for -- see `smallest_viewer`. A caller with room to spare letterboxes the
+    /// difference; it must not stretch or reflow what came back to fill its window, which
+    /// would corrupt the very output somebody is reading.
+    pub fn resize_viewer(&self, viewer: &str, cols: u16, rows: u16) -> io::Result<(u16, u16)> {
         match &self.backend {
-            TerminalBackend::Local(terminal) => terminal.resize(cols, rows),
-            TerminalBackend::Remote(terminal) => terminal.resize(cols, rows),
+            TerminalBackend::Local(terminal) => terminal.resize_viewer(viewer, cols, rows),
+            TerminalBackend::Remote(terminal) => terminal.resize_viewer(viewer, cols, rows),
+        }
+    }
+
+    /// Stops counting a window that has gone away, letting the terminal grow back.
+    ///
+    /// Call it from a teardown that runs on an abrupt disconnect as well as a clean one: a
+    /// viewer nobody removes pins the terminal to a dead window's size.
+    pub fn detach_viewer(&self, viewer: &str) -> io::Result<(u16, u16)> {
+        match &self.backend {
+            TerminalBackend::Local(terminal) => terminal.detach_viewer(viewer),
+            TerminalBackend::Remote(terminal) => terminal.detach_viewer(viewer),
         }
     }
 
@@ -2359,6 +2679,9 @@ impl WorkspaceSession {
     /// Call this on the error paths too: skipping it leaves mouse reporting and the keyboard
     /// enhancement flags on, and leaves the session leased to a workspace nobody is in.
     pub fn finish(mut self) -> io::Result<()> {
+        // Before the terminal is handed back: this window is no longer looking at the
+        // session's PTYs, so it must stop being one of the viewers they are sized to.
+        self.handle.lock().unwrap().release_workspace_viewer();
         if self.keyboard_enhancement_enabled {
             self.stdout.write_all(DISABLE_KEYBOARD_ENHANCEMENT)
         } else {
@@ -5103,20 +5426,52 @@ impl SessionTerminals {
         Ok(None)
     }
 
+    /// This attach's name in each terminal's viewer registry.
+    ///
+    /// One per process rather than one per pane: the registry is per terminal already, and a
+    /// dashboard only ever has one workspace open, so the process's lease instance is enough
+    /// to tell this window apart from a browser's -- and stable across every relayout, which
+    /// is what makes a resize update this viewer instead of adding another.
+    fn workspace_viewer(&self) -> String {
+        format!("{}:tui:{}", std::process::id(), self.lease_owner_id)
+    }
+
+    /// Sizes the session's terminals for this workspace's panes.
+    ///
+    /// Reported as a viewer rather than imposed: a browser may be looking at the same PTY,
+    /// and the size it ends up at is the smallest of the two. A pane with room left over
+    /// letterboxes -- `render_terminal` clears each row to the pane's width and writes the
+    /// screen's shorter row into it, so the spare columns stay blank rather than being filled
+    /// with reflowed output.
     fn resize_workspace(&mut self, layout: &WorkspaceLayout) -> io::Result<()> {
         self.selection = None;
         self.alternate_selection = None;
         self.pending_alternate_copy = None;
         self.pending_agent_click = None;
+        let viewer = self.workspace_viewer();
         if let Some(agent) = &self.agent {
-            agent.resize(layout.agent.width, layout.agent.height)?;
+            agent.resize_viewer(&viewer, layout.agent.width, layout.agent.height)?;
         }
         for (index, rect) in &layout.shell_panes {
-            self.shells[*index]
-                .terminal
-                .resize(rect.width, rect.height.saturating_sub(1))?;
+            self.shells[*index].terminal.resize_viewer(
+                &viewer,
+                rect.width,
+                rect.height.saturating_sub(1),
+            )?;
         }
         Ok(())
+    }
+
+    /// Stops this workspace counting as a viewer, so a terminal it was keeping small grows
+    /// back to whatever browser is still looking at it.
+    fn release_workspace_viewer(&self) {
+        let viewer = self.workspace_viewer();
+        if let Some(agent) = &self.agent {
+            let _ = agent.detach_viewer(&viewer);
+        }
+        for shell in &self.shells {
+            let _ = shell.terminal.detach_viewer(&viewer);
+        }
     }
 
     fn write_focused(&mut self, focus: WorkspaceFocus, bytes: &[u8]) -> io::Result<()> {
@@ -6484,6 +6839,16 @@ pub fn agent_command(
             let mut spec = CommandSpec::new("claude", &resume_cwd)
                 .arg("--settings")
                 .arg(hooks);
+            // Codex is asked for this with `--no-alt-screen`; Claude Code's switch is an
+            // environment variable. Either way the point is the same: an agent that takes
+            // the alternate screen has no scrollback at all, so its terminal shows the
+            // current screen and nothing above it -- in the dashboard and in a browser alike
+            // -- and every wheel notch has to be answered by the agent itself instead of by
+            // the buffer this console already keeps. Left alone if the user set it: they
+            // asked for the alternate screen on purpose.
+            if env::var_os(CLAUDE_ALTERNATE_SCREEN_VAR).is_none() {
+                spec = spec.env(CLAUDE_ALTERNATE_SCREEN_VAR, "1");
+            }
             if new_session {
                 spec = spec
                     .arg("--session-id")
@@ -6496,12 +6861,13 @@ pub fn agent_command(
             spec
         }
     };
-    let CommandSpec { args, cwd, .. } = spec;
+    let CommandSpec { args, cwd, env, .. } = spec;
     let command = config.provider_command(session.agent, args);
     CommandSpec {
         program: command.program,
         args: command.args,
         cwd,
+        env,
     }
 }
 
@@ -6754,6 +7120,94 @@ mod tests {
         );
     }
 
+    /// Both providers are asked for the same thing in the shape each one offers: Codex takes
+    /// a flag, Claude Code takes an environment variable. An agent on the alternate screen
+    /// keeps no scrollback, so its terminal opens on the current screen with nothing above it
+    /// -- the report that a phone cannot swipe back to a session's earlier output, and the
+    /// same reason scrolling the dashboard's agent pane has to be answered by the agent
+    /// instead of by the buffer this console already keeps.
+    #[test]
+    fn both_providers_are_kept_off_the_alternate_screen() {
+        let _guard = ALTERNATE_SCREEN_ENV
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let cwd = Path::new("/tmp/repo");
+        let executable = Path::new("/tmp/agent console");
+        let config = AgentConsoleConfig::default();
+
+        let codex = agent_command(&config, &session(AgentKind::Codex, cwd), executable, true);
+        assert!(codex.args.iter().any(|arg| arg == "--no-alt-screen"));
+
+        let claude = agent_command(&config, &session(AgentKind::Claude, cwd), executable, true);
+        assert!(
+            claude
+                .env
+                .iter()
+                .any(|(name, value)| name == CLAUDE_ALTERNATE_SCREEN_VAR && value == "1"),
+            "claude has no flag for it, so the spec has to carry the variable: {:?}",
+            claude.env
+        );
+    }
+
+    /// The spawn environment has to survive the trip to the daemon, which is another process
+    /// and the one that actually starts the agent.
+    #[test]
+    fn a_spawn_environment_survives_the_daemon_wire() {
+        let spec = CommandSpec::new("claude", Path::new("/tmp/repo"))
+            .arg("--resume")
+            .env(CLAUDE_ALTERNATE_SCREEN_VAR, "1");
+
+        let wire = WireCommandSpec::from(&spec);
+        let round_tripped: WireCommandSpec =
+            serde_json::from_str(&serde_json::to_string(&wire).unwrap()).unwrap();
+
+        assert_eq!(
+            round_tripped.command_spec().env,
+            vec![(
+                OsString::from(CLAUDE_ALTERNATE_SCREEN_VAR),
+                OsString::from("1")
+            )]
+        );
+    }
+
+    /// A daemon older than this build left the field out entirely; a spec with no environment
+    /// has to stay parseable rather than failing the spawn.
+    #[test]
+    fn a_spec_from_before_the_environment_existed_still_parses() {
+        let wire: WireCommandSpec =
+            serde_json::from_str(r#"{"program":"claude","args":[],"cwd":"/tmp"}"#).unwrap();
+        assert!(wire.command_spec().env.is_empty());
+    }
+
+    /// The process environment is shared by every test in this binary, and two of them read
+    /// this variable, so the one that *writes* it has to exclude the one that reads it.
+    static ALTERNATE_SCREEN_ENV: Mutex<()> = Mutex::new(());
+
+    /// A user who set it themselves gets to keep whatever they chose, including "off".
+    #[test]
+    fn an_explicit_setting_of_its_own_is_left_alone() {
+        let _guard = ALTERNATE_SCREEN_ENV
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        // SAFETY: no other thread reads this variable while the guard above is held.
+        unsafe { env::set_var(CLAUDE_ALTERNATE_SCREEN_VAR, "0") };
+        let claude = agent_command(
+            &AgentConsoleConfig::default(),
+            &session(AgentKind::Claude, Path::new("/tmp/repo")),
+            Path::new("/tmp/agent console"),
+            true,
+        );
+        let carried = claude
+            .env
+            .iter()
+            .any(|(name, _)| name == CLAUDE_ALTERNATE_SCREEN_VAR);
+        unsafe { env::remove_var(CLAUDE_ALTERNATE_SCREEN_VAR) };
+        assert!(
+            !carried,
+            "the console must not overwrite a choice the user made deliberately"
+        );
+    }
+
     #[test]
     fn agent_command_uses_configured_provider_prefix() {
         let config = AgentConsoleConfig::parse(
@@ -6894,6 +7348,272 @@ mod tests {
         assert!(wait_for_capture(&terminal, "ready").contains("ready"));
         terminal.write(b"hello\n").unwrap();
         assert!(wait_for_capture(&terminal, "got:hello").contains("got:hello"));
+    }
+
+    /* ------------------------------------------------ one PTY, several viewers
+
+    A session is often open in more than one window at once -- a desktop browser, a phone,
+    the dashboard's own workspace -- and they share one PTY, which has exactly one size.
+    Applying whichever window resized last is what squashed a 180-column desktop the moment
+    a 40-column phone attached, and, because resizing a PTY reflows its scrollback, mangled
+    the history the desktop was reading at the same time. The rule below is the one every
+    terminal multiplexer settled on. */
+
+    /// A stand-in for an agent that answers with the size it is running under, so a test can
+    /// observe what the PTY actually did rather than what it was asked to do.
+    fn size_probe_script(root: &Path) -> std::path::PathBuf {
+        let script = root.join("size-probe.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\nn=0\nwhile IFS= read -r line; do\n  n=$((n+1))\n  printf 'probe%s=%s\\n' \"$n\" \"$(stty size | tr ' ' 'x')\"\ndone\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).unwrap();
+        }
+        script
+    }
+
+    /// Prods the probe through the daemon and waits for *that* probe's answer, as `rowsxcols`.
+    fn probe_daemon_size(state: &mut PtyDaemonState, id: &str, probe: usize) -> String {
+        state.handle(DaemonRequest::Write {
+            id: id.to_owned(),
+            owner_id: "test".into(),
+            bytes: b"\n".to_vec(),
+        });
+        let marker = format!("probe{probe}=");
+        let mut offset = 0;
+        let mut output = Vec::new();
+        let start = Instant::now();
+        loop {
+            if let DaemonResponse::Poll { end, bytes, .. } = state
+                .handle(DaemonRequest::Poll {
+                    id: id.to_owned(),
+                    offset,
+                    scrollback: false,
+                })
+                .0
+            {
+                offset = end;
+                output.extend(bytes);
+            }
+            let text = plain_text(&output);
+            if let Some(size) = text
+                .split_whitespace()
+                .find_map(|word| word.strip_prefix(marker.as_str()))
+            {
+                return size.to_owned();
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "probe {probe} never answered: {text}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn viewers(entries: &[(&str, (u16, u16))]) -> ViewerSizes {
+        entries
+            .iter()
+            .map(|(id, size)| ((*id).to_owned(), *size))
+            .collect()
+    }
+
+    /// The rule itself: the PTY fits inside every window, taking each dimension on its own so
+    /// a tall narrow phone beside a short wide desktop still leaves both able to show it all.
+    #[test]
+    fn the_pty_is_sized_to_the_smallest_of_every_viewer_in_each_dimension() {
+        assert_eq!(
+            smallest_viewer(&viewers(&[("desktop", (180, 50)), ("phone", (40, 20))])),
+            Some((40, 20))
+        );
+        assert_eq!(
+            smallest_viewer(&viewers(&[("wide", (200, 20)), ("tall", (60, 80))])),
+            Some((60, 20)),
+            "each dimension is taken from whichever viewer is smaller in it"
+        );
+    }
+
+    /// A single viewer must behave exactly as it did before viewers existed -- including the
+    /// defect this replaced, where attaching to an already-running terminal kept the size the
+    /// first window had picked and rendered into a strip of the new one.
+    #[test]
+    fn one_viewer_gets_exactly_the_size_it_asked_for() {
+        assert_eq!(
+            smallest_viewer(&viewers(&[("only", (180, 50))])),
+            Some((180, 50))
+        );
+    }
+
+    /// Nothing attached is not a size. Resizing for nobody would only make the agent repaint.
+    #[test]
+    fn no_viewers_at_all_leaves_the_terminal_where_it_is() {
+        assert_eq!(smallest_viewer(&ViewerSizes::new()), None);
+    }
+
+    /// The leak to watch for: a socket that dies without a close frame, or a whole process
+    /// killed outright, cannot detach itself. A viewer nobody can remove would hold the
+    /// terminal at a dead window's size for every other reader, forever.
+    #[cfg(unix)]
+    #[test]
+    fn a_viewer_whose_process_is_gone_stops_holding_the_terminal_small() {
+        // A pid that has certainly exited: a child we reaped ourselves.
+        let mut dead = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let dead_pid = dead.id();
+        dead.wait().unwrap();
+
+        let mut registry = viewers(&[("phone", (40, 20)), ("no-pid-at-all", (200, 60))]);
+        registry.insert(format!("{dead_pid}:ws:abandoned"), (40, 20));
+        registry.insert(format!("{}:ws:live", std::process::id()), (180, 50));
+        drop_dead_viewers(&mut registry);
+
+        assert!(
+            !registry.contains_key(&format!("{dead_pid}:ws:abandoned")),
+            "a viewer from a process that is gone has to stop being counted"
+        );
+        assert!(
+            registry.contains_key(&format!("{}:ws:live", std::process::id())),
+            "this process's own viewers are live"
+        );
+        assert!(
+            registry.contains_key("no-pid-at-all"),
+            "a name that carries no pid says nothing about liveness, so it is kept"
+        );
+    }
+
+    /// The measurement this whole change exists to fix, end to end through the daemon that
+    /// owns the PTY: a desktop attaches wide, a phone joins narrow, the phone leaves.
+    #[cfg(unix)]
+    #[test]
+    fn a_second_viewer_shrinks_the_pty_and_its_leaving_gives_the_size_back() {
+        let root = tempdir().unwrap();
+        let script = size_probe_script(root.path());
+        let mut state = PtyDaemonState::default();
+        let id = "agent|sizing";
+        assert!(matches!(
+            state
+                .handle(DaemonRequest::Ensure {
+                    id: id.into(),
+                    spec: WireCommandSpec::from(&CommandSpec::new(script.as_os_str(), root.path())),
+                    cols: 80,
+                    rows: 24,
+                })
+                .0,
+            DaemonResponse::Ok
+        ));
+
+        let resize = |state: &mut PtyDaemonState, viewer: &str, cols, rows| match state
+            .handle(DaemonRequest::Resize {
+                id: id.into(),
+                cols,
+                rows,
+                viewer: Some(viewer.into()),
+            })
+            .0
+        {
+            DaemonResponse::Size { cols, rows } => (cols, rows),
+            other => panic!("a viewer's resize has to answer with a size: {other:?}"),
+        };
+
+        // A desktop, on its own: it gets exactly what it asked for.
+        assert_eq!(resize(&mut state, "desktop", 180, 50), (180, 50));
+        assert_eq!(probe_daemon_size(&mut state, id, 1), "50x180");
+
+        // A phone joins. The PTY has to fit inside it -- and the desktop is told so, rather
+        // than being left believing it still has 180 columns.
+        assert_eq!(resize(&mut state, "phone", 40, 20), (40, 20));
+        assert_eq!(probe_daemon_size(&mut state, id, 2), "20x40");
+
+        // The phone leaves. The desktop must get its width back, not stay squashed.
+        let grown = match state
+            .handle(DaemonRequest::Detach {
+                id: id.into(),
+                viewer: "phone".into(),
+            })
+            .0
+        {
+            DaemonResponse::Size { cols, rows } => (cols, rows),
+            other => panic!("detaching has to answer with the size left behind: {other:?}"),
+        };
+        assert_eq!(grown, (180, 50));
+        assert_eq!(probe_daemon_size(&mut state, id, 3), "50x180");
+
+        state.handle(DaemonRequest::Terminate { id: id.into() });
+    }
+
+    /// Polls carry the size so a window learns about a change it did not cause: the phone
+    /// attaching is what shrinks the desktop, and nothing happens on the desktop's own socket.
+    #[cfg(unix)]
+    #[test]
+    fn a_poll_reports_the_size_the_pty_is_running_at() {
+        let root = tempdir().unwrap();
+        let mut state = PtyDaemonState::default();
+        let id = "agent|poll-size";
+        state.handle(DaemonRequest::Ensure {
+            id: id.into(),
+            spec: WireCommandSpec::from(
+                &CommandSpec::new("/bin/sh", root.path())
+                    .arg("-c")
+                    .arg("sleep 5"),
+            ),
+            cols: 80,
+            rows: 24,
+        });
+        state.handle(DaemonRequest::Resize {
+            id: id.into(),
+            cols: 180,
+            rows: 50,
+            viewer: Some("desktop".into()),
+        });
+        state.handle(DaemonRequest::Resize {
+            id: id.into(),
+            cols: 40,
+            rows: 20,
+            viewer: Some("phone".into()),
+        });
+
+        let DaemonResponse::Poll { cols, rows, .. } = state
+            .handle(DaemonRequest::Poll {
+                id: id.into(),
+                offset: 0,
+                scrollback: false,
+            })
+            .0
+        else {
+            panic!("a poll has to answer with a poll");
+        };
+        assert_eq!((cols, rows), (40, 20));
+
+        state.handle(DaemonRequest::Terminate { id: id.into() });
+    }
+
+    /// A local terminal -- no daemon in the picture -- follows the same rule, because the
+    /// registry lives with the PTY rather than with whichever process is talking to it.
+    #[cfg(unix)]
+    #[test]
+    fn a_process_local_terminal_is_sized_by_its_viewers_too() {
+        let root = tempdir().unwrap();
+        let script = size_probe_script(root.path());
+        let terminal =
+            ManagedTerminal::spawn(&CommandSpec::new(script.as_os_str(), root.path()), (80, 24))
+                .unwrap();
+
+        assert_eq!(
+            terminal.resize_viewer("desktop", 180, 50).unwrap(),
+            (180, 50)
+        );
+        assert_eq!(terminal.resize_viewer("phone", 40, 20).unwrap(), (40, 20));
+        assert_eq!(terminal.size(), (40, 20));
+        assert_eq!(terminal.detach_viewer("phone").unwrap(), (180, 50));
+        assert_eq!(terminal.size(), (180, 50));
+        // The last viewer leaving changes nothing: nobody is looking.
+        assert_eq!(terminal.detach_viewer("desktop").unwrap(), (180, 50));
+
+        terminal.terminate();
     }
 
     #[test]
@@ -10642,5 +11362,69 @@ mod tests {
             panic!("a poll response has to parse as one");
         };
         assert!(scrollback.is_none());
+    }
+
+    /// A one-shot stand-in for a daemon's socket: answers one request and exits.
+    #[cfg(unix)]
+    fn serve_one_request<F>(socket: &Path, answer: F)
+    where
+        F: FnOnce(String) -> String + Send + 'static,
+    {
+        let listener = UnixListener::bind(socket).unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let response = answer(line);
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(b"\n").unwrap();
+        });
+    }
+
+    /// Tolerating the version gap field by field is what let an upgrade go quiet: the older
+    /// daemon kept answering polls, just without the rows above the screen. Asking outright
+    /// is the part that can be reported, so a daemon that cannot answer counts as behind
+    /// rather than as broken.
+    #[cfg(unix)]
+    #[test]
+    fn a_daemon_that_cannot_answer_the_version_question_is_the_answer() {
+        let root = tempdir().unwrap();
+        let socket = root.path().join("older.sock");
+        serve_one_request(&socket, |_| {
+            r#"{"Error":"unknown variant `Version`"}"#.to_owned()
+        });
+
+        let reported = daemon_protocol(&socket).unwrap();
+        assert_eq!(reported, Some(0));
+        assert!(
+            reported.is_some_and(|protocol| protocol < DAEMON_PROTOCOL),
+            "a daemon from before the question has to sort below this build"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_current_daemon_answers_the_protocol_this_build_speaks() {
+        let root = tempdir().unwrap();
+        let socket = root.path().join("current.sock");
+        serve_one_request(&socket, |line| {
+            let mut state = PtyDaemonState::default();
+            let (response, _) = state.handle(serde_json::from_str(&line).unwrap());
+            serde_json::to_string(&response).unwrap()
+        });
+
+        assert_eq!(daemon_protocol(&socket).unwrap(), Some(DAEMON_PROTOCOL));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_daemon_at_all_is_not_an_out_of_date_one() {
+        let root = tempdir().unwrap();
+        assert_eq!(
+            daemon_protocol(&root.path().join("absent.sock")).unwrap(),
+            None
+        );
     }
 }

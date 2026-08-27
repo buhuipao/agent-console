@@ -233,6 +233,7 @@ mod tests {
             bytes: b" second".to_vec(),
             checkpoint: Some(b"first".to_vec()),
             scrollback: None,
+            size: (80, 24),
             alive: true,
             exit: None,
         };

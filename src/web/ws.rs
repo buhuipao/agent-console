@@ -14,7 +14,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use super::{AppState, agent, shells};
-use crate::pty::{ManagedTerminal, RawPoll, Scrollback};
+use crate::pty::{self, ManagedTerminal, RawPoll, Scrollback};
 
 /// The web layer owns its own per-websocket offset cursor and relays raw bytes straight from
 /// `ManagedTerminal::poll_raw` into the socket -- no vt100 parsing happens server-side.
@@ -45,14 +45,26 @@ enum Target {
 }
 
 impl Target {
-    /// Ensures the terminal exists **and is sized for this client**, on every attach rather
-    /// than only the first: a terminal another surface started keeps its original size, so a
-    /// re-attach from a wide window would otherwise render into a narrow strip of it.
-    fn attach(&self, state: &AppState, key: &str, size: (u16, u16)) -> Result<(), String> {
+    /// Ensures the terminal exists and registers this socket as one of its viewers, on every
+    /// attach rather than only the first: a terminal another surface started keeps its
+    /// original size, so a re-attach from a wide window would otherwise render into a narrow
+    /// strip of it.
+    ///
+    /// Answers with the terminal and the size it settled on -- the smallest of every attached
+    /// viewer, which can be smaller than this socket asked for.
+    fn attach(
+        &self,
+        state: &AppState,
+        key: &str,
+        viewer: &str,
+        size: (u16, u16),
+    ) -> Result<(Arc<ManagedTerminal>, (u16, u16)), String> {
         match self {
-            Self::Agent => agent::attach(state, key, size).map_err(|error| error.to_string()),
+            Self::Agent => {
+                agent::attach(state, key, viewer, size).map_err(|error| error.to_string())
+            }
             Self::Shell(id) => {
-                shells::attach(state, key, id, size).map_err(|error| error.to_string())
+                shells::attach(state, key, id, viewer, size).map_err(|error| error.to_string())
             }
         }
     }
@@ -156,6 +168,26 @@ fn upgrade(
     ws.on_upgrade(move |socket| handle_socket(socket, state, key, target, (cols, rows)))
 }
 
+/// Keeps this socket counted as a viewer of its terminal for exactly as long as it is open.
+///
+/// The removal has to be a `Drop` rather than a line at the end of the loop: a socket that
+/// dies without a close frame -- a phone that went into a tunnel, a tab killed by the OS --
+/// leaves the loop by an error path, and a viewer nobody takes back out would pin the
+/// terminal to that window's size for every other reader, forever. Dropping the task is the
+/// one thing that happens on every ending, clean or not.
+struct AttachedViewer {
+    terminal: Arc<ManagedTerminal>,
+    id: String,
+}
+
+impl Drop for AttachedViewer {
+    fn drop(&mut self) {
+        // A unix-socket round trip, not an await: nothing here can block the runtime for
+        // longer than the daemon takes to answer one request.
+        let _ = self.terminal.detach_viewer(&self.id);
+    }
+}
+
 async fn handle_socket(
     mut socket: WebSocket,
     state: AppState,
@@ -163,8 +195,21 @@ async fn handle_socket(
     target: Target,
     size: (u16, u16),
 ) {
-    if let Err(error) = target.attach(&state, &key, size) {
-        let _ = socket.send(exit_message(&error)).await;
+    let viewer = pty::viewer_id("ws");
+    let (terminal, mut pty_size) = match target.attach(&state, &key, &viewer, size) {
+        Ok(attached) => attached,
+        Err(error) => {
+            let _ = socket.send(exit_message(&error)).await;
+            return;
+        }
+    };
+    let _viewer = AttachedViewer {
+        terminal,
+        id: viewer.clone(),
+    };
+    // Sent before any output: the browser sizes its emulator to this and letterboxes the
+    // rest, so it has to know before the first checkpoint is drawn into it.
+    if socket.send(size_message(pty_size)).await.is_err() {
         return;
     }
 
@@ -195,7 +240,7 @@ async fn handle_socket(
                     }
                     Reached::Ok(Ok(raw)) => {
                         snapshot = Scrollback::Omit;
-                        if !apply_poll(&mut socket, &mut offset, raw).await {
+                        if !apply_poll(&mut socket, &mut offset, &mut pty_size, raw).await {
                             break;
                         }
                     }
@@ -208,7 +253,7 @@ async fn handle_socket(
                         write_to_terminal(&state, &key, &target, &bytes).await
                     }
                     Some(Ok(Message::Text(text))) => {
-                        handle_text_frame(&state, &key, &target, &text).await
+                        handle_text_frame(&state, &key, &target, &viewer, &text).await
                     }
                     Some(Ok(_)) => false,
                 };
@@ -223,7 +268,12 @@ async fn handle_socket(
 
 /// Sends a poll result's checkpoint/bytes, advances `offset`, and sends a final exit frame if
 /// the terminal is no longer alive. Returns `false` when the caller should stop the loop.
-async fn apply_poll(socket: &mut WebSocket, offset: &mut u64, raw: RawPoll) -> bool {
+async fn apply_poll(
+    socket: &mut WebSocket,
+    offset: &mut u64,
+    pty_size: &mut (u16, u16),
+    raw: RawPoll,
+) -> bool {
     debug_assert!(
         raw.start <= raw.end,
         "poll_raw returned a start offset past its own end: {} > {}",
@@ -239,6 +289,15 @@ async fn apply_poll(socket: &mut WebSocket, offset: &mut u64, raw: RawPoll) -> b
         && socket.send(scrollback_message(rows)).await.is_err()
     {
         return false;
+    }
+    // Another viewer attaching, leaving or resizing changes the PTY's size with nothing at
+    // all happening on this socket, and everything below is drawn for the new size. It goes
+    // out ahead of those bytes so the browser has already resized when they land.
+    if raw.size != *pty_size {
+        *pty_size = raw.size;
+        if socket.send(size_message(raw.size)).await.is_err() {
+            return false;
+        }
     }
     let mut frames = Vec::new();
     frames.extend(raw.checkpoint);
@@ -309,13 +368,23 @@ struct ResizeControl {
 /// text that doesn't parse as the former is written straight to the terminal as the latter.
 ///
 /// Reports the same "refused for lack of the lease" verdict [`write_to_terminal`] does.
-async fn handle_text_frame(state: &AppState, key: &str, target: &Target, text: &str) -> bool {
+async fn handle_text_frame(
+    state: &AppState,
+    key: &str,
+    target: &Target,
+    viewer: &str,
+    text: &str,
+) -> bool {
     if let Ok(resize) = serde_json::from_str::<ResizeControl>(text)
         && resize.kind == "resize"
     {
+        // Recorded against this viewer, never imposed: the browser reports how much room it
+        // has, and the PTY follows the smallest window looking at it. The size it settled on
+        // reaches the browser on the next poll, which is also the path that carries a change
+        // somebody else caused -- one route rather than two.
         target
             .with_terminal_waiting(state, key, |terminal| {
-                let _ = terminal.resize(resize.cols, resize.rows);
+                let _ = terminal.resize_viewer(viewer, resize.cols, resize.rows);
             })
             .await;
         return false;
@@ -334,6 +403,31 @@ struct ExitFrame<'a> {
 
 fn exit_message(detail: &str) -> Message {
     control_message("exit", detail)
+}
+
+/// The size the PTY is actually running at, which is the smallest of every window looking at
+/// it and so not necessarily the size this browser asked for.
+///
+/// The browser sizes its emulator to exactly this and letterboxes whatever room is left over.
+/// Stretching the agent's output to fill the window instead would reflow the very lines
+/// somebody is scrolling back through, which is the thing this whole mechanism exists to
+/// avoid.
+fn size_message((cols, rows): (u16, u16)) -> Message {
+    let payload = serde_json::to_string(&SizeFrame {
+        kind: "size",
+        cols,
+        rows,
+    })
+    .unwrap_or_else(|_| "{\"type\":\"size\"}".to_owned());
+    Message::text(payload)
+}
+
+#[derive(Serialize)]
+struct SizeFrame {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    cols: u16,
+    rows: u16,
 }
 
 /// Everything the terminal printed before this socket existed, in one frame.
@@ -377,6 +471,66 @@ fn control_message(kind: &'static str, detail: &str) -> Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::Arc;
+
+    use crate::pty::{CommandSpec, ManagedTerminal};
+
+    /// The size frame is what lets a window letterbox deliberately instead of drawing the
+    /// agent into a strip of itself, so it has to be parseable and must not be mistaken for
+    /// the two frames that tear a terminal down or raise a takeover dialog.
+    #[test]
+    fn the_size_frame_names_the_size_the_pty_is_actually_running_at() {
+        let Message::Text(payload) = size_message((40, 20)) else {
+            panic!("the size has to be a text frame the browser can parse");
+        };
+        let value: serde_json::Value = serde_json::from_str(payload.as_str()).unwrap();
+        assert_eq!(value["type"], "size");
+        assert_eq!(value["cols"], 40);
+        assert_eq!(value["rows"], 20);
+        assert_ne!(value["type"], "exit");
+        assert_ne!(value["type"], "lease_denied");
+    }
+
+    /// A socket that dies without a close frame leaves its loop by an error path, so the
+    /// viewer is taken back out by dropping rather than by a line at the end of the loop.
+    /// Without this, one phone that lost signal would hold the session at 40 columns for
+    /// every other window until the agent was restarted.
+    #[cfg(unix)]
+    #[test]
+    fn an_abruptly_dropped_socket_stops_holding_the_terminal_small() {
+        let root = tempfile::tempdir().unwrap();
+        let terminal = Arc::new(
+            ManagedTerminal::spawn(
+                &CommandSpec::new("/bin/sh", root.path())
+                    .arg("-c")
+                    .arg("sleep 5"),
+                (80, 24),
+            )
+            .unwrap(),
+        );
+        terminal.resize_viewer("desktop", 180, 50).unwrap();
+
+        {
+            let phone = AttachedViewer {
+                terminal: Arc::clone(&terminal),
+                id: "phone".into(),
+            };
+            phone
+                .terminal
+                .resize_viewer(&phone.id, 40, 20)
+                .expect("the phone is attached");
+            assert_eq!(terminal.size(), (40, 20));
+            // No close frame, no clean teardown: the task simply ends and its state drops.
+        }
+
+        assert_eq!(
+            terminal.size(),
+            (180, 50),
+            "dropping the socket's registration has to give the desktop its width back"
+        );
+        terminal.terminate();
+    }
 
     #[test]
     fn an_exit_frame_names_the_reason_the_stream_stopped() {

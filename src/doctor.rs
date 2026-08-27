@@ -348,10 +348,32 @@ pub fn check_clipboard() -> ProviderStatus {
 pub fn check_daemon(state_root: &Path) -> ProviderStatus {
     let socket = state_root.join("pty-daemon.sock");
     match pty::daemon_health(&socket) {
-        Ok(Some(())) => ProviderStatus::Available(format!("healthy at {}", socket.display())),
+        Ok(Some(())) => check_daemon_protocol(&socket),
         Ok(None) => {
             ProviderStatus::Available("not running; will start on first agent entry".into())
         }
+        Err(error) => ProviderStatus::Unavailable(format!("{}: {error}", socket.display())),
+    }
+}
+
+/// A daemon older than this build still serves terminals, so this is not "unhealthy" -- but
+/// it answers polls without the rows above the screen, and a browser terminal opened against
+/// it starts at the current screen with nothing to scroll back through. Restarting it is the
+/// only cure and it ends every agent it is holding, so the report says that rather than
+/// doing it.
+#[cfg(unix)]
+fn check_daemon_protocol(socket: &Path) -> ProviderStatus {
+    match pty::daemon_protocol(socket) {
+        Ok(Some(protocol)) if protocol < pty::DAEMON_PROTOCOL => {
+            ProviderStatus::Unavailable(format!(
+                "{} is running an older build (protocol {protocol}, this one speaks {}); \
+                 browser and dashboard terminals open without their earlier output until it \
+                 is restarted, which ends every agent terminal it currently holds",
+                socket.display(),
+                pty::DAEMON_PROTOCOL
+            ))
+        }
+        Ok(_) => ProviderStatus::Available(format!("healthy at {}", socket.display())),
         Err(error) => ProviderStatus::Unavailable(format!("{}: {error}", socket.display())),
     }
 }

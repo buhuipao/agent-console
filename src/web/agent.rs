@@ -1,11 +1,13 @@
 //! Getting at a session's agent terminal from a web request.
 //!
 //! Two callers want different things from the same terminal. A websocket attach owns a real
-//! viewport and must impose its size; a prompt or interrupt has no viewport at all and must
-//! not resize a terminal some other client is looking at.
+//! viewport and is counted as one of the terminal's viewers -- the PTY runs at the smallest
+//! of them, so a phone joining a desktop never squashes the desktop. A prompt or an interrupt
+//! has no viewport at all, so it is not a viewer and never changes the size.
 
 use std::{
     fmt, io,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -94,14 +96,28 @@ pub(super) fn is_new_session(session: &Session) -> bool {
     session.transcript_path.is_none()
 }
 
-/// Ensures the agent terminal exists **and is sized for this client**.
+/// Ensures the agent terminal exists and registers this client as one of its viewers.
 ///
 /// `TerminalManager::ensure_agent` only applies `size` on the call that spawns the pty. A
 /// terminal the TUI (or an earlier, narrower browser) already started keeps its original size
-/// forever, so an attach from a wide window renders the agent into half of it. The explicit
-/// resize is what makes the size argument mean anything on the second attach onwards.
-pub(super) fn attach(state: &AppState, key: &str, size: (u16, u16)) -> Result<(), AgentError> {
-    with_agent(state, key, size, |terminal| terminal.resize(size.0, size.1))
+/// forever, so an attach from a wide window renders the agent into half of it -- which is why
+/// attaching has to say how big it is at all.
+///
+/// It says so as a *viewer* rather than as an order. Every window looking at this PTY is
+/// counted, and the size that comes back is the smallest of them: a phone joining a desktop
+/// no longer squashes the desktop, and the desktop letterboxes the columns the PTY is not
+/// using instead of reflowing the agent's output into them.
+pub(super) fn attach(
+    state: &AppState,
+    key: &str,
+    viewer: &str,
+    size: (u16, u16),
+) -> Result<(Arc<ManagedTerminal>, (u16, u16)), AgentError> {
+    let terminal = with_agent(state, key, size, |terminal| Ok(Arc::clone(terminal)))?;
+    let effective = terminal
+        .resize_viewer(viewer, size.0, size.1)
+        .map_err(classify)?;
+    Ok((terminal, effective))
 }
 
 /// Ensures the agent terminal exists, then writes to it, leaving its size alone.
@@ -163,7 +179,7 @@ fn with_agent<T>(
     state: &AppState,
     key: &str,
     size: (u16, u16),
-    action: impl FnOnce(&ManagedTerminal) -> io::Result<T>,
+    action: impl FnOnce(&Arc<ManagedTerminal>) -> io::Result<T>,
 ) -> Result<T, AgentError> {
     let mut app = state.app.lock().unwrap();
     let session = app
@@ -264,7 +280,7 @@ mod tests {
             "ensure_agent silently drops the size of an already-running terminal"
         );
 
-        terminal.resize(200, 50).unwrap();
+        terminal.resize_viewer("test-viewer", 200, 50).unwrap();
         assert_eq!(
             probe_size(&terminal, 3),
             "50x200",
