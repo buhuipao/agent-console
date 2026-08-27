@@ -46,8 +46,38 @@ All notable changes to this project will be documented in this file.
   tab opened was simply not there. The first poll of a socket now answers with the rows above
   the screen as well as the screen, taken from one parser at one instant so the two cannot
   overlap or leave a gap, and the browser writes them into its own scrollback ahead of the
-  checkpoint. Both the Agent TUI and Shell tabs; output arriving while you have scrolled up
-  still leaves you where you are, and "Jump to latest" returns you to the tail.
+  checkpoint. Both the Agent TUI and Shell tabs.
+- Let a web terminal actually be scrolled while its agent is printing. xterm renders into a
+  real scrolling element and reassigns its scroll position on every write, so a wheel's
+  smooth scroll and a finger's momentum were cancelled ten times a second: the Agent TUI tab
+  crawled on a desktop and would not move at all on a phone, while the Shell tab -- usually
+  sitting at a prompt, printing nothing -- looked fine. Scrolling off the tail now holds the
+  arriving output instead of writing it, in order, and releases it when you come back to the
+  bottom or press "Jump to latest".
+- Keep Claude Code out of the alternate screen, which is what a session's earlier output was
+  disappearing into. A program on the alternate screen has no scrollback at all, so the Agent
+  TUI tab opened on the current screen with nothing above it and there was nothing to swipe
+  back through on a phone; in the dashboard, Claude also turned mouse reporting on there, so
+  every wheel notch was handed to the agent to answer instead of scrolling the buffer the
+  console already keeps -- which is why scrolling a Claude session felt slow and a Codex one
+  did not. Codex has been asked for this with `--no-alt-screen` all along; Claude Code's
+  switch is an environment variable, so a spawn can now carry environment as well as
+  arguments. An explicit `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN` of your own is left alone.
+- Size a session's PTY to the smallest window looking at it, instead of to whichever one
+  attached last. Opening the same session on a phone squashed the desktop it was already
+  open on into a narrow column -- and, because resizing a PTY reflows its scrollback, mangled
+  the history the desktop was in the middle of reading, which is why the two were reported
+  together. Every attached window is now counted as a viewer -- each browser socket, and the
+  dashboard's own workspace -- and the terminal is sized to the element-wise minimum of them;
+  a window leaving gives the size back. A window with room to spare letterboxes the unused
+  area rather than stretching or re-wrapping the agent's output into it, and names the size
+  it is showing. A socket that dies without closing cleanly stops counting when its task
+  drops, and a viewer whose whole process was killed is forgotten by pid.
+- Report a PTY daemon left running by an older build. The daemon owns every running agent's
+  terminal, so nothing restarts it behind your back, and its wire format tolerates a version
+  gap field by field -- which meant an upgrade degraded in silence: an older daemon answers
+  polls without the rows above the screen, so browser terminals opened with no history and
+  nothing said why. `agent-console doctor` now asks it for its protocol version and says so.
 - Keep the web API answering while the TUI has a session open. A workspace frame used to
   hold the shared `App` lock for as long as the workspace was up, so `/api/*` timed out for
   the entire time anyone was actually using the console. Frames are now stepped, and the part

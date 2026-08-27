@@ -182,7 +182,24 @@ Alerts live in memory and start empty after a restart -- "what happened since I
 last looked" reaches back only as far as the running process.
 
 A program that takes the alternate screen (`vim`, `less`) has no scrollback to
-recover, in the browser or the dashboard; the agents themselves do not use it.
+recover, in the browser or the dashboard -- so neither agent is allowed to take it.
+Codex is asked with `--no-alt-screen`; Claude Code's switch is an environment
+variable, `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN`, which the console sets for it.
+Set that variable yourself and your choice is kept, including turning it off -- at
+the cost of an Agent TUI tab that shows the current screen and nothing above it.
+
+The same session can be open in several places at once -- a desktop browser, a
+phone, the dashboard's own workspace -- and they share one PTY, which has one size.
+It runs at the smallest window attached, so the output fits all of them; a window
+with room to spare leaves the rest of its panel empty and says what size it is
+showing, rather than re-wrapping the output you are reading. Closing the small
+window gives the size back.
+
+The PTY daemon holds every running agent's terminal, so upgrading the binary does
+not restart it -- and one left over from an older build answers without the rows
+above the screen, which is a browser terminal that opens with no history to scroll
+back through. `agent-console doctor` reports it. Restarting it is the cure and it
+ends every agent terminal it is holding, so it is left to you.
 
 ## Provider commands
 
