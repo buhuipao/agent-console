@@ -117,4 +117,40 @@ mod tests {
         assert!(Assets::get("icons/icon-192.png").is_some());
         assert!(Assets::get("icons/icon-512.png").is_some());
     }
+
+    /// A letterboxed terminal frames the *screen*, never the emulator's root element.
+    ///
+    /// `.xterm` is a block element, so it spans the whole pane whatever size the emulator is
+    /// running at; only `.xterm-screen` is laid out at cols x rows. Painting `.xterm` black
+    /// covered the backdrop that tells a reader the spare room is deliberate, and a 48-column
+    /// agent in a 1440px window then looked exactly like a terminal that had failed to lay
+    /// out -- which is the whole impression the letterbox exists to prevent.
+    #[test]
+    fn the_letterbox_frames_the_screen_rather_than_the_emulator_root() {
+        let css = Assets::get("css/terminal.css").expect("the terminal stylesheet is embedded");
+        let css = String::from_utf8(css.data.into_owned()).expect("the stylesheet is utf-8");
+        let rule = |selector: &str| {
+            let start = css
+                .find(selector)
+                .unwrap_or_else(|| panic!("no `{selector}` rule in the stylesheet"));
+            let open = css[start..].find('{').expect("a selector opens a block") + start;
+            let close = css[open..].find('}').expect("a block closes") + open;
+            css[open..close].to_owned()
+        };
+
+        assert!(
+            rule(".terminal-view.term-letterboxed .terminal-container .xterm-screen")
+                .contains("outline"),
+            "the live area has to be the thing that is outlined"
+        );
+        assert!(
+            rule(".terminal-view.term-letterboxed .terminal-container .xterm,")
+                .contains("transparent"),
+            "the emulator root has to let the backdrop through, not paint over it"
+        );
+        assert!(
+            rule(".terminal-view.term-letterboxed .terminal-container").contains("repeating-"),
+            "the spare room needs a backdrop of its own to read as deliberate"
+        );
+    }
 }

@@ -197,3 +197,88 @@
 .term-jump[hidden] {
   display: none;
 }
+
+/* ------------------------------------------------- one PTY, several windows
+
+   A session open in more than one place shares one PTY, and a PTY has one size. The server
+   runs it at the smallest window attached, so this window can have room to spare -- and the
+   output must not be stretched or re-wrapped to fill it, because those are the lines somebody
+   is scrolling back through.
+
+   So the spare room is given a backdrop of its own and the live area is outlined. Black on
+   black would read as a terminal that failed to lay out; this reads as a decision. */
+
+.terminal-view.term-letterboxed .terminal-container {
+  background: repeating-linear-gradient(
+    135deg,
+    #0d1117,
+    #0d1117 6px,
+    #11161d 6px,
+    #11161d 12px
+  );
+}
+
+/* The frame has to go round `.xterm-screen`, not round `.xterm`.
+
+   `.xterm` is a block element, so it is as wide as the container whatever size the emulator
+   is; only `.xterm-screen` is laid out at cols x rows. Outlining `.xterm` and painting it
+   black therefore drew a black rectangle over the whole pane and hid the backdrop below --
+   the spare room looked exactly like a terminal that had failed to lay out, which is the
+   impression the backdrop exists to prevent. Both `.xterm` and its viewport are made
+   transparent so the stripes show through everywhere the agent is not drawing. */
+.terminal-view.term-letterboxed .terminal-container .xterm,
+.terminal-view.term-letterboxed .terminal-container .xterm-viewport {
+  background: transparent;
+}
+
+.terminal-view.term-letterboxed .terminal-container .xterm-screen {
+  outline: 1px solid var(--border);
+  background: #000;
+}
+
+.term-size {
+  position: absolute;
+  right: calc(var(--safe-right) + 0.45rem);
+  bottom: 0.35rem;
+  z-index: 6;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  pointer-events: none;
+}
+
+.term-size[hidden] {
+  display: none;
+}
+
+/* An alternate-screen program has no scrollback, so scrolling up finds nothing. Say so where
+   the reader is looking, and point at the view that does hold the history. */
+.term-alt-note {
+  position: absolute;
+  top: 0.5rem;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 3;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.15rem 0.5rem;
+  align-items: baseline;
+  justify-content: center;
+  max-width: min(38rem, calc(100% - 1.5rem));
+  padding: 0.4rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  text-align: center;
+}
+
+.term-alt-link {
+  color: var(--accent);
+  cursor: pointer;
+  white-space: nowrap;
+}

@@ -9,6 +9,7 @@ import { byId, toast } from "../dom.js";
 import { offerTakeover } from "../lease.js";
 import { getSession } from "../store.js";
 import { createTerminalView } from "./termview.js";
+import { sessionHash } from "../router.js";
 
 let view = null;
 let current = null;
@@ -24,6 +25,9 @@ export function initTerminal() {
       const session = getSession(current);
       return !(session && session.managed_alive === false);
     },
+    // Claude Code takes the alternate screen, which has no scrollback at all; its history
+    // lives in the transcript the Conversation view is built from.
+    altScreenHint: () => (current ? sessionHash(current) : null),
     // Typing at an agent a TUI is already attached to is refused by the daemon. Without this
     // the keystrokes simply disappeared; now the same takeover the composer offers is here.
     onLeaseDenied: () => offerTakeover(current),
