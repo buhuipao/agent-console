@@ -25,6 +25,7 @@ const MAX_ACTIVITY: usize = 12;
 pub struct DiscoveryPaths {
     pub codex_sessions: PathBuf,
     pub claude_projects: PathBuf,
+    pub pi_sessions: PathBuf,
 }
 
 #[derive(Default)]
@@ -59,9 +60,15 @@ impl DiscoveryPaths {
         let codex_home = env::var_os("CODEX_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".codex"));
+        // pi reads the same variable to decide where its own agent directory lives, so a user
+        // who moved it keeps a dashboard that finds their sessions.
+        let pi_home = env::var_os("PI_CODING_AGENT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".pi/agent"));
         Some(Self {
             codex_sessions: codex_home.join("sessions"),
             claude_projects: home.join(".claude/projects"),
+            pi_sessions: pi_home.join("sessions"),
         })
     }
 
@@ -69,6 +76,7 @@ impl DiscoveryPaths {
         match provider {
             AgentKind::Codex => &self.codex_sessions,
             AgentKind::Claude => &self.claude_projects,
+            AgentKind::Pi => &self.pi_sessions,
         }
     }
 }
@@ -667,6 +675,212 @@ pub(crate) fn parse_claude_with_cached_prompt(
     }))
 }
 
+#[cfg(test)]
+pub(crate) fn parse_pi(path: &Path) -> io::Result<Option<Session>> {
+    parse_pi_with_cached_prompt(path, None)
+}
+
+/// One pi session file (`~/.pi/agent/sessions/--<encoded-cwd>--/<stamp>_<uuid>.jsonl`).
+///
+/// pi stores a conversation *tree*: every entry carries `id`/`parentId`, and `/tree` can move
+/// the leaf back onto an earlier branch. The dashboard shows what the session has been doing,
+/// not which branch is live, so this reads the file in write order rather than walking the
+/// branch -- the same way the Codex and Claude readers treat their own transcripts.
+pub(crate) fn parse_pi_with_cached_prompt(
+    path: &Path,
+    cached_prompt: Option<(&str, &str)>,
+) -> io::Result<Option<Session>> {
+    let (lines, fingerprint, modified_at) = bounded_jsonl(path)?;
+    let mut id = pi_session_id(path);
+    let mut cwd = None;
+    let mut session_name = None;
+    let mut model = None;
+    let mut first_prompt = None;
+    let mut latest_prompt = None;
+    let mut conversation_summary = None;
+    let mut task = String::new();
+    let mut activity = VecDeque::new();
+    let mut failed = false;
+
+    for line in lines {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        match value.get("type").and_then(Value::as_str).unwrap_or("") {
+            "session" => {
+                id = raw_string_field(&value, "id").or(id);
+                cwd = raw_string_field(&value, "cwd").map(PathBuf::from).or(cwd);
+            }
+            "session_info" => session_name = string_field(&value, "name").or(session_name),
+            "model_change" => model = string_field(&value, "modelId").or(model),
+            "compaction" | "branch_summary" => {
+                conversation_summary = string_field(&value, "summary").or(conversation_summary);
+            }
+            // `custom_message` is deliberately absent: an extension\'s injected context has no
+            // `role`, so it is not something the user or the agent did. The web conversation
+            // view renders it; this activity feed does not.
+            "message" => {
+                let message = value.get("message").unwrap_or(&value);
+                pi_absorb_message(
+                    message,
+                    &mut first_prompt,
+                    &mut latest_prompt,
+                    &mut task,
+                    &mut activity,
+                    &mut failed,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let (Some(id), Some(cwd)) = (id, cwd) else {
+        return Ok(None);
+    };
+    if let Some((_, prompt)) =
+        cached_prompt.filter(|(provider_session_id, _)| *provider_session_id == id)
+    {
+        first_prompt = Some(prompt.to_owned());
+    } else if let Some(prompt) = first_prompt_in_jsonl(path, pi_prompt_from_record)? {
+        // Only on a cache miss: this reads to EOF when no user turn yields text, and doing it
+        // unconditionally made every poll re-read the whole transcript from byte 0.
+        first_prompt = Some(prompt);
+    }
+    let mut search_terms = Vec::new();
+    for term in [
+        session_name.clone(),
+        first_prompt.clone(),
+        latest_prompt,
+        conversation_summary,
+        model,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        push_search_term(&mut search_terms, term);
+    }
+    let name = session_name
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| directory_name(&cwd));
+    let status = if failed {
+        SessionStatus::Failed
+    } else {
+        SessionStatus::Idle
+    };
+    let summary = SessionSummary {
+        task,
+        status,
+        current_action: activity.back().cloned().unwrap_or_default(),
+        ..SessionSummary::default()
+    };
+
+    Ok(Some(Session {
+        key: Session::stable_key(AgentKind::Pi, &id),
+        provider_session_id: id,
+        name,
+        search_terms,
+        first_prompt,
+        agent: AgentKind::Pi,
+        status,
+        cwd: cwd.clone(),
+        branch: None,
+        transcript_path: Some(path.to_owned()),
+        transcript_modified_at: modified_at,
+        transcript_fingerprint: fingerprint,
+        summary_fingerprint: String::new(),
+        summary_updated_at: None,
+        summary_error: None,
+        summary,
+        recent_activity: activity.into_iter().collect(),
+        pending_decisions: Vec::new(),
+        pending_shell_injection: None,
+        managed_alive: false,
+        unavailable_reason: (!cwd.is_dir()).then(|| "working directory no longer exists".into()),
+        discovered_after_startup: false,
+    }))
+}
+
+/// The session id pi puts in the file name (`<stamp>_<id>.jsonl`), used only until the header
+/// line supplies the authoritative one -- which it always does for a usable session, since a
+/// file with no header has no `cwd` either and is rejected outright.
+///
+/// It still matters: pi splits the name at the last `_`, so an id containing one is truncated
+/// here, and the header is what repairs it.
+fn pi_session_id(path: &Path) -> Option<String> {
+    path.file_stem()
+        .and_then(|value| value.to_str())
+        .and_then(|stem| stem.rsplit_once('_'))
+        .map(|(_, id)| id.to_owned())
+}
+
+fn pi_absorb_message(
+    message: &Value,
+    first_prompt: &mut Option<String>,
+    latest_prompt: &mut Option<String>,
+    task: &mut String,
+    activity: &mut VecDeque<String>,
+    failed: &mut bool,
+) {
+    let content = message.get("content");
+    let text = content_text(content);
+    match message.get("role").and_then(Value::as_str).unwrap_or("") {
+        "user" => {
+            if let Some(text) = user_prompt_text(&text) {
+                first_prompt.get_or_insert_with(|| text.clone());
+                *latest_prompt = Some(text.clone());
+                task.clone_from(&text);
+                push_activity(activity, format!("You: {text}"));
+            }
+        }
+        "assistant" => {
+            if !text.is_empty() {
+                push_activity(activity, format!("Agent: {text}"));
+            }
+            for tool in pi_tool_names(content) {
+                push_activity(activity, format!("Tool: {tool}"));
+            }
+            // `stopReason` is how pi records a turn that died in the provider; the human-facing
+            // reason lives in `errorMessage`, so the activity line says what went wrong rather
+            // than only that something did.
+            if message.get("stopReason").and_then(Value::as_str) == Some("error") {
+                *failed = true;
+                let reason = string_field(message, "errorMessage")
+                    .unwrap_or_else(|| "API request failed".to_owned());
+                push_activity(activity, reason);
+            }
+        }
+        "toolResult" => {
+            if !text.is_empty() {
+                push_activity(activity, format!("Tool result: {text}"));
+            }
+        }
+        "bashExecution" => {
+            if let Some(command) = string_field(message, "command") {
+                push_activity(activity, format!("Shell: {command}"));
+            }
+        }
+        "compactionSummary" | "branchSummary" => {
+            if let Some(summary) = string_field(message, "summary") {
+                push_activity(activity, format!("Summary: {summary}"));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// pi names an assistant's tool calls in `toolCall` content blocks, where Codex and Claude
+/// both use `tool_use`.
+fn pi_tool_names(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("toolCall"))
+        .filter_map(|item| item.get("name").and_then(Value::as_str))
+        .map(clean_text)
+        .collect()
+}
+
 fn bounded_jsonl(path: &Path) -> io::Result<(Vec<String>, String, u64)> {
     let metadata = fs::metadata(path)?;
     let length = metadata.len();
@@ -785,6 +999,20 @@ fn claude_prompt_from_record(value: &Value) -> Option<String> {
     (!has_tool_result)
         .then(|| user_prompt_text(&text))
         .flatten()
+}
+
+/// The first thing a person typed into a pi session. `custom_message` entries are
+/// extension-injected context rather than the user's own words, so only `message` entries
+/// with a `user` role can name the session.
+fn pi_prompt_from_record(value: &Value) -> Option<String> {
+    if value.get("type").and_then(Value::as_str) != Some("message") {
+        return None;
+    }
+    let message = value.get("message")?;
+    if message.get("role").and_then(Value::as_str) != Some("user") {
+        return None;
+    }
+    user_prompt_text(&content_text(message.get("content")))
 }
 
 fn file_modified(path: &Path) -> u64 {
@@ -1041,6 +1269,7 @@ mod tests {
         let sessions = discover(&DiscoveryPaths {
             codex_sessions: root.path().join("codex"),
             claude_projects: root.path().join("claude"),
+            pi_sessions: PathBuf::new(),
         });
         assert_eq!(sessions.len(), 2);
         assert!(sessions.iter().any(|session| {
@@ -1208,6 +1437,7 @@ mod tests {
         let paths = DiscoveryPaths {
             codex_sessions: codex_dir,
             claude_projects: claude_dir,
+            pi_sessions: PathBuf::new(),
         };
         let mut cache = DiscoveryCache::default();
         let first = discover_cached(&paths, &mut cache);
@@ -1440,6 +1670,7 @@ mod tests {
         let sessions = discover(&DiscoveryPaths {
             codex_sessions: codex_home.join("sessions"),
             claude_projects,
+            pi_sessions: PathBuf::new(),
         });
         let session = sessions
             .iter()
@@ -1492,6 +1723,7 @@ mod tests {
         let paths = DiscoveryPaths {
             codex_sessions,
             claude_projects,
+            pi_sessions: PathBuf::new(),
         };
         let mut cache = DiscoveryCache::default();
         let first = discover_cached(&paths, &mut cache);
@@ -1500,6 +1732,168 @@ mod tests {
         fs::write(&database_path, b"not a sqlite database anymore").unwrap();
         let refreshed = discover_cached(&paths, &mut cache);
         assert_eq!(refreshed[0].name, "cached-name");
+    }
+
+    /// Writes one pi transcript under a session root shaped the way pi shapes it, and returns
+    /// both the root to discover from and the file itself.
+    fn pi_transcript(root: &Path, cwd: &Path, id: &str, records: &[Value]) -> (PathBuf, PathBuf) {
+        let sessions = root.join("pi/sessions/--encoded-cwd--");
+        fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join(format!("2026-08-30T00-04-14-153Z_{id}.jsonl"));
+        let mut transcript = fs::File::create(&path).unwrap();
+        writeln!(
+            transcript,
+            "{}",
+            serde_json::json!({
+                "type":"session","version":3,"id":id,
+                "timestamp":"2026-08-30T00:04:14.153Z","cwd":cwd
+            })
+        )
+        .unwrap();
+        for record in records {
+            writeln!(transcript, "{record}").unwrap();
+        }
+        (root.join("pi/sessions"), path)
+    }
+
+    #[test]
+    fn a_pi_transcript_yields_its_name_prompt_activity_and_search_terms() {
+        let root = tempdir().unwrap();
+        let cwd = root.path().join("repo");
+        fs::create_dir(&cwd).unwrap();
+        let id = Uuid::new_v4().to_string();
+        let (sessions_root, path) = pi_transcript(
+            root.path(),
+            &cwd,
+            &id,
+            &[
+                serde_json::json!({
+                    "type":"model_change","id":"aa","parentId":null,
+                    "timestamp":"2026-08-30T00:04:14.188Z",
+                    "provider":"deepseek","modelId":"deepseek-v4-flash"
+                }),
+                serde_json::json!({
+                    "type":"session_info","id":"bb","parentId":"aa",
+                    "timestamp":"2026-08-30T00:04:14.200Z","name":"Wire up pi"
+                }),
+                serde_json::json!({
+                    "type":"message","id":"cc","parentId":"bb",
+                    "timestamp":"2026-08-30T00:04:14.194Z",
+                    "message":{"role":"user","content":[{"type":"text","text":"Add pi support"}]}
+                }),
+                serde_json::json!({
+                    "type":"message","id":"dd","parentId":"cc",
+                    "timestamp":"2026-08-30T00:04:16.039Z",
+                    "message":{"role":"assistant","stopReason":"toolUse","content":[
+                        {"type":"thinking","thinking":"planning"},
+                        {"type":"text","text":"Reading the adapter table"},
+                        {"type":"toolCall","id":"call-1","name":"read",
+                         "arguments":{"path":"src/providers.rs"}}
+                    ]}
+                }),
+                serde_json::json!({
+                    "type":"message","id":"ee","parentId":"dd",
+                    "timestamp":"2026-08-30T00:04:17.000Z",
+                    "message":{"role":"toolResult","toolCallId":"call-1","toolName":"read",
+                        "isError":false,"content":[{"type":"text","text":"const ADAPTERS"}]}
+                }),
+                serde_json::json!({
+                    "type":"message","id":"ff","parentId":"ee",
+                    "timestamp":"2026-08-30T00:04:18.000Z",
+                    "message":{"role":"user","content":[{"type":"text","text":"Now run the tests"}]}
+                }),
+            ],
+        );
+
+        let sessions = discover(&DiscoveryPaths {
+            codex_sessions: root.path().join("codex"),
+            claude_projects: root.path().join("claude"),
+            pi_sessions: sessions_root,
+        });
+        let session = sessions
+            .iter()
+            .find(|session| session.provider_session_id == id)
+            .unwrap();
+        assert_eq!(session.agent, AgentKind::Pi);
+        assert_eq!(session.key, format!("pi:{id}"));
+        assert_eq!(session.name, "Wire up pi");
+        assert_eq!(session.cwd, cwd);
+        assert_eq!(session.transcript_path.as_deref(), Some(path.as_path()));
+        assert_eq!(session.first_prompt.as_deref(), Some("Add pi support"));
+        assert_eq!(session.summary.task, "Now run the tests");
+        assert_eq!(session.list_title(), "Add pi support");
+        assert!(
+            session
+                .recent_activity
+                .iter()
+                .any(|line| line == "Tool: read"),
+            "a pi tool call is named by its `toolCall` block, not by `tool_use`: {:?}",
+            session.recent_activity
+        );
+        assert!(
+            session
+                .recent_activity
+                .iter()
+                .any(|line| line == "Tool result: const ADAPTERS"),
+            "{:?}",
+            session.recent_activity
+        );
+        for term in ["Wire up pi", "Add pi support", "deepseek-v4-flash"] {
+            assert!(
+                session
+                    .search_terms
+                    .iter()
+                    .any(|value| value.eq_ignore_ascii_case(term)),
+                "missing search term {term}: {:?}",
+                session.search_terms
+            );
+        }
+    }
+
+    #[test]
+    fn a_pi_turn_that_died_in_the_provider_reads_as_failed() {
+        let root = tempdir().unwrap();
+        let cwd = root.path().join("repo");
+        fs::create_dir(&cwd).unwrap();
+        let id = Uuid::new_v4().to_string();
+        let (_, path) = pi_transcript(
+            root.path(),
+            &cwd,
+            &id,
+            &[
+                serde_json::json!({
+                    "type":"message","id":"cc","parentId":null,
+                    "timestamp":"2026-08-30T00:04:14.194Z",
+                    "message":{"role":"user","content":[{"type":"text","text":"Summarize"}]}
+                }),
+                serde_json::json!({
+                    "type":"message","id":"dd","parentId":"cc",
+                    "timestamp":"2026-08-30T00:04:16.039Z",
+                    "message":{"role":"assistant","stopReason":"error",
+                        "errorMessage":"deepseek returned 429","content":[]}
+                }),
+            ],
+        );
+
+        let session = parse_pi(&path).unwrap().unwrap();
+        assert_eq!(session.status, SessionStatus::Failed);
+        assert_eq!(
+            session.recent_activity.last().map(String::as_str),
+            Some("deepseek returned 429"),
+            "the reason the turn died is what the dashboard has to show"
+        );
+    }
+
+    #[test]
+    fn a_pi_transcript_without_its_header_is_not_a_session() {
+        let root = tempdir().unwrap();
+        let sessions = root.path().join("pi/sessions/--encoded-cwd--");
+        fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join(format!("2026-08-30T00-04-14-153Z_{}.jsonl", Uuid::new_v4()));
+        // A file that never got its `session` line has no cwd, and a session with no working
+        // directory cannot be resumed or shown.
+        fs::write(&path, "{\"type\":\"message\",\"id\":\"cc\"}\n").unwrap();
+        assert!(parse_pi(&path).unwrap().is_none());
     }
 
     #[test]
@@ -1548,6 +1942,7 @@ mod tests {
         let sessions = discover(&DiscoveryPaths {
             codex_sessions: codex,
             claude_projects: root.path().join("claude"),
+            pi_sessions: PathBuf::new(),
         });
         let session = sessions
             .iter()
@@ -1712,6 +2107,7 @@ mod tests {
         let paths = DiscoveryPaths {
             codex_sessions: root.path().join("codex"),
             claude_projects: root.path().to_owned(),
+            pi_sessions: PathBuf::new(),
         };
         let mut cache = DiscoveryCache::default();
         assert!(discover_cached(&paths, &mut cache).is_empty());
@@ -1795,6 +2191,7 @@ mod tests {
         let sessions = discover(&DiscoveryPaths {
             codex_sessions: codex,
             claude_projects: root.path().join("claude"),
+            pi_sessions: PathBuf::new(),
         });
         let session = sessions
             .iter()
@@ -1829,6 +2226,7 @@ mod tests {
         let sessions = discover(&DiscoveryPaths {
             codex_sessions: codex,
             claude_projects: root.path().join("claude"),
+            pi_sessions: PathBuf::new(),
         });
 
         assert!(sessions.is_empty());

@@ -50,6 +50,12 @@ const ADAPTERS: &[ProviderAdapter] = &[
         parse: discovery::parse_claude_with_cached_prompt,
         enrich: None,
     },
+    ProviderAdapter {
+        kind: AgentKind::Pi,
+        accepts: accepts_pi,
+        parse: discovery::parse_pi_with_cached_prompt,
+        enrich: None,
+    },
 ];
 
 /// Adapters enabled for this process, in table order.
@@ -127,6 +133,39 @@ fn accepts_claude(path: &Path) -> bool {
         && Uuid::parse_str(stem).is_ok()
 }
 
+/// pi names a transcript `<ISO stamp>_<session id>.jsonl`. The stamp is what tells it apart
+/// from a Claude transcript, whose stem is the bare uuid and can therefore never contain `_`.
+///
+/// The id is not necessarily a uuid. `pi --session-id <id>` takes anything matching pi's own
+/// rule, so requiring a uuid here made `pi --session-id review-pass` produce a session no
+/// provider claimed and the dashboard never showed.
+fn accepts_pi(path: &Path) -> bool {
+    if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+        return false;
+    }
+    path.file_stem()
+        .and_then(|name| name.to_str())
+        .and_then(|stem| stem.rsplit_once('_'))
+        .is_some_and(|(stamp, id)| !stamp.is_empty() && is_pi_session_id(id))
+}
+
+/// pi's own validator for a session id, transcribed from its `session-manager`:
+/// `^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$`.
+fn is_pi_session_id(value: &str) -> bool {
+    let ends_are_alphanumeric = || {
+        let mut characters = value.chars();
+        let first = characters.next();
+        let last = characters.next_back().or(first);
+        first.is_some_and(|value| value.is_ascii_alphanumeric())
+            && last.is_some_and(|value| value.is_ascii_alphanumeric())
+    };
+    !value.is_empty()
+        && ends_are_alphanumeric()
+        && value
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '.' | '_' | '-'))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -142,7 +181,7 @@ mod tests {
 
     #[test]
     fn every_agent_kind_has_exactly_one_adapter() {
-        for kind in [AgentKind::Codex, AgentKind::Claude] {
+        for kind in [AgentKind::Codex, AgentKind::Claude, AgentKind::Pi] {
             assert_eq!(
                 ADAPTERS
                     .iter()
@@ -156,24 +195,38 @@ mod tests {
 
     #[test]
     fn an_absent_selection_enables_every_provider() {
-        assert_eq!(kinds(None), [AgentKind::Codex, AgentKind::Claude]);
-        assert_eq!(kinds(Some("   ")), [AgentKind::Codex, AgentKind::Claude]);
+        assert_eq!(
+            kinds(None),
+            [AgentKind::Codex, AgentKind::Claude, AgentKind::Pi]
+        );
+        assert_eq!(
+            kinds(Some("   ")),
+            [AgentKind::Codex, AgentKind::Claude, AgentKind::Pi]
+        );
     }
 
     #[test]
     fn a_selection_retires_the_providers_it_omits() {
         assert_eq!(kinds(Some("codex")), [AgentKind::Codex]);
         assert_eq!(kinds(Some(" CLAUDE ")), [AgentKind::Claude]);
+        assert_eq!(kinds(Some("pi")), [AgentKind::Pi]);
         assert_eq!(
             kinds(Some("claude,codex")),
             [AgentKind::Codex, AgentKind::Claude]
         );
+        assert_eq!(kinds(Some("pi,codex")), [AgentKind::Codex, AgentKind::Pi]);
     }
 
     #[test]
     fn an_unusable_selection_keeps_every_provider_instead_of_showing_nothing() {
-        assert_eq!(kinds(Some("cladue")), [AgentKind::Codex, AgentKind::Claude]);
-        assert_eq!(kinds(Some(",,")), [AgentKind::Codex, AgentKind::Claude]);
+        assert_eq!(
+            kinds(Some("cladue")),
+            [AgentKind::Codex, AgentKind::Claude, AgentKind::Pi]
+        );
+        assert_eq!(
+            kinds(Some(",,")),
+            [AgentKind::Codex, AgentKind::Claude, AgentKind::Pi]
+        );
         assert_eq!(kinds(Some("codex,gemini")), [AgentKind::Codex]);
     }
 
@@ -187,11 +240,40 @@ mod tests {
         let nested_claude_subagent = PathBuf::from(
             "/root/project/session/subagents/nested/0197e9a1-6f42-7c31-9d55-6f0f8b0a1234.jsonl",
         );
+        let pi = PathBuf::from(
+            "/root/--Users-me-repo--/2026-08-30T00-04-14-153Z_0197e9a1-6f42-7c31-9d55-6f0f8b0a1234.jsonl",
+        );
         let other = PathBuf::from("/root/project/notes.jsonl");
 
         assert!(accepts_codex(&codex));
         assert!(!accepts_codex(&claude));
         assert!(accepts_claude(&claude));
+        // A pi transcript is a stamp and a uuid; a Claude one is a bare uuid. Neither adapter
+        // may claim the other's file, or one provider's sessions land under the other's name.
+        assert!(accepts_pi(&pi));
+        assert!(!accepts_pi(&claude));
+        assert!(!accepts_pi(&codex));
+        assert!(!accepts_pi(&other));
+        assert!(!accepts_claude(&pi));
+        assert!(!accepts_codex(&pi));
+
+        // `pi --session-id <id>` takes anything matching pi's own rule, not just a uuid.
+        // Requiring one here left those sessions claimed by no provider at all.
+        let named =
+            PathBuf::from("/root/--Users-me-repo--/2026-08-30T00-04-14-153Z_review-pass.jsonl");
+        let dotted = PathBuf::from("/root/--Users-me-repo--/2026-08-30T00-04-14-153Z_v2.1.jsonl");
+        let single = PathBuf::from("/root/--Users-me-repo--/2026-08-30T00-04-14-153Z_a.jsonl");
+        assert!(accepts_pi(&named));
+        assert!(accepts_pi(&dotted));
+        assert!(accepts_pi(&single));
+        // A trailing separator is not a pi id, and a stem with no `_` is not a pi transcript.
+        assert!(!accepts_pi(&PathBuf::from(
+            "/root/x/2026-08-30T00-04-14-153Z_-bad.jsonl"
+        )));
+        assert!(!accepts_pi(&PathBuf::from(
+            "/root/x/2026-08-30T00-04-14-153Z_bad-.jsonl"
+        )));
+        assert!(!accepts_pi(&PathBuf::from("/root/x/nounderscore.jsonl")));
         assert!(!accepts_claude(&claude_subagent));
         assert!(!accepts_claude(&nested_claude_subagent));
         assert!(!accepts_claude(&codex));

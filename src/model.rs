@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 pub enum AgentKind {
     Claude,
     Codex,
+    Pi,
 }
 
 impl AgentKind {
@@ -18,6 +19,7 @@ impl AgentKind {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Pi => "pi",
         }
     }
 
@@ -25,6 +27,7 @@ impl AgentKind {
         match self {
             Self::Claude => "Cla",
             Self::Codex => "Cdx",
+            Self::Pi => "Pi",
         }
     }
 }

@@ -767,3 +767,207 @@ fn every_page_reports_both_edges_so_a_client_can_walk_either_way() {
         "the two edges of a non-empty page are different offsets"
     );
 }
+
+fn pi_page(records: &[serde_json::Value]) -> MessagePage {
+    let (_root, path) = transcript("2026-08-30T00-04-14-153Z_session.jsonl", records);
+    read_page(&path, AgentKind::Pi, Position::Tail, DEFAULT_LIMIT).unwrap()
+}
+
+#[test]
+fn a_pi_assistant_turn_keeps_thinking_text_and_tool_calls_in_order() {
+    let page = pi_page(&[json!({
+        "type": "message",
+        "id": "8ef03f8e",
+        "parentId": "df299118",
+        "timestamp": "2026-08-30T00:04:16.039Z",
+        "message": {"role": "assistant", "provider": "deepseek", "model": "deepseek-v4-flash",
+            "stopReason": "toolUse", "content": [
+            {"type": "thinking", "thinking": "the test is flaky",
+             "thinkingSignature": "reasoning_content"},
+            {"type": "text", "text": "I'll run the suite first."},
+            {"type": "toolCall", "id": "call_1", "name": "bash",
+             "arguments": {"command": "cargo test --locked"}}
+        ]}
+    })]);
+
+    let message = &page.messages[0];
+    assert_eq!(message.id, "8ef03f8e");
+    assert_eq!(message.role, Role::Assistant);
+    assert_eq!(message.ts, 1_788_048_256);
+    assert_eq!(
+        message.blocks,
+        vec![
+            Block::Thinking {
+                text: "the test is flaky".into()
+            },
+            Block::Text {
+                text: "I'll run the suite first.".into()
+            },
+            Block::ToolUse {
+                id: "call_1".into(),
+                name: "bash".into(),
+                summary: "cargo test --locked".into()
+            },
+        ]
+    );
+}
+
+/// pi answers a tool call with a `toolResult` message of its own rather than folding the
+/// answer into the next user turn, which is what lets the block carry the id of the call it
+/// answers without the reader pairing them up itself.
+#[test]
+fn a_pi_tool_result_is_its_own_message_and_names_the_call_it_answers() {
+    let page = pi_page(&[json!({
+        "type": "message",
+        "id": "c3d4e5f6",
+        "parentId": "8ef03f8e",
+        "timestamp": "2026-08-30T00:04:17.000Z",
+        "message": {"role": "toolResult", "toolCallId": "call_1", "toolName": "bash",
+            "isError": true, "content": [{"type": "text", "text": "1 test failed"}]}
+    })]);
+
+    assert_eq!(
+        page.messages[0].blocks,
+        vec![Block::ToolResult {
+            tool_use_id: "call_1".into(),
+            ok: false,
+            summary: "1 test failed".into()
+        }]
+    );
+}
+
+/// `!command` runs outside the model. Showing it as the command plus its output, rather than
+/// as a tool the assistant chose, is the difference between reading the transcript as what
+/// happened and reading it as what the agent decided.
+#[test]
+fn a_pi_user_bash_line_reads_as_a_command_and_its_output() {
+    let page = pi_page(&[json!({
+        "type": "message",
+        "id": "b1",
+        "parentId": null,
+        "timestamp": "2026-08-30T00:04:18.000Z",
+        "message": {"role": "bashExecution", "command": "git status --short",
+            "output": " M src/pty.rs", "exitCode": 0, "cancelled": false, "truncated": false}
+    })]);
+
+    assert_eq!(
+        page.messages[0].blocks,
+        vec![
+            Block::Text {
+                text: "!git status --short".into()
+            },
+            Block::ToolResult {
+                tool_use_id: String::new(),
+                ok: true,
+                summary: " M src/pty.rs".trim().into()
+            },
+        ]
+    );
+}
+
+/// Entry types that are pi's own bookkeeping never reach the conversation: nobody typed them
+/// and nobody read them.
+#[test]
+fn pi_bookkeeping_entries_stay_out_of_the_conversation() {
+    let page = pi_page(&[
+        json!({"type": "session", "version": 3, "id": "uuid",
+               "timestamp": "2026-08-30T00:04:14.153Z", "cwd": "/repo"}),
+        json!({"type": "model_change", "id": "aa", "parentId": null,
+               "timestamp": "2026-08-30T00:04:14.188Z",
+               "provider": "deepseek", "modelId": "deepseek-v4-flash"}),
+        json!({"type": "thinking_level_change", "id": "bb", "parentId": "aa",
+               "timestamp": "2026-08-30T00:04:14.188Z", "thinkingLevel": "high"}),
+        json!({"type": "label", "id": "cc", "parentId": "bb",
+               "timestamp": "2026-08-30T00:04:14.200Z",
+               "targetId": "aa", "label": "checkpoint-1"}),
+        json!({"type": "session_info", "id": "dd", "parentId": "cc",
+               "timestamp": "2026-08-30T00:04:14.200Z", "name": "Wire up pi"}),
+        json!({"type": "custom", "id": "ee", "parentId": "dd",
+               "timestamp": "2026-08-30T00:04:14.300Z",
+               "customType": "my-extension", "data": {"count": 42}}),
+        json!({"type": "message", "id": "ff", "parentId": "ee",
+               "timestamp": "2026-08-30T00:04:14.400Z",
+               "message": {"role": "user", "content": [{"type": "text", "text": "Add pi"}]}}),
+    ]);
+
+    assert_eq!(page.messages.len(), 1);
+    assert_eq!(page.messages[0].id, "ff");
+    assert_eq!(page.messages[0].role, Role::User);
+}
+
+/// `/tree` moves the leaf onto another branch and attaches a summary of the one it left. That
+/// branch is not in this file's history above the entry, so the summary is context the reader
+/// has no other way to get -- unlike a compaction, which only restates what is already there.
+#[test]
+fn a_pi_branch_summary_is_shown_where_a_compaction_would_be_suppressed() {
+    let page = pi_page(&[
+        json!({"type": "message", "id": "u1", "parentId": null,
+               "timestamp": "2026-08-30T00:40:01.000Z",
+               "message": {"role": "user", "content": [{"type": "text", "text": "Try approach A"}]}}),
+        json!({"type": "compaction", "id": "k1", "parentId": "u1",
+               "timestamp": "2026-08-30T00:40:03.000Z",
+               "summary": "Condensed: approach A was explored.", "tokensBefore": 50000}),
+        json!({"type": "branch_summary", "id": "g1", "parentId": "k1",
+               "timestamp": "2026-08-30T00:40:08.000Z", "fromId": "u1",
+               "summary": "The abandoned branch tried a fixed delay."}),
+    ]);
+
+    let rendered = page
+        .messages
+        .iter()
+        .map(|message| (message.id.as_str(), &message.blocks))
+        .collect::<Vec<_>>();
+    assert_eq!(rendered.len(), 2, "{rendered:?}");
+    assert_eq!(rendered[0].0, "u1");
+    assert_eq!(
+        rendered[1],
+        (
+            "g1",
+            &vec![Block::Text {
+                text: "The abandoned branch tried a fixed delay.".into()
+            }]
+        )
+    );
+}
+
+/// pi leaves `exitCode` out entirely when a command is cancelled or killed, so treating an
+/// absent one as zero reported a killed command as a success.
+#[test]
+fn a_cancelled_pi_shell_command_does_not_read_as_a_success() {
+    let cancelled = pi_page(&[json!({
+        "type": "message", "id": "b1", "parentId": null,
+        "timestamp": "2026-08-30T00:04:18.000Z",
+        "message": {"role": "bashExecution", "command": "sleep 100",
+            "output": "", "cancelled": true, "truncated": false}
+    })]);
+    assert_eq!(
+        cancelled.messages[0].blocks[1],
+        Block::ToolResult {
+            tool_use_id: String::new(),
+            ok: false,
+            summary: String::new()
+        }
+    );
+
+    let failed = pi_page(&[json!({
+        "type": "message", "id": "b2", "parentId": null,
+        "timestamp": "2026-08-30T00:04:19.000Z",
+        "message": {"role": "bashExecution", "command": "false",
+            "output": "", "exitCode": 1, "cancelled": false, "truncated": false}
+    })]);
+    assert!(matches!(
+        failed.messages[0].blocks[1],
+        Block::ToolResult { ok: false, .. }
+    ));
+
+    let ok = pi_page(&[json!({
+        "type": "message", "id": "b3", "parentId": null,
+        "timestamp": "2026-08-30T00:04:20.000Z",
+        "message": {"role": "bashExecution", "command": "true",
+            "output": "done", "exitCode": 0, "cancelled": false, "truncated": false}
+    })]);
+    assert!(matches!(
+        ok.messages[0].blocks[1],
+        Block::ToolResult { ok: true, .. }
+    ));
+}

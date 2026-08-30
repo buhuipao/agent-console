@@ -6,11 +6,16 @@ The supported floor and the versions exercised for this release are:
 | --- | ---: | --- | --- |
 | Codex CLI | 0.100.0 | 0.100.0, 0.144.5 | 0.144.5 |
 | Claude Code | 2.0.0 | 2.0.0, 2.1.214 | 2.1.214 |
+| pi | 0.84.0 | — | 0.84.4 |
 
 Compatibility means the provider exposes the resume and hook-configuration
 flags used by the native session command and the non-persistent structured
 output flags used by the same-provider summary command. `doctor` checks these
 contracts from provider help output instead of invoking a model.
+
+pi has no contract fixtures yet: its floor was set from the oldest release
+verified by hand against this console, and `doctor` still checks its help output
+for the same flags the session and summary commands use.
 
 `tests/e2e/provider_compatibility.sh` covers every fixture pair. The fixtures
 model the CLI contract rather than provider rendering, which remains owned by

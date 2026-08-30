@@ -104,6 +104,7 @@ const WORKSPACE_ACTIONS: &[&str] = &[
 struct ProviderConfig {
     codex: Option<Vec<String>>,
     claude: Option<Vec<String>>,
+    pi: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -176,6 +177,7 @@ impl AgentConsoleConfig {
         let configured = match provider {
             AgentKind::Codex => self.providers.codex.as_deref(),
             AgentKind::Claude => self.providers.claude.as_deref(),
+            AgentKind::Pi => self.providers.pi.as_deref(),
         };
         if let Some([name]) = configured
             && is_shell_name(name)
@@ -360,6 +362,7 @@ impl AgentConsoleConfig {
         for (name, command) in [
             ("codex", config.providers.codex.as_ref()),
             ("claude", config.providers.claude.as_ref()),
+            ("pi", config.providers.pi.as_ref()),
         ] {
             if command.is_some_and(Vec::is_empty) {
                 return Err(io::Error::new(

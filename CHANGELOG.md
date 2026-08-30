@@ -2,6 +2,46 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0] - 2026-08-30
+
+### Added
+- Support [pi](https://github.com/earendil-works/pi) as a third provider, on the
+  same footing as Codex and Claude Code: its sessions are discovered from
+  `~/.pi/agent/sessions` (or `PI_CODING_AGENT_DIR`), listed and grouped by
+  workspace, resumed in place, summarised by pi itself, and rendered in the web
+  conversation view. `AGENT_CONSOLE_PROVIDERS=pi` and `[providers] pi = [...]`
+  work as they do for the other two.
+- Report pi progress through a generated pi extension. pi has no hook commands --
+  extensions are TypeScript loaded with `-e` -- so the console writes one into its
+  state directory and forwards session, prompt, tool, and turn events to
+  `agent-console hook pi`. Its child processes are detached, because
+  `session_shutdown` fires while pi is exiting and a hook still in pi's process
+  group is killed before it can report the session ended. A bridge that cannot be
+  written costs the session its live status, not its start.
+- Launch pi with `--tui-mode regular`, for the same reason Codex gets
+  `--no-alt-screen` and Claude Code gets `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN`:
+  pi's experimental fullscreen mode takes the alternate screen, where neither the
+  dashboard nor a browser has any history to scroll back through.
+- Resume and create pi sessions through one flag. `pi --session-id <id>` reopens
+  the session when the file exists and creates it with that id when it does not,
+  so the console's own id stays authoritative and `--name` is only passed when the
+  session is new -- a reattach must not overwrite a name set with `/name`.
+
+### Fixed
+- Walk the new-session provider field in the direction its arrow points. `< codex >`
+  is drawn with an arrow on each side, and with two providers it made no difference
+  which one was pressed; with three, Left has to go back.
+
+### Known limitations
+- A pi session never reports `waiting`. Codex and Claude Code raise an approval event
+  the console turns into a pending decision; pi ships no permission prompts at all,
+  so there is nothing to raise. A pi session blocked on its own "trust project
+  folder?" dialog therefore reads as idle in the web UI -- answer it from the
+  Agent TUI tab, which shows pi's own screen.
+- pi status reporting needs a POSIX shell. The generated bridge spawns `sh -c`, so on
+  Windows it silently reports nothing and the session runs without live status.
+  Codex and Claude Code are unaffected: their own hook runners execute the command.
+
 ## [0.1.0] - 2026-08-25
 
 ### Added

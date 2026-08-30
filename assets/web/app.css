@@ -362,6 +362,11 @@ a {
   border-color: #2f4364;
 }
 
+.agent-badge.pi {
+  color: #93c572;
+  border-color: #3a512c;
+}
+
 .toast {
   position: fixed;
   left: 50%;

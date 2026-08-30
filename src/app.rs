@@ -1510,7 +1510,7 @@ impl RuntimeState {
                 selected_row = lines.len();
             }
             lines.push(format!(
-                "{}{} {} {}",
+                "{}{} {:<3} {}",
                 if archived { "⌁" } else { "" },
                 workspace_status_symbol(session.status),
                 session.agent.short_label(),
@@ -2086,6 +2086,7 @@ impl App {
                 discovery_paths: DiscoveryPaths {
                     codex_sessions: root.join("codex"),
                     claude_projects: root.join("claude"),
+                    pi_sessions: PathBuf::new(),
                 },
                 discovery_worker: DiscoveryWorker::start(DiscoveryCache::default()).unwrap(),
                 last_discovery: Instant::now(),
@@ -2231,6 +2232,7 @@ mod tests {
                 discovery_paths: DiscoveryPaths {
                     codex_sessions: codex,
                     claude_projects: claude,
+                    pi_sessions: PathBuf::new(),
                 },
                 discovery_worker: DiscoveryWorker::start(DiscoveryCache::default()).unwrap(),
                 last_discovery: Instant::now(),
@@ -2886,6 +2888,7 @@ mod tests {
         app.runtime.discovery_paths = DiscoveryPaths {
             codex_sessions,
             claude_projects: root.path().join("claude"),
+            pi_sessions: PathBuf::new(),
         };
         let alive = HashSet::from(["codex:provisional-id".to_owned()]);
 
@@ -2926,6 +2929,7 @@ mod tests {
         app.runtime.discovery_paths = DiscoveryPaths {
             codex_sessions,
             claude_projects: root.path().join("claude"),
+            pi_sessions: PathBuf::new(),
         };
 
         app.runtime.refresh_now(&HashSet::new());
@@ -2960,6 +2964,7 @@ mod tests {
         app.runtime.discovery_paths = DiscoveryPaths {
             codex_sessions,
             claude_projects: root.path().join("claude"),
+            pi_sessions: PathBuf::new(),
         };
 
         app.runtime.refresh_now(&HashSet::new());

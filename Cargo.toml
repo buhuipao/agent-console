@@ -1,12 +1,14 @@
 [package]
 name = "agent-console"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "Local terminal dashboard for Codex and Claude Code sessions."
+description = "Local terminal dashboard for Codex, Claude Code, and pi sessions."
 repository = "https://github.com/buhuipao/agent-console"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 keywords = ["cli", "tui", "codex", "claude", "agent"]
+# "pi" is deliberately left out of `keywords`: crates.io allows five, and a
+# two-letter term is not what anyone searches for.
 categories = ["command-line-utilities", "development-tools"]
 exclude = ["docs/assets/*", "tests/fixtures/*", "target/*"]
 

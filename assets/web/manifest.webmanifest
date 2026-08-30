@@ -1,7 +1,7 @@
 {
   "name": "Agent Console",
   "short_name": "Agent Console",
-  "description": "Drive Codex and Claude Code agent sessions from a phone or desktop browser.",
+  "description": "Drive Codex, Claude Code and pi agent sessions from a phone or desktop browser.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

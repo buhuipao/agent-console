@@ -82,6 +82,14 @@ pub fn check_provider_capability(
             &["--help"],
             &["--print", "--output-format", "--json-schema"],
         ),
+        // pi resumes by id rather than by subcommand, reports progress through extensions
+        // rather than hook commands, and summarizes through its non-interactive print mode.
+        (AgentKind::Pi, ProviderCapability::Resume) => (&["--help"], &["--session-id"]),
+        (AgentKind::Pi, ProviderCapability::Hooks) => (&["--help"], &["--extension"]),
+        (AgentKind::Pi, ProviderCapability::Summary) => (
+            &["--help"],
+            &["--print", "--append-system-prompt", "--no-tools"],
+        ),
     };
     let invocation = config.provider_command(provider, arguments);
     let output = match command_output(Command::new(invocation.program).args(invocation.args)) {
@@ -228,6 +236,7 @@ pub fn report() -> io::Result<DoctorReport> {
             [
                 (AgentKind::Codex, "Codex sessions", paths.codex_sessions),
                 (AgentKind::Claude, "Claude projects", paths.claude_projects),
+                (AgentKind::Pi, "pi sessions", paths.pi_sessions),
             ]
             .into_iter()
             .filter(|(kind, _, _)| providers::is_enabled(*kind))
@@ -269,6 +278,9 @@ pub fn version_support(provider: AgentKind, version: &str) -> VersionSupport {
     let minimum = match provider {
         AgentKind::Codex => (0, 100),
         AgentKind::Claude => (2, 0),
+        // The oldest pi verified against this console. `--session-id`, `--tui-mode`, and the
+        // extension events the hook bridge subscribes to all exist here.
+        AgentKind::Pi => (0, 84),
     };
     if (major, minor) >= minimum {
         VersionSupport::Supported

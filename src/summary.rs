@@ -176,6 +176,17 @@ pub fn build_prompt(previous: &SessionSummary, records: &[String]) -> String {
     format!("{prefix}{records}\n")
 }
 
+/// What pi is told instead of a schema flag. It has to carry both the shape and the demand for
+/// a bare object, because `structured_value` recovers the answer from the last stdout line that
+/// looks like JSON and a fenced block or a sentence of preamble would defeat it.
+fn pi_summary_instruction() -> String {
+    format!(
+        "Reply with exactly one line containing only a JSON object matching this JSON Schema. \
+         No prose, no explanation, no markdown code fence.\n{}",
+        summary_schema()
+    )
+}
+
 fn command_for(
     config: &AgentConsoleConfig,
     provider: AgentKind,
@@ -207,6 +218,22 @@ fn command_for(
             "json".into(),
             "--json-schema".into(),
             summary_schema().to_string(),
+        ],
+        // pi has no schema flag, so the schema rides in the system prompt and the answer is
+        // recovered from stdout. Every discovery switch is turned off explicitly: the
+        // summarizer must not load the user's extensions, skills, or AGENTS.md, and must not
+        // leave a session file behind for the dashboard to then list as real work.
+        AgentKind::Pi => vec![
+            "--print".into(),
+            "--no-session".into(),
+            "--no-tools".into(),
+            "--no-extensions".into(),
+            "--no-skills".into(),
+            "--no-prompt-templates".into(),
+            "--no-context-files".into(),
+            "--no-approve".into(),
+            "--append-system-prompt".into(),
+            pi_summary_instruction(),
         ],
     };
     args.push(prompt.to_owned());
@@ -342,7 +369,10 @@ fn parse_output(provider: AgentKind, bytes: &[u8]) -> Result<SessionSummary, Str
     let value =
         structured_value(bytes).ok_or_else(|| "summarizer returned no JSON object".to_owned())?;
     let structured = match provider {
-        AgentKind::Codex => value,
+        // Both answer with the object itself: Codex because `--output-schema` makes it the
+        // whole of stdout, pi because the system prompt asked for one JSON line and nothing
+        // else.
+        AgentKind::Codex | AgentKind::Pi => value,
         AgentKind::Claude => {
             if let Some(value) = value.get("structured_output") {
                 value.clone()

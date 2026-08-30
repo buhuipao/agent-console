@@ -1,6 +1,6 @@
 # Agent Console
 
-Agent Console is a local terminal dashboard for Codex and Claude Code. It
+Agent Console is a local terminal dashboard for Codex, Claude Code, and pi. It
 discovers recent sessions, shows their current state, resumes the native agent
 UI, and keeps same-workspace shells beside each agent.
 
@@ -8,13 +8,13 @@ UI, and keeps same-workspace shells beside each agent.
 the session waiting on an approval, searching across workspaces, and opening a
 shell in the session's own directory](docs/assets/demo.gif)
 
-Twenty sessions across seven workspaces, both providers in one list. A session
+Twenty sessions across seven workspaces, every provider in one list. A session
 stops for an approval, the dashboard raises an alert, and `a` jumps straight to
 it. `s` opens a shell in that session's own directory, beside the agent.
 
 ## What it provides
 
-- Codex and Claude Code sessions grouped by workspace
+- Codex, Claude Code, and pi sessions grouped by workspace
 - Working, waiting, idle, and failed status at a glance
 - Same-provider progress summaries
 - Native agent resume instead of a replacement chat UI
@@ -28,7 +28,7 @@ it. `s` opens a shell in that session's own directory, beside the agent.
 ## Requirements
 
 - macOS, Linux, or Windows 10+
-- `codex` and/or `claude` available on `PATH`
+- `codex`, `claude`, and/or `pi` available on `PATH`
 - A terminal with ANSI and mouse support
 
 ## Install
@@ -182,11 +182,13 @@ Alerts live in memory and start empty after a restart -- "what happened since I
 last looked" reaches back only as far as the running process.
 
 A program that takes the alternate screen (`vim`, `less`) has no scrollback to
-recover, in the browser or the dashboard -- so neither agent is allowed to take it.
+recover, in the browser or the dashboard -- so no agent is allowed to take it.
 Codex is asked with `--no-alt-screen`; Claude Code's switch is an environment
-variable, `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN`, which the console sets for it.
-Set that variable yourself and your choice is kept, including turning it off -- at
-the cost of an Agent TUI tab that shows the current screen and nothing above it.
+variable, `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN`, which the console sets for it;
+pi is launched with `--tui-mode regular` so a saved `tuiMode: "fullscreen"` does
+not take the history away. Set the Claude variable yourself and your choice is
+kept, including turning it off -- at the cost of an Agent TUI tab that shows the
+current screen and nothing above it.
 
 The same session can be open in several places at once -- a desktop browser, a
 phone, the dashboard's own workspace -- and they share one PTY, which has one size.
@@ -210,9 +212,10 @@ proxy, environment variables, or fixed arguments:
 [providers]
 codex = ["proxychains4", "codex"]
 claude = ["env", "HTTPS_PROXY=http://127.0.0.1:7890", "claude"]
+pi = ["env", "DEEPSEEK_API_KEY=sk-...", "pi"]
 ```
 
-Missing entries use `codex` or `claude` directly. The configured command is
+Missing entries use `codex`, `claude`, or `pi` directly. The configured command is
 also used by that provider's isolated summarizer. Set
 `AGENT_CONSOLE_CONFIG=/path/to/config.toml` to use another file.
 
@@ -324,6 +327,14 @@ overridden in the configuration file.
   pane to retain and scroll the transcript in every Codex state.
 - Codex fork-subagent and Claude sidechain transcripts are excluded from
   Sessions; only primary sessions are discovered and tracked.
+- pi has no hook commands, so the console generates a small pi extension under
+  its state directory and launches pi with `-e`. It forwards session, prompt,
+  tool, and turn events to `agent-console hook pi` and nothing else. If it
+  cannot be written the session still starts; it just reports no live status.
+- pi is resumed with `--session-id`, which creates the session when the id is
+  new and reopens it when it is not. `/new`, `/resume`, `/fork`, and `/clone`
+  move pi to a different session file; the console keeps its own entry and
+  discovers the new one as a session of its own.
 - Each managed pane retains up to 2,000 scrollback rows. The separate 128 KiB
   daemon replay tail is a reconnect transport bound; crossing it does not stop
   the process or discard Codex's retained viewport rows.

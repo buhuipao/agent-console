@@ -84,6 +84,7 @@ pub(crate) fn parser_for(agent: AgentKind) -> LineParser {
     match agent {
         AgentKind::Claude => super::claude::parse_line,
         AgentKind::Codex => super::codex::parse_line,
+        AgentKind::Pi => super::pi::parse_line,
     }
 }
 

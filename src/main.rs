@@ -247,10 +247,11 @@ fn run_hook(provider: Option<String>) -> io::Result<()> {
     let provider = match provider.as_deref() {
         Some("codex") => AgentKind::Codex,
         Some("claude") => AgentKind::Claude,
+        Some("pi") => AgentKind::Pi,
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "hook provider must be codex or claude",
+                "hook provider must be codex, claude, or pi",
             ));
         }
     };
@@ -305,7 +306,7 @@ fn run_doctor() -> io::Result<()> {
     if !report.providers.iter().any(|provider| provider.available) {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "neither codex nor claude is available",
+            "no supported agent CLI is available",
         ));
     }
     if report.failures > 0 {
@@ -687,16 +688,29 @@ fn handle_dialog_key(
                 accept_workspace_completion(dialog);
             }
         }
+        // `< codex >` is drawn with an arrow on each side, so each one has to walk its own
+        // way round the ring. With two providers the direction made no difference; with three
+        // it does, and Left going forwards would contradict the control it is drawn under.
         KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l')
             if app
                 .dialog
                 .as_ref()
                 .is_some_and(|dialog| dialog.field == DialogField::Provider) =>
         {
+            let forwards = matches!(key, KeyCode::Right | KeyCode::Char('l'));
             if let Some(dialog) = &mut app.dialog {
-                dialog.provider = match dialog.provider {
-                    AgentKind::Codex => AgentKind::Claude,
-                    AgentKind::Claude => AgentKind::Codex,
+                dialog.provider = if forwards {
+                    match dialog.provider {
+                        AgentKind::Codex => AgentKind::Claude,
+                        AgentKind::Claude => AgentKind::Pi,
+                        AgentKind::Pi => AgentKind::Codex,
+                    }
+                } else {
+                    match dialog.provider {
+                        AgentKind::Codex => AgentKind::Pi,
+                        AgentKind::Claude => AgentKind::Codex,
+                        AgentKind::Pi => AgentKind::Claude,
+                    }
                 };
             }
         }
@@ -1078,7 +1092,7 @@ fn draw_sessions(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled(if selected { "▸" } else { " " }, base.fg(Color::White)),
             Span::styled(format!("{symbol} "), base.fg(color)),
             Span::styled(
-                format!("{} ", session.agent.short_label()),
+                format!("{:<3} ", session.agent.short_label()),
                 base.fg(agent_color(session.agent)),
             ),
             Span::styled(
@@ -1829,6 +1843,7 @@ fn agent_color(agent: AgentKind) -> Color {
     match agent {
         AgentKind::Claude => Color::Rgb(219, 126, 82),
         AgentKind::Codex => Color::Cyan,
+        AgentKind::Pi => Color::Rgb(147, 197, 114),
     }
 }
 
@@ -1859,6 +1874,25 @@ mod tests {
         assert_eq!(span.content.as_ref(), "[q]");
         assert_ne!(span.style.fg, Some(Color::Black));
         assert_eq!(span.style.bg, None);
+    }
+
+    /// The field is drawn as `< codex >`, one arrow per direction. Each arrow has to walk its
+    /// own way round the ring, or the control lies about what it does.
+    #[test]
+    fn the_provider_arrows_walk_the_ring_in_opposite_directions() {
+        let mut app = App::test_fixture();
+        app.open_new_dialog();
+        let provider = |app: &App| app.dialog.as_ref().unwrap().provider;
+        assert_eq!(provider(&app), AgentKind::Codex);
+
+        for expected in [AgentKind::Claude, AgentKind::Pi, AgentKind::Codex] {
+            handle_dialog_key(&mut app, KeyCode::Right, std::path::Path::new("/tmp/ac")).unwrap();
+            assert_eq!(provider(&app), expected);
+        }
+        for expected in [AgentKind::Pi, AgentKind::Claude, AgentKind::Codex] {
+            handle_dialog_key(&mut app, KeyCode::Left, std::path::Path::new("/tmp/ac")).unwrap();
+            assert_eq!(provider(&app), expected);
+        }
     }
 
     #[test]

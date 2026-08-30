@@ -15,7 +15,7 @@ document wins.
 
 Build one local terminal application that can:
 
-1. Discover recent persisted Codex and Claude Code sessions.
+1. Discover recent persisted Codex, Claude Code, and pi sessions.
 2. Show each session's provider, working directory, task summary, activity,
    status, and decisions that need the user.
 3. Resume a persisted session in the provider's native terminal UI.
@@ -40,7 +40,7 @@ knows that its managed child is alive.
 ## 3. Supported environment
 
 - Windows 10+, macOS, and Unix-like terminals.
-- `codex` and/or `claude` available on `PATH`.
+- `codex`, `claude`, and/or `pi` available on `PATH`.
 - Rust stable with edition 2024.
 - No tmux dependency.
 - Clipboard integration uses `pbcopy` on macOS, `clip.exe` on Windows, and
@@ -77,6 +77,7 @@ state.db                    SQLite session cache, metadata, event cursors/index.
 state.json                  One-time legacy migration input only.
 events/<provider>-<id>.jsonl[.1]  Two bounded hook/event generations.
 summary-schema.json         Schema passed to non-interactive summarizers.
+pi-hooks.mts                Generated pi extension bridging its events to `hook pi`.
 agent-console.log           Current diagnostics; three rotated generations.
 ```
 
@@ -106,6 +107,7 @@ from the path in `AGENT_CONSOLE_CONFIG` when set:
 [providers]
 codex = ["proxychains4", "codex"]
 claude = ["env", "HTTPS_PROXY=http://127.0.0.1:7890", "claude"]
+pi = ["env", "DEEPSEEK_API_KEY=sk-...", "pi"]
 ```
 
 There is one optional command per provider and no provider-profile layer.
@@ -166,7 +168,7 @@ Use this stable key:
 <provider>:<provider-session-id>
 ```
 
-`provider` is exactly `codex` or `claude`.
+`provider` is exactly `codex`, `claude`, or `pi`.
 
 Each session record contains:
 
@@ -279,7 +281,44 @@ claude --session-id <new UUID> --name <directory name>
 
 Run it with process cwd set to the selected cwd.
 
-### 7.3 Refresh
+### 7.3 pi
+
+Scan `$PI_CODING_AGENT_DIR/sessions`, or `~/.pi/agent/sessions` when the variable
+is unset, for `<ISO stamp>_<uuid>.jsonl` transcripts. The stamp is what tells a pi
+transcript apart from a Claude one, whose stem is the bare uuid. Sort by
+modification time descending and inspect at most the newest 60 files. Reuse parsed
+results while file metadata is unchanged.
+
+Read the session id and `cwd` from the first `session` header line and the display
+name from the newest `session_info` entry. pi stores a conversation tree, and
+`/tree` can move the leaf back onto an earlier branch; read the file in write order
+rather than walking the branch, as the Codex and Claude readers do with their own
+transcripts. Take user prompts, assistant text, `toolCall` names, `toolResult`
+text, `bashExecution` commands, and compaction and branch summaries as activity. An
+assistant message with `stopReason = "error"` marks the session failed and its
+`errorMessage` is the activity line.
+
+Resume and new command are the same, because `--session-id` reopens the session
+when the file exists and creates it with that id when it does not:
+
+```text
+pi --tui-mode regular --session-id <provider-session-id> -e <hook extension>
+```
+
+A new session additionally passes `--name <directory name>`. A resume must not, or
+it overwrites a name the user set with `/name`. Run it with process cwd set to the
+session cwd.
+
+pi has no hook commands. The console writes a pi extension into its state
+directory and passes it with `-e`; the extension forwards `session_start`,
+`before_agent_start`, `tool_execution_start`, `tool_execution_end`, `user_bash`,
+`agent_settled`, and `session_shutdown` to `agent-console hook pi` as the same JSON
+hook payload the other providers send. Its child processes are detached:
+`session_shutdown` fires while pi is exiting, and a child still in pi's process
+group is killed before it can report the session ended. An extension that cannot be
+written is recorded in diagnostics and the session starts without it.
+
+### 7.4 Refresh
 
 - Perform discovery on startup.
 - Display at most the 50 most recently modified sessions from the last seven
@@ -327,7 +366,7 @@ Use `portable-pty` to launch agent and shell children. Each selected session can
 own one agent terminal and multiple shell terminals:
 
 ```text
-agent PTY: codex or claude native TUI
+agent PTY: codex, claude, or pi native TUI
 shell PTYs: zero or more $SHELL -l children, each with cwd set to the session cwd
 ```
 
@@ -344,11 +383,13 @@ Entering a workspace:
    reveal or redraw the Dashboard as an intermediate frame.
 2. Keep the session list visible on the left. A two-line summary immediately
    below its heading continuously shows working, waiting, idle, and failed
-   totals using the Dashboard status colors. Its `Cdx` and `Cla` labels use the
-   same provider colors as the Dashboard.
+   totals using the Dashboard status colors. Its `Cdx`, `Cla`, and `Pi` labels use
+   the same provider colors as the Dashboard, padded to a common width so the
+   columns beside them line up.
 3. Render the agent PTY in the upper-right pane.
-   Launch Codex with `--no-alt-screen` so its transcript becomes retained pane
-   history instead of an application-private alternate-screen page.
+   Launch Codex with `--no-alt-screen` and pi with `--tui-mode regular` so their
+   transcripts become retained pane history instead of an application-private
+   alternate-screen page.
 4. Render up to three shell PTYs side by side in the lower-right pane and all
    shell identities in a list at the far right.
 5. Resize each visible child PTY to its pane.
@@ -530,6 +571,16 @@ claude --safe-mode --print --tools "" --no-session-persistence
   --output-format json --json-schema <schema-json> <prompt>
 ```
 
+pi summary command uses an empty neutral working directory. It has no schema
+flag, so the schema rides in the system prompt and the answer is recovered from
+the last stdout line that parses as a JSON object:
+
+```text
+pi --print --no-session --no-tools --no-extensions --no-skills
+  --no-prompt-templates --no-context-files --no-approve
+  --append-system-prompt <schema instruction> <prompt>
+```
+
 Pass the prompt as the final argument and give the summarizer no stdin. A
 configured Provider Command may wrap the provider in a terminal automation tool
 that hands the child a PTY, and a PTY stdin never delivers a piped prompt, so a
@@ -632,7 +683,8 @@ dark-on-dark filled rectangles.
 
 The dialog has two fields in focus order:
 
-1. provider: toggle with Left/Right or `h`/`l`, values `codex` and `claude`;
+1. provider: cycle with Right or `l` and back with Left or `h`, values `codex`,
+   `claude`, and `pi`;
 2. workspace: editable text, initialized to the dashboard startup directory.
 
 Shift-Tab is the sole field-switching key and toggles between provider and
@@ -657,7 +709,7 @@ filter/apply and cancel behavior.
 
 ## 14. Failure behavior
 
-- Missing one provider: show its doctor error; continue with the other.
+- Missing one provider: show its doctor error; continue with the others.
 - Missing transcript directory: treat as zero sessions.
 - Missing cwd: show session as unavailable; Enter reports an error.
 - Child spawn failure: return to dashboard with an error banner.
@@ -676,7 +728,7 @@ to work but live Codex approval events are unavailable.
 
 Automated tests must cover:
 
-1. Codex and Claude transcript discovery from fixtures.
+1. Codex, Claude, and pi transcript discovery from fixtures.
 2. Stable identity and refresh preserving selection.
 3. Deterministic status precedence.
 4. Summary rolling prompt, redaction, output validation, and status override.
@@ -699,7 +751,7 @@ Automated tests must cover:
 Manual smoke test:
 
 1. Start the dashboard in a real terminal.
-2. Confirm real recent Codex/Claude sessions appear.
+2. Confirm real recent Codex/Claude/pi sessions appear.
 3. Resume one session and return with `Ctrl-Q`.
 4. Add multiple shells, switch focus, run `pwd`, close one, and return.
 5. Copy and stage output from the selected shell.
