@@ -184,7 +184,8 @@ async function requestSummaryRetry(key) {
  */
 async function answerOption(option) {
   // The dialog is answered by the number it printed, never by the position of the button:
-  // a provider is free to skip or reorder, and the digit is what reaches the pty.
+  // a provider is free to skip or reorder. What reaches the pty is the server's business:
+  // a digit for a numbered menu, arrow keys plus a read-back check for a cursor one.
   const result = await answerBlockingPrompt(option.number);
   if (result.ok) {
     const stuck = state.pending.some((entry) => entry.kind === "failed");

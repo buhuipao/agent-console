@@ -1,6 +1,6 @@
 // Watching the open session for a blocking dialog, and answering it.
 //
-// A provider stops on a numbered menu -- "trust this folder", a tool permission request --
+// A provider stops on a menu -- "trust this folder", a tool permission request --
 // and waits for a keypress. Nothing about that reaches the transcript, and nothing about it
 // reaches the hook-driven `pending_decisions` either (a session can sit blocked for minutes
 // with `pending_decisions: []`), so `GET /prompt-status` is the only thing in the API that
@@ -164,7 +164,7 @@ function signature(prompt) {
   return prompt ? JSON.stringify(prompt) : "";
 }
 
-/** Keeps only a prompt this view can actually act on: a question plus numbered options. */
+/** Keeps only a prompt this view can actually act on: a question plus at least one option. */
 function normalise(payload) {
   const prompt = payload && payload.prompt;
   if (!prompt) return null;

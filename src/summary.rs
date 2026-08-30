@@ -538,12 +538,41 @@ mod tests {
         assert!(claude.args.contains(&"--no-session-persistence".into()));
     }
 
+    /// pi has no schema flag, so its answer is recovered from whatever it printed. That makes
+    /// it the provider most likely to regress here, and the one that was untested.
+    #[test]
+    fn a_pi_summary_is_recovered_from_the_last_json_line_it_printed() {
+        let answer = serde_json::json!({
+            "task": "Add pi support",
+            "status": "working",
+            "progress": ["wired the adapter"],
+            "current_action": "running the suite",
+            "next_step": "ship it",
+            "needs_user": [],
+            "blockers": []
+        });
+
+        let bare = parse_output(AgentKind::Pi, answer.to_string().as_bytes()).unwrap();
+        assert_eq!(bare.task, "Add pi support");
+        assert_eq!(bare.progress, ["wired the adapter"]);
+
+        // Real stdout can carry a line of chatter before the object; the last JSON line wins.
+        let noisy = format!("Model catalogs refreshed.\n{answer}\n");
+        assert_eq!(
+            parse_output(AgentKind::Pi, noisy.as_bytes()).unwrap().task,
+            "Add pi support"
+        );
+
+        // Unlike Claude, pi's object is the answer itself rather than a wrapper around it.
+        assert!(parse_output(AgentKind::Pi, b"not json at all").is_err());
+    }
+
     #[test]
     fn the_prompt_is_an_argument_so_a_tty_wrapper_cannot_swallow_it() {
         let root = Path::new("/tmp/neutral");
         let schema = root.join("schema.json");
         let config = AgentConsoleConfig::default();
-        for provider in [AgentKind::Codex, AgentKind::Claude] {
+        for provider in [AgentKind::Codex, AgentKind::Claude, AgentKind::Pi] {
             let command = command_for(&config, provider, root, &schema, "summarize this");
             assert_eq!(
                 command.args.last().map(String::as_str),

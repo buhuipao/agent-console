@@ -567,6 +567,14 @@ mod tests {
             version_support(AgentKind::Claude, "development build"),
             VersionSupport::Unknown
         );
+        assert_eq!(
+            version_support(AgentKind::Pi, "0.84.4"),
+            VersionSupport::Supported
+        );
+        assert_eq!(
+            version_support(AgentKind::Pi, "0.83.9"),
+            VersionSupport::TooOld
+        );
 
         let root = tempdir().unwrap();
         assert!(matches!(

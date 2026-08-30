@@ -5,7 +5,7 @@
 //! carriage return, and a stop is the escape key -- exactly what the TUI sends when a person
 //! types into the same session.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::{
     extract::{Path, State},
@@ -161,7 +161,19 @@ pub(crate) async fn blocking_prompt(
     }))
 }
 
-/// Answers a blocking dialog by choosing one of its numbered options.
+/// How long a cursor menu is given to show the highlight on the chosen option.
+const MOVE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Gap between reads while waiting for the highlight to land.
+const MOVE_POLL: Duration = Duration::from_millis(100);
+
+/// Answers a blocking dialog by choosing one of its options.
+///
+/// A numbered menu is one write: the digit names the option, so it cannot land on the wrong
+/// one. A cursor menu is answered *positionally*, and is therefore done in two steps -- move,
+/// read back, confirm. The parse can be wrong in ways no amount of care at parse time removes:
+/// a label that wraps at the viewport width looks exactly like a sibling option, so a
+/// miscounted walk would confirm the neighbour of what the user tapped. Reading the highlight
+/// back before pressing Enter is what makes that impossible rather than unlikely.
 pub(crate) async fn answer_prompt(
     State(state): State<AppState>,
     Path(key): Path<String>,
@@ -174,17 +186,36 @@ pub(crate) async fn answer_prompt(
     ))?;
     // Answering by number rather than by position, and only a number the dialog is actually
     // offering: the screen may have changed between the client reading it and this call.
-    if !prompt
-        .options
-        .iter()
-        .any(|option| option.number == body.option)
-    {
-        return Err((
-            StatusCode::CONFLICT,
-            format!("the current prompt has no option {}\n", body.option),
-        ));
+    let answer = dialog::answer(&prompt, body.option).ok_or((
+        StatusCode::CONFLICT,
+        format!("the current prompt has no option {}\n", body.option),
+    ))?;
+
+    match answer {
+        dialog::Answer::Once(bytes) => write(&state, &key, &bytes),
+        dialog::Answer::Move { keys, expect } => {
+            agent::write(&state, &key, &keys).map_err(to_response)?;
+            let deadline = Instant::now() + MOVE_TIMEOUT;
+            loop {
+                tokio::time::sleep(MOVE_POLL).await;
+                let screen = agent::screen_state(&state, &key).map_err(to_response)?;
+                if dialog::marked_label(&screen.text).as_deref() == Some(expect.as_str()) {
+                    return write(&state, &key, dialog::CONFIRM);
+                }
+                if Instant::now() >= deadline {
+                    // Deliberately not confirmed. Enter here would accept whatever the agent
+                    // happens to be highlighting, which is the accident this split prevents.
+                    return Err((
+                        StatusCode::CONFLICT,
+                        format!(
+                            "the menu did not move onto {expect:?}, so nothing was confirmed; \
+                             answer it from the Agent TUI tab\n"
+                        ),
+                    ));
+                }
+            }
+        }
     }
-    write(&state, &key, &dialog::answer_bytes(body.option))
 }
 
 /// The bytes that put a prompt into the agent's composer, or `None` when there is no prompt

@@ -707,6 +707,51 @@ the active field/completion state and always exposes field movement, editing or
 completion, Enter, and Esc. The search and alias dialogs similarly expose live
 filter/apply and cancel behavior.
 
+### 13.1 Blocking provider dialogs
+
+A dialog is never written to a transcript, so a session stopped on one is
+indistinguishable from an idle one unless the visible screen is read.
+
+Report a blocking prompt only for a *contiguous block of option lines directly
+above its own footer*: at most two blank lines may separate the block from the
+footer, and the block ends at the first blank line above it. Evidence gathered
+from anywhere else on the screen does not count. Anchoring is load-bearing --
+without it a stale numbered list scrolled above a live dialog outranks the dialog,
+and answering then confirms whatever the agent has highlighted.
+
+A footer names the key to press: `to confirm`, `to select`, `to cancel`, or
+`to continue` when the same line also says `press` or `enter`. `to continue`
+alone is ordinary prose.
+
+Two shapes, tried in this order:
+
+- **Numbered** (Codex): each line carries its own digit. Answer by writing that
+  digit and a carriage return.
+- **Cursor** (Claude Code 2.1.251+, pi): no digits; exactly one line carries a
+  selection marker and the siblings align at its label column. Number them by
+  position and report which is marked. A line at any other position continues the
+  option above it — pi wraps an option's path onto its own line at a *shallower*
+  indent, so indentation cannot distinguish a wrap from a sibling.
+
+Selection markers are `❯`, `›`, and `→` only. A numbered option may additionally
+carry `>` or `*`, because there the digit does the work; treating those as cursor
+markers turns a markdown bullet list into a menu.
+
+Strip a box border from both ends of a line before parsing, so a framed dialog
+parses like a bare one.
+
+Answer a cursor menu in two steps: write the arrow keys, read the screen back,
+and write the carriage return only once the marked label equals the requested one.
+Give up after three seconds without confirming. A positional answer cannot be
+verified at parse time — a label that wraps at the viewport width looks exactly
+like a sibling option — so the read-back is what prevents confirming the wrong row.
+
+A dialog that is reported also blocks `/prompt`, which reports the question rather
+than typing into it.
+
+pi emits no extension events at all while its trust dialog is up, so for pi the
+screen is the only place a blocking dialog exists.
+
 ## 14. Failure behavior
 
 - Missing one provider: show its doctor error; continue with the others.

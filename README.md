@@ -161,7 +161,19 @@ transcript and sends prompts. **Shell** is a login shell in the session's workin
 directory -- several per session, switchable, and the same daemon terminals the
 dashboard's shell panes use, so a shell opened in either place shows up in the
 other. **Agent TUI** streams the agent's own PTY, so its terminal UI renders as
-it does in the dashboard; that is where its blocking dialogs get answered.
+it does in the dashboard.
+
+A blocking dialog -- "trust this folder", a tool permission request, an update
+prompt -- is never written to a transcript, so the Conversation view reads it off
+the screen and offers its options as buttons. Both shapes are understood: the
+numbered menus Codex uses, and the cursor menus Claude Code and pi use, where the
+answer is arrow keys rather than a digit. A cursor menu is answered in two steps
+-- move the highlight, read it back, and only then press Enter -- because a label
+that wraps at the window width is indistinguishable from a second option, and
+confirming the neighbour of what you tapped is not a mistake worth risking. Until
+a dialog is answered the composer says so rather than losing the prompt into it.
+This matters most for pi, which emits no events at all while its trust dialog is
+up, so the screen is the only place that dialog exists.
 The layout adapts to phone or desktop, and because a phone keyboard has no Esc,
 Tab, Ctrl or arrows, a touch toolbar supplies them, with Ctrl as a sticky
 modifier.

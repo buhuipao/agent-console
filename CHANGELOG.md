@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.1] - 2026-08-30
+
+### Fixed
+- See and answer the blocking dialogs the web UI was blind to. A "trust this
+  folder", a tool permission request, an update prompt or a spend-cap notice is
+  never written to a transcript, so a session stopped on one reported `idle` with
+  no pending decision and every prompt sent to it was swallowed and refused after
+  a ten-second wait. Cursor menus -- Claude Code 2.1.251 and pi, which carry no
+  digits at all -- are now recognised alongside Codex's numbered ones, and a
+  dialog drawn inside a box is recognised too. pi needs this most: it emits no
+  extension events whatsoever until its trust dialog is answered, so the screen is
+  the only place that dialog exists.
+- Answer a cursor menu in two steps: write the arrow keys, read the highlight
+  back, and press Enter only once it sits on the option that was asked for. A
+  positional answer cannot be checked at parse time -- a label that wraps at the
+  window width is indistinguishable from a second option -- so without the
+  read-back a miscount would confirm the neighbour of what the user tapped.
+- Detection is anchored rather than searched: a menu is a contiguous block of
+  option lines directly above its own footer, and evidence from elsewhere on the
+  screen no longer counts. An earlier attempt matched any two numbered lines plus
+  any line saying "to confirm", which made a stale plan scrolled above a live
+  permission dialog outrank the dialog -- answering it then wrote an inert digit
+  and a live carriage return, silently approving a tool call nobody chose. Ordinary
+  agent output no longer trips it either: `to continue` now needs the key named
+  beside it, and `>` and `*` are a blockquote and a bullet rather than selection
+  markers.
+
 ## [0.2.0] - 2026-08-30
 
 ### Added
