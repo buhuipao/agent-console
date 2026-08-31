@@ -2,12 +2,10 @@
 
 Status: implementation contract for Agent Console 0.2.1.
 
-Scope is the terminal application and the core it shares with the web server:
-discovery, events and status, managed PTYs, summaries, and the dashboard. The
-web/PWA server itself (`src/web/`) is not specified here; its user-facing
-behavior is documented in [README.md](README.md), and the one contract the two
-share is section 13.1. Domain terms are defined in [CONTEXT.md](CONTEXT.md),
-and accepted architecture decisions live under `docs/adr/`.
+Scope is the whole application: discovery, events and status, managed PTYs,
+summaries, the terminal dashboard (sections 12 and 13), and the web server
+(section 17). Domain terms are defined in [CONTEXT.md](CONTEXT.md), and accepted
+architecture decisions live under `docs/adr/`.
 
 This document is intentionally explicit so an implementation agent can execute
 it without making product decisions. If code and this document disagree, this
@@ -805,6 +803,11 @@ Automated tests must cover:
     atomic install/upgrade path. Directly overwriting an already launched
     signed inode is unsupported because macOS can retain its old signature
     cache and kill the replacement.
+13. Web settings precedence, both authentication modes and their constant-time
+    comparison, cross-origin websocket refusal, asset content types and cache
+    policy, route wiring behind the credential and App-lock checks, transcript
+    paging with cursor recovery, and blocking-dialog parsing with the two-step
+    cursor answer.
 
 Manual smoke test:
 
@@ -822,3 +825,279 @@ The implementation is complete only when all automated tests pass, `cargo fmt
 --check` and `cargo clippy -- -D warnings` pass, both installed providers pass
 `doctor`, and the dashboard smoke test can start and exit without corrupting the
 terminal.
+
+## 17. Web server
+
+The dashboard and the browser are two surfaces over one `App`. Everything in
+sections 6 to 11 is shared; this section is the surface.
+
+### 17.1 Process models
+
+Two, differing only in who advances the runtime:
+
+- **Embedded.** The dashboard binds and serves on its own `App`, on a thread of
+  its own. It starts no ticker: the dashboard already ticks. Binding happens on
+  the caller's thread before the terminal is taken over, so a port conflict is
+  an ordinary error the dashboard reports and carries on from.
+- **`agent-console web`.** This process owns the only `App`, and a 100 ms tick
+  thread mirroring the TUI event loop drives discovery, event polling, and
+  summaries. Selected-session notification suppression is off: this process has
+  no screen, so suppressing for `selected` would drop alerts nobody saw.
+
+One `App` behind one mutex. A request never blocks on it for longer than
+400 ms, retrying every 20 ms; past that it answers `503` and names the remedy
+(return the workspace to the dashboard, or run `agent-console web` as its own
+process). A poisoned mutex is `500`. Blocking instead would park one worker per
+request and wedge the server, static shell included, while a dashboard holds a
+workspace attached.
+
+### 17.2 Binding and exposure
+
+`host` resolves through `ToSocketAddrs`, so `localhost` is as valid as a
+literal; when a name resolves to both families the IPv4 address wins, because
+IPv6-only binding would refuse the `http://127.0.0.1:<port>` the console prints.
+Defaults are `127.0.0.1:7878`.
+
+A non-loopback bind warns on stderr and is reported to the dashboard as
+`exposed`, which shows it on screen: the terminal is taken over immediately and
+the stderr line scrolls away. There is no built-in TLS. Anything past the
+credential check has full PTY access, so a non-loopback deployment belongs
+behind a trusted TLS reverse proxy.
+
+### 17.3 Authentication
+
+Chosen once at startup, never mixed. The server is never unauthenticated.
+
+- **Basic**, whenever credentials resolve from `--auth`,
+  `AGENT_CONSOLE_WEB_AUTH`, or `[web] auth`. The browser draws its own
+  credential prompt, so the app ships no login form. A `401` carries
+  `WWW-Authenticate: Basic`.
+- **Token**, otherwise: a per-process UUID, accepted from `?token=`, an
+  `Authorization: Bearer` header, or a `token` cookie.
+
+Secrets compare byte-for-byte with no early exit, and both halves of a Basic
+credential are always compared, so a wrong user answers no faster than a wrong
+password. Length is compared first and is not constant time, which leaks the
+length of the expected secret rather than its content.
+
+A Basic-authenticated response sets `agent-console-session`, a per-process
+secret, `Path=/; HttpOnly; SameSite=Strict` and deliberately not `Secure`
+because there is no TLS to require. The `WebSocket` constructor cannot set an
+`Authorization` header, so the handshake depends on the browser sending
+something; the cookie is what makes that this code's decision rather than the
+browser's. It is issued only to a request that already proved the password, and
+only when it did not already present the cookie.
+
+`GET /api/health` and the static shell are the only unauthenticated routes: the
+page has to load before it can tell the user which mode it is looking at.
+
+### 17.4 Cross-origin refusal
+
+`/ws/*` is a PTY control channel, and a browser attaches cached Basic
+credentials to a handshake another page started. Credentials therefore answer
+the wrong question on their own, and the handshake is additionally checked for
+being same-origin.
+
+Compare `Origin` against `Host`, case-insensitively, never against the
+configured bind address: one server answers to several names, and a page's
+`Origin` is the authority it puts in `Host`. Strip `http://` or `https://` only;
+the scheme is excluded so a TLS-terminating proxy still matches. The port is
+included, because a different port is a different origin.
+
+A handshake with **no** `Origin` proceeds. RFC 6455 requires a browser to send
+one, so its absence means curl or a native client, neither of which carries
+ambient credentials. `null` and any non-HTTP origin are refused with `403`.
+
+The check is a layer, not a line in the handler, so it decides before any
+extractor runs.
+
+### 17.5 Static shell
+
+The whole PWA — HTML, CSS, JS, `manifest.webmanifest`, service worker, icons,
+vendored xterm.js — is embedded in the binary. An unknown path falls back to
+`index.html` so the shell always loads. `.webmanifest` is served as
+`application/manifest+json`.
+
+Shell files are `no-cache`: a rebuilt binary changes their bytes but not their
+URLs, so a cached copy would outlive an upgrade and the service worker would
+refresh itself out of it. Only `vendor/` and `icons/`, which change when their
+pinned version does, are cached (`max-age=3600`).
+
+### 17.6 HTTP surface
+
+Every route below requires the active credential and the App-lock check, in
+that order, except `/api/health`. The two `/ws/` routes additionally pass the
+origin check of section 17.4.
+
+```text
+GET    /api/health                                  public; {ok, version, auth}
+GET    /api/sessions?q=                             workspaces, counts, unread
+POST   /api/sessions                                {agent, cwd} -> session
+POST   /api/sessions/{key}/archive                  toggle archived
+DELETE /api/sessions/{key}                          terminate agent; 204
+GET    /api/sessions/{key}/messages?after|before&limit
+POST   /api/sessions/{key}/prompt                   {text}
+POST   /api/sessions/{key}/interrupt
+GET    /api/sessions/{key}/prompt-status            {accepts_input, prompt}
+POST   /api/sessions/{key}/answer                   {option}
+PUT    /api/sessions/{key}/alias                    rename
+POST   /api/sessions/{key}/summary/retry            re-queue at the front
+POST   /api/sessions/{key}/lease                    {force} -> {granted, holder}
+GET    /api/sessions/{key}/shells                   adopts others' shells too
+POST   /api/sessions/{key}/shells                   new shell in the session cwd
+DELETE /api/sessions/{key}/shells/{id}              204
+GET    /api/sessions/{key}/shells/{id}/capture      retained output, as text
+POST   /api/sessions/{key}/shells/{id}/stage        paste it into the composer
+GET    /api/notifications                           pure read
+POST   /api/notifications/read-all
+POST   /api/notifications/{id}/read
+GET    /api/doctor                                  the doctor report as JSON
+GET    /api/fs/complete?path=                       directory completion
+GET    /ws/sessions/{key}                           agent PTY
+GET    /ws/sessions/{key}/shells/{id}               shell PTY
+```
+
+A server has several clients at once, so every TUI binding that acts on "the
+selected session" is re-cut here as a route that names its own key, and every
+modal that rewrites shared state is re-cut as a per-request argument. Search is
+`?q=`, using the TUI's matching rules and none of its state. Creating a session
+restores `app.dialog` and archiving restores `app.selected` afterwards, so a
+browser never moves a dashboard's cursor or opens a modal on its screen.
+
+Alerts are data rather than a mode. `GET` changes nothing, entries keep their
+place and their stable `id` after being read, and the shared read flag moves
+only through the explicit, idempotent mark-read routes — so one client polling
+cannot swallow an alert for the others, while acknowledging in the browser still
+clears the TUI badge.
+
+`GET /api/doctor` runs on a blocking task, spawns provider binaries, and answers
+`200` even when checks fail: a failing check is the payload. Only being unable
+to run the checks at all is `500`.
+
+### 17.7 Session list
+
+Sessions are grouped by exact working directory, workspaces ordered by their
+most recently active session and sessions within one by recency. The four status
+counts are computed over every session rather than the filtered subset:
+filtering narrows one client's view, and the counts answer what is happening on
+the machine. The normalized query is echoed so a client can tell a stale
+response from a current one.
+
+### 17.8 Conversation
+
+Transcripts are append-only JSONL and routinely hundreds of megabytes, so no
+page parses from byte 0. Each page carries an opaque cursor at both edges
+(`v1.<byte offset>`), and a follow-up seeks straight to one and parses a bounded
+window: 2 MiB normally, 16 MiB on the retry a single multi-megabyte base64 line
+forces. A forward cursor more than 16 MiB behind falls back to a tail window.
+
+`after` and `before` select opposite directions and are rejected together
+(`400`). Neither reads the tail, because the bottom of a conversation is what
+anyone wants first. Messages are always ordered oldest to newest whichever
+direction the page was read in. `limit` defaults to 50 and clamps to 1..=500.
+`has_more` is set only when `limit` cut the page short, never merely because the
+file ends mid-line, which would spin a client looping on it. An unparseable or
+stale cursor falls back to the tail rather than failing. A session with no
+transcript is an empty page, not an error.
+
+A message is `{id, role, ts, blocks}` with `role` one of `user`, `assistant`,
+`system`, and each block tagged by `type`: `text`, `thinking`, `tool_use`,
+`tool_result`, `image`. Injected instruction payloads are stripped, a typed
+slash command is rendered as the user would recognise it, and a message left
+with no blocks is dropped. Tool commands and tool output cap at 2 000
+characters, conversation prose at 20 000, each marking the cut and reporting the
+original size — the browser never has to defend itself against a 50 MB field.
+
+### 17.9 Terminal websockets
+
+A socket is a raw byte relay. No vt100 parsing happens server-side, and reads go
+through `poll_raw` with the socket's own offset — never `sync()`, which would
+advance the parser and offset the TUI and every other reader render from.
+
+Handshake `?cols=`/`?rows=` default to 80x24. Server frames:
+
+```text
+binary                                    raw PTY bytes
+{"type":"size","cols":C,"rows":R}         before any output, and on every change
+{"type":"scrollback","text":"..."}        first poll only; rows above the screen
+{"type":"exit","detail":"..."}            the process is gone; the socket closes
+{"type":"lease_denied","detail":"..."}    a write was refused; once per change
+```
+
+Client frames are keystrokes as binary, or text that is
+`{"type":"resize","cols":C,"rows":R}` when it parses as one and keystrokes
+otherwise.
+
+Every socket is registered as a viewer for exactly as long as it is open, and
+the PTY runs at the smallest viewport of all of them, so a phone joining a
+desktop never squashes the desktop and the browser letterboxes the columns the
+PTY is not using instead of reflowing the agent's output. Deregistration is a
+`Drop`, because a socket that dies without a close frame leaves by an error
+path, and a viewer nobody removes would pin the terminal to that window's size
+forever.
+
+Scrollback is a text frame rather than more bytes: the receiver pads it out to
+its own viewport height before the checkpoint repaints over it, and only the
+browser knows that height.
+
+Polling is every 50 ms. A tick lost to the dashboard holding the App lock is
+skipped and resumes from the same offset; the first-poll snapshot flag stays set
+until a poll gets through, so a busy tick does not cost the connection its
+scrollback. A write waits up to 300 ms instead, because a keystroke has nowhere
+to go — and stays short, because queueing keystrokes for minutes would replay
+them into a terminal long after whoever typed them gave up.
+
+### 17.10 Driving an agent without a terminal
+
+The web UI renders no PTY, but the agents underneath it speak only PTY. Reading
+the screen is done through this layer's own `vt100` parser per session, fed from
+`poll_raw` with its own offset and retaining no scrollback. Reusing the
+terminal's parser would corrupt what the TUI and the socket render and make the
+read race them; an earlier revision did exactly that and produced a screen
+signal that flapped.
+
+A prompt is a bracketed paste and then, separately, a carriage return:
+
+1. Wait up to 20 s, polling every 50 ms, for bracketed paste to be on with no
+   dialog detected (section 13.1).
+2. Write the paste, which carries no carriage return of its own.
+3. Look for a distinctive 24-character slice of the prompt on screen, eight
+   times at 400 ms. Re-send the paste up to three times, and only while no trace
+   of the text is on screen.
+4. Re-read the screen immediately before Enter. Any dialog now up means the
+   prompt is not ours to submit.
+
+Splitting paste from submit is load-bearing: a carriage return riding along with
+the paste is delivered whether or not the agent was ready, and answers whatever
+dialog happens to be up. Sending them together is how a "trust this folder"
+prompt was silently accepted and the prompt discarded. A prompt that never
+appears is `409` naming the Terminal tab, rather than a silent duplicate.
+
+An interrupt is `ESC`. Shell capture reads the retained output through
+`poll_raw` and decodes it with the same `pty::plain_text` the TUI uses, so both
+surfaces produce the same text without sharing mutable state. Staging pastes
+immediately rather than setting `pending_shell_injection`, because a browser has
+no later "enter the agent" moment for a staged string to be consumed at.
+
+Failures map to status codes a frontend can act on without reading prose:
+
+```text
+404  no such session or shell
+409  starting up, blocked on a dialog, empty capture, or a missing cwd
+423  another surface holds the input lease
+500  the terminal failed
+```
+
+### 17.11 Input lease
+
+Writing to an agent a TUI holds is refused by the PTY daemon.
+`POST /api/sessions/{key}/lease` is the takeover, on its own.
+
+A denial is `200`, not an error: asking is legitimate and the answer — the
+holder's pid, instance id, and start time — is the payload. The frontend posts
+`force: false`, and on `granted: false` offers a button posting `force: true`.
+
+The claim is never released. The daemon treats a lease as stale once its owner
+has not revalidated for half a second and the web server never revalidates, so a
+TUI takes the session back by opening it: no forcing, no cleanup call, and no
+way for a closed browser tab to lock a session out.
