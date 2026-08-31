@@ -2,7 +2,7 @@
 
 `docs/assets/demo.gif` is recorded with [vhs](https://github.com/charmbracelet/vhs)
 from synthetic fixtures, never from a real session. Nothing here touches
-`~/.codex`, `~/.claude`, or the real state directory.
+`~/.codex`, `~/.claude`, `~/.pi`, or the real state directory.
 
 ```sh
 # 1. Build an isolated demo home from the checked-in fixtures.

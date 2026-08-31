@@ -368,7 +368,7 @@ Provider compatibility details are in
 
 Please use [GitHub Issues](https://github.com/buhuipao/agent-console/issues) for
 reproducible bugs and workflow feedback. Include your operating system,
-terminal, Codex or Claude Code version, and redacted `agent-console doctor`
+terminal, Codex, Claude Code, or pi version, and redacted `agent-console doctor`
 output when they are relevant. Do not post tokens, private prompts, unredacted
 paths, or full environment variables.
 
