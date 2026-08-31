@@ -1,11 +1,13 @@
 # Agent Console implementation specification
 
-Status: implementation contract for Agent Console 0.0.3.
+Status: implementation contract for Agent Console 0.2.1.
 
-The completed hardening requirements and real-machine acceptance matrix are
-recorded in [PLAN.md](PLAN.md). Domain terms are defined in
-[CONTEXT.md](CONTEXT.md), and accepted architecture decisions live under
-`docs/adr/`.
+Scope is the terminal application and the core it shares with the web server:
+discovery, events and status, managed PTYs, summaries, and the dashboard. The
+web/PWA server itself (`src/web/`) is not specified here; its user-facing
+behavior is documented in [README.md](README.md), and the one contract the two
+share is section 13.1. Domain terms are defined in [CONTEXT.md](CONTEXT.md),
+and accepted architecture decisions live under `docs/adr/`.
 
 This document is intentionally explicit so an implementation agent can execute
 it without making product decisions. If code and this document disagree, this
@@ -48,16 +50,26 @@ knows that its managed child is alive.
   dashboard and never crashes the app.
 - Unix uses the detached PTY daemon. Windows uses process-local ConPTY and does
   not promise PTY survival after Agent Console exits.
+- `AGENT_CONSOLE_PTY_MODE=local` forces the Windows behavior on Unix: PTYs are
+  owned by the running process and die with it. For debugging a daemon fault,
+  not for daily use.
 
 ## 4. Commands
 
 The binary supports these modes:
 
 ```text
-agent-console                 Open the dashboard.
+agent-console                 Open the dashboard, serving the web UI too.
+agent-console web             Serve the web UI alone, with no dashboard.
 agent-console hook PROVIDER   Read one hook JSON object from stdin.
 agent-console doctor          Check provider binaries and data paths.
 ```
+
+The dashboard and `web` take `--host`, `--port`, and `--auth USER:PASS`; the
+dashboard also takes `--no-web` to open without serving. Each reads
+`AGENT_CONSOLE_WEB_HOST`, `_PORT`, `_AUTH`, and `_ENABLED`, then `[web]` in the
+config file, in that order of precedence. `--help` and `--version` print and
+exit.
 
 The `hook` mode appends one normalized event to the application's event inbox.
 It must finish quickly and must not invoke an LLM.
@@ -78,6 +90,7 @@ state.json                  One-time legacy migration input only.
 events/<provider>-<id>.jsonl[.1]  Two bounded hook/event generations.
 summary-schema.json         Schema passed to non-interactive summarizers.
 pi-hooks.mts                Generated pi extension bridging its events to `hook pi`.
+pty-daemon.sock             Unix only; the detached PTY daemon's control socket.
 agent-console.log           Current diagnostics; three rotated generations.
 ```
 

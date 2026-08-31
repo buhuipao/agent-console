@@ -4,8 +4,8 @@ The supported floor and the versions exercised for this release are:
 
 | Provider | Supported floor | Contract fixtures | Real local smoke |
 | --- | ---: | --- | --- |
-| Codex CLI | 0.100.0 | 0.100.0, 0.144.5 | 0.144.5 |
-| Claude Code | 2.0.0 | 2.0.0, 2.1.214 | 2.1.214 |
+| Codex CLI | 0.100.0 | 0.100.0, 0.144.5 | 0.151.0 |
+| Claude Code | 2.0.0 | 2.0.0, 2.1.214 | 2.1.251 |
 | pi | 0.84.0 | — | 0.84.4 |
 
 Compatibility means the provider exposes the resume and hook-configuration
