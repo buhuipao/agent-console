@@ -1,9 +1,11 @@
 //! The wire shape of a conversation as the web UI renders it, plus the text hygiene every
 //! provider parser shares. Provider transcripts carry megabyte tool results, base64 images and
 //! injected instruction blocks; nothing reaches a block until it has been filtered and capped
-//! here, so the browser never has to defend itself against a 50 MB field.
+//! here, so the browser never has to defend itself against a 50 MB field. Images are the one
+//! exception let through at all, and only up to `IMAGE_DATA_LIMIT`.
 
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::{discovery, model::AgentKind};
 
@@ -15,6 +17,49 @@ pub(crate) const SUMMARY_LIMIT: usize = 2_000;
 /// content the user actually reads, but still bounded so one pathological message cannot
 /// blow up a response.
 pub(crate) const TEXT_LIMIT: usize = 20_000;
+
+/// Cap on the base64 payload relayed inline as a data URI, in encoded characters (base64 runs
+/// ~4/3 the raw byte count, so this is roughly a 3 MB image). This still repeats on every poll
+/// of the session -- there is no cache or dedicated route for images -- so it stays well under
+/// `TEXT_LIMIT`'s neighbourhood; a screenshot past this cap still shows as a block, just
+/// without a preview, the same fallback as before this existed.
+pub(crate) const IMAGE_DATA_LIMIT: usize = 4_000_000;
+
+/// Best-effort extraction of an inline image as a data URI, tried across the handful of shapes
+/// Claude, Codex and pi each use for an image content block. `None` covers both "no image data
+/// present" and "too large to relay" -- either way the caller falls back to a bare
+/// `Block::Image` the UI renders as a placeholder chip.
+pub(crate) fn image_data_uri(item: &Value) -> Option<String> {
+    // Anthropic: {"type":"image","source":{"type":"base64","media_type":"image/png","data":".."}}
+    if let Some(source) = item.get("source") {
+        let data = source.get("data").and_then(Value::as_str);
+        let media_type = source.get("media_type").and_then(Value::as_str);
+        if let (Some(data), Some(media_type)) = (data, media_type) {
+            return capped_data_uri(media_type, data);
+        }
+    }
+    // OpenAI Responses API: {"type":"input_image","image_url":"data:image/png;base64,.."} or
+    // {"image_url":{"url":"data:.."}}.
+    if let Some(image_url) = item.get("image_url") {
+        let url = image_url
+            .as_str()
+            .or_else(|| image_url.get("url").and_then(Value::as_str));
+        if let Some(url) = url {
+            return (url.len() <= IMAGE_DATA_LIMIT).then(|| url.to_string());
+        }
+    }
+    // A bare {"data": "..", "mime_type": ".."} pair, as some tool outputs carry.
+    let data = item.get("data").and_then(Value::as_str);
+    let mime = item.get("mime_type").and_then(Value::as_str);
+    if let (Some(data), Some(mime)) = (data, mime) {
+        return capped_data_uri(mime, data);
+    }
+    None
+}
+
+fn capped_data_uri(media_type: &str, data: &str) -> Option<String> {
+    (data.len() <= IMAGE_DATA_LIMIT).then(|| format!("data:{media_type};base64,{data}"))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -43,7 +88,10 @@ pub(crate) enum Block {
         ok: bool,
         summary: String,
     },
-    Image,
+    Image {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        data: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

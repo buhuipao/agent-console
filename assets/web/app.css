@@ -180,13 +180,24 @@ a {
 
 .brand {
   margin: 0;
+  min-width: 0;
   font-size: var(--fs-xl);
   font-weight: 650;
   letter-spacing: -0.015em;
+}
+
+.brand-link {
+  display: block;
+  overflow: hidden;
   color: var(--text-strong);
   white-space: nowrap;
-  overflow: hidden;
   text-overflow: ellipsis;
+  text-decoration: none;
+}
+
+.brand-link:hover,
+.brand-link:focus-visible {
+  color: var(--accent);
 }
 
 .topbar-actions {
@@ -301,6 +312,12 @@ a {
   line-height: 1;
 }
 
+svg.btn-icon {
+  width: 1.05em;
+  height: 1.05em;
+  flex: none;
+}
+
 /* ------------------------------------------------------------------- misc */
 
 .empty-hint {
@@ -345,26 +362,20 @@ a {
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.05em;
-  padding: 0.1rem 0.35rem;
-  border-radius: 5px;
-  border: 1px solid var(--border);
   color: var(--muted);
   flex: none;
 }
 
 .agent-badge.claude {
   color: #f2b07a;
-  border-color: #5b4530;
 }
 
 .agent-badge.codex {
   color: #9cc0fa;
-  border-color: #2f4364;
 }
 
 .agent-badge.pi {
   color: #93c572;
-  border-color: #3a512c;
 }
 
 .toast {
@@ -422,6 +433,11 @@ a {
 }
 
 .session-title {
+  /* A flex item's min-width defaults to `auto` -- its content's natural width --
+     so without an explicit 0 here the ellipsis rules below never engage; the
+     title just overflows its row and wraps instead of truncating. */
+  flex: 1;
+  min-width: 0;
   font-weight: 600;
   font-size: var(--fs-md);
   letter-spacing: -0.005em;
@@ -712,11 +728,25 @@ a {
   padding-bottom: 0.2rem;
 }
 
-/* On a narrow phone there is no room for three labelled controls, and an
-   icon-only button is exactly the thing the header must not become. The list
-   already polls itself, so the manual refresh is the one that goes. */
+/* On a narrow phone there is no room for three labelled controls. The list
+   already polls itself, so the manual refresh goes entirely; Alerts and New
+   session stay, but drop to icon-only so the row stops overlapping itself. */
 @media (max-width: 560px) {
   #refresh-btn {
     display: none;
+  }
+
+  .topbar-actions {
+    gap: 0.3rem;
+  }
+
+  #alerts-btn .btn-text,
+  #new-session-btn .btn-text {
+    display: none;
+  }
+
+  #alerts-btn,
+  #new-session-btn {
+    padding: 0;
   }
 }

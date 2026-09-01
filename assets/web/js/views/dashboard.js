@@ -231,6 +231,7 @@ function workspaceSection(workspace, home) {
     },
     [
       el("span", { class: "workspace-caret", "aria-hidden": "true", text: "▾" }),
+      el("span", { class: "workspace-icon", "aria-hidden": "true", text: "📁" }),
       el("span", { class: "workspace-labels" }, [
         el("span", { class: "workspace-name", text: workspace.name }),
         el("span", { class: "workspace-path", text: prettyPath(workspace.path, home) }),

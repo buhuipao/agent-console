@@ -363,6 +363,8 @@ export function createTerminalView({
     state.term = new window.Terminal({
       cursorBlink: true,
       fontSize: 13,
+      // Matches --mono in app.css; xterm needs a literal stack, not a custom property.
+      fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace',
       // Comfortably more than the 2000 rows `pty.rs` retains and seeds, so the whole snapshot
       // survives alongside everything that arrives live afterwards.
       scrollback: 5000,

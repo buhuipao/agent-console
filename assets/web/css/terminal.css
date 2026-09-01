@@ -208,13 +208,16 @@
    So the spare room is given a backdrop of its own and the live area is outlined. Black on
    black would read as a terminal that failed to lay out; this reads as a decision. */
 
+/* The two stops need to actually read as a stripe next to the `.xterm-screen`'s pure black --
+   the original pair (#0d1117/#11161d) were close enough to each other that the "decision"
+   this backdrop exists to signal rendered as a flat, uninterrupted dark field instead. */
 .terminal-view.term-letterboxed .terminal-container {
   background: repeating-linear-gradient(
     135deg,
-    #0d1117,
-    #0d1117 6px,
-    #11161d 6px,
-    #11161d 12px
+    var(--bg),
+    var(--bg) 6px,
+    var(--panel-alt) 6px,
+    var(--panel-alt) 12px
   );
 }
 

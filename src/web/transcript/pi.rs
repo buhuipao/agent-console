@@ -15,6 +15,7 @@ use serde_json::Value;
 use super::{
     block::{
         Block, LineOutcome, Message, Role, SUMMARY_LIMIT, TEXT_LIMIT, cap, conversational_text,
+        image_data_uri,
     },
     timestamp::parse_rfc3339_seconds,
 };
@@ -117,9 +118,11 @@ fn content_block(item: &Value) -> Option<Block> {
             name: string_or_default(item, "name"),
             summary: tool_call_summary(item.get("arguments")),
         }),
-        // An image block is a base64 payload measured in megabytes. The UI only needs to know
-        // one was there; the bytes are deliberately never relayed.
-        "image" => Some(Block::Image),
+        // An image block is a base64 payload measured in megabytes; only a capped copy is
+        // relayed as a preview (see `image_data_uri`), never the raw field.
+        "image" => Some(Block::Image {
+            data: image_data_uri(item),
+        }),
         _ => None,
     }
 }

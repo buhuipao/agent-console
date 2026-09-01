@@ -321,6 +321,14 @@
   width: 100%;
 }
 
+/* Explicit, not inherited: relying on the base `.msg-body` rule left the reply
+   the same shade as the pane behind it, so a prose turn read as bare text
+   with no visible container next to the user's tinted bubble. */
+.msg.assistant .msg-body {
+  background: var(--panel-alt);
+  border-color: var(--border);
+}
+
 .msg.system {
   align-self: stretch;
   max-width: 56rem;
@@ -767,4 +775,35 @@
   .msg.system .msg-body {
     padding: 0.55rem 0.65rem;
   }
+}
+
+/* ----------------------------------------------------------- pasted images */
+
+.msg-image-btn {
+  display: block;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  overflow: hidden;
+  cursor: zoom-in;
+  line-height: 0;
+}
+
+.msg-image {
+  display: block;
+  max-width: 100%;
+  max-height: 260px;
+  width: auto;
+}
+
+.image-preview-overlay {
+  cursor: zoom-out;
+}
+
+.image-preview-full {
+  max-width: 100%;
+  max-height: 100%;
+  border-radius: 4px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
 }

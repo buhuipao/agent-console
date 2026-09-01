@@ -123,15 +123,16 @@ fn oversized_tool_output_is_truncated_with_its_original_size() {
 }
 
 #[test]
-fn a_base64_image_is_announced_without_relaying_its_payload() {
+fn an_oversized_base64_image_is_announced_without_relaying_its_payload() {
     let page = claude_page(&[json!({
         "type": "user",
         "uuid": "user-1",
         "timestamp": "2026-08-21T23:46:10.197Z",
         "message": {"role": "user", "content": [
             {"type": "text", "text": "what is wrong with this screen?"},
+            // Past IMAGE_DATA_LIMIT (4_000_000 chars); 11 * 400_000 = 4_400_000.
             {"type": "image", "source": {"type": "base64", "media_type": "image/png",
-                                         "data": "iVBORw0KGgo".repeat(50_000)}}
+                                         "data": "iVBORw0KGgo".repeat(400_000)}}
         ]}
     })]);
 
@@ -141,13 +142,33 @@ fn a_base64_image_is_announced_without_relaying_its_payload() {
             Block::Text {
                 text: "what is wrong with this screen?".into()
             },
-            Block::Image,
+            Block::Image { data: None },
         ]
     );
     let encoded = serde_json::to_string(&page).unwrap();
     assert!(
         !encoded.contains("iVBORw0KGgo"),
-        "image bytes must never reach the browser"
+        "an oversized image's bytes must never reach the browser"
+    );
+}
+
+#[test]
+fn a_small_base64_image_is_relayed_as_a_data_uri() {
+    let page = claude_page(&[json!({
+        "type": "user",
+        "uuid": "user-1",
+        "timestamp": "2026-08-21T23:46:10.197Z",
+        "message": {"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                         "data": "iVBORw0KGgo"}}
+        ]}
+    })]);
+
+    assert_eq!(
+        page.messages[0].blocks,
+        vec![Block::Image {
+            data: Some("data:image/png;base64,iVBORw0KGgo".into())
+        }]
     );
 }
 

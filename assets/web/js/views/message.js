@@ -84,10 +84,7 @@ function renderBlock(block) {
       });
     }
     case "image":
-      return el("div", { class: "msg-block" }, [
-        el("span", { class: "chip", text: "image" }),
-        el("span", { class: "fold-line", text: " (not rendered in this view)" }),
-      ]);
+      return block.data ? imageBlock(block.data) : oversizedImageBlock();
     default:
       return fold({
         className: "fold",
@@ -104,6 +101,51 @@ function textBlock(text) {
   const node = el("div", { class: "msg-block md" });
   node.append(renderMarkdown(text || ""));
   return node;
+}
+
+function imageBlock(dataUri) {
+  const thumb = el("img", {
+    class: "msg-image",
+    src: dataUri,
+    alt: "Attached image",
+    loading: "lazy",
+  });
+  return el("div", { class: "msg-block" }, [
+    el(
+      "button",
+      {
+        class: "msg-image-btn",
+        type: "button",
+        title: "Click to view full size",
+        onclick: () => openImagePreview(dataUri),
+      },
+      [thumb],
+    ),
+  ]);
+}
+
+function oversizedImageBlock() {
+  return el("div", { class: "msg-block" }, [
+    el("span", { class: "chip", text: "image" }),
+    el("span", { class: "fold-line", text: " (too large to preview here)" }),
+  ]);
+}
+
+function openImagePreview(dataUri) {
+  const close = () => {
+    overlay.remove();
+    document.removeEventListener("keydown", onKey);
+  };
+  const onKey = (event) => {
+    if (event.key === "Escape") close();
+  };
+  const overlay = el(
+    "div",
+    { class: "overlay image-preview-overlay", role: "dialog", "aria-label": "Image preview", onclick: close },
+    [el("img", { class: "image-preview-full", src: dataUri, alt: "Attached image" })],
+  );
+  document.addEventListener("keydown", onKey);
+  document.body.append(overlay);
 }
 
 function fold({ className, head, detail, markdown = false }) {

@@ -144,6 +144,14 @@
   transform: rotate(-90deg);
 }
 
+/* A folder glyph reads faster than the caret alone -- it's what says
+   "this row is a group of sessions", not just "this row expands". */
+.workspace-icon {
+  flex: none;
+  font-size: var(--fs-sm);
+  line-height: 1;
+}
+
 .workspace-labels {
   min-width: 0;
   flex: 1;
@@ -208,9 +216,12 @@
   gap: 0.55rem;
   width: 100%;
   min-height: 58px;
-  /* The right inset reserves room for the row's archive control, so a two-line title never
-     runs underneath it. */
-  padding: 0.55rem calc(var(--safe-right) + 5rem) 0.55rem calc(var(--safe-left) + 0.75rem);
+  /* Left inset is deliberately past the header's: the row has to sit visibly
+     inside the group rail, not flush against it, or the group reads as a
+     label sitting *above* its sessions rather than a folder holding them.
+     The right inset reserves room for the row's archive control, so a
+     two-line title never runs underneath it. */
+  padding: 0.55rem calc(var(--safe-right) + 5rem) 0.55rem calc(var(--safe-left) + 1.5rem);
   border: none;
   border-top: 1px solid var(--border-soft);
   background: transparent;
@@ -279,21 +290,12 @@
   color: var(--faint);
 }
 
+/* Colour lives on the dot; the word next to it stays neutral so the sub-line
+   doesn't compete with the "needs you" badge, the one thing here that should
+   pull the eye. */
 .status-word {
   font-weight: 600;
   color: var(--faint);
-}
-
-.status-word.working {
-  color: var(--ok-ink);
-}
-
-.status-word.waiting {
-  color: var(--warn-ink);
-}
-
-.status-word.failed {
-  color: var(--danger-ink);
 }
 
 .decision-flag {
@@ -331,6 +333,17 @@
   font-size: var(--fs-xs);
   cursor: pointer;
   touch-action: manipulation;
+  /* Idle rows read title + status, not a row of buttons. The control appears
+     for the row you're actually on -- pointer hover, keyboard focus, or a
+     touch device, which has no hover to reveal it by. */
+  opacity: 0;
+  transition: opacity 0.1s ease;
+}
+
+.session-row-wrap:hover .row-archive,
+.session-row-wrap:focus-within .row-archive,
+.app[data-touch="true"] .row-archive {
+  opacity: 1;
 }
 
 .row-archive:hover:not(:disabled) {

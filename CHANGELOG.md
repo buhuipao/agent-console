@@ -2,6 +2,36 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.2] - 2026-09-01
+
+### Added
+- Pasted images in the Conversation tab render as a clickable thumbnail with a
+  full-size preview overlay, instead of a bare "image (not rendered in this
+  view)" placeholder. Small images (up to ~3 MB decoded) are relayed inline as
+  a data URI from Claude, Codex and pi transcripts alike; larger ones still
+  fall back to a placeholder chip rather than repeating a multi-megabyte
+  payload on every poll of the session.
+
+### Fixed
+- The web sidebar's workspace groups now carry a folder icon, and session
+  rows sit visibly indented inside their group's rail instead of flush
+  against the group header.
+- The session detail header's title no longer wraps to multiple lines and
+  overflows its row: a flex item's default `min-width: auto` was blocking the
+  ellipsis rule from ever engaging.
+- A Claude reply with no tool calls is now visibly a bubble (a distinct
+  background), rather than reading as bare text indistinguishable from the
+  pane behind it.
+- A letterboxed terminal's spare room reads as a deliberate diagonal stripe
+  again; the two stripe colors had drifted close enough to each other to look
+  like a flat black dead zone instead.
+- The Shell and Agent TUI terminals now render in the app's own monospace
+  font stack instead of silently falling back to xterm.js's default, which
+  diverged from every other monospace element in the UI.
+- The topbar's "Agent Console" title is a link back to the dashboard, the
+  Alerts button gained an icon, and on a narrow phone screen Alerts and New
+  session collapse to icon-only instead of overlapping each other.
+
 ## [0.2.1] - 2026-08-30
 
 ### Fixed

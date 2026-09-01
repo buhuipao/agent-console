@@ -11,6 +11,7 @@ use serde_json::Value;
 use super::{
     block::{
         Block, LineOutcome, Message, Role, SUMMARY_LIMIT, TEXT_LIMIT, cap, conversational_text,
+        image_data_uri,
     },
     timestamp::parse_rfc3339_seconds,
 };
@@ -97,7 +98,9 @@ fn content_block(item: &Value) -> Option<Block> {
                 text: cap(&text, TEXT_LIMIT),
             })
         }
-        "input_image" | "image" => Some(Block::Image),
+        "input_image" | "image" => Some(Block::Image {
+            data: image_data_uri(item),
+        }),
         // `encrypted_content` and friends are opaque model state, not conversation.
         _ => None,
     }

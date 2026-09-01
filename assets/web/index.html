@@ -34,11 +34,15 @@
           <rect x="0" y="10" width="15" height="2" rx="1" />
         </svg>
       </button>
-      <h1 class="brand">Agent Console</h1>
+      <h1 class="brand"><a href="#/" class="brand-link" title="Back to the dashboard">Agent Console</a></h1>
       <div class="topbar-actions">
         <div class="alerts-wrap">
           <button id="alerts-btn" class="btn btn-ghost alerts-btn" type="button" aria-haspopup="true" aria-expanded="false"
             title="Sessions that started waiting or failed" aria-label="Alerts">
+            <svg class="btn-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+              <path d="M8 1.5a4 4 0 0 0-4 4v2.2c0 .58-.2 1.14-.58 1.58L2.3 10.6c-.53.62-.1 1.6.72 1.6h9.96c.82 0 1.25-.98.72-1.6l-1.12-1.32A2.4 2.4 0 0 1 12 7.7V5.5a4 4 0 0 0-4-4Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+              <path d="M6.2 13.2a1.9 1.9 0 0 0 3.6 0" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+            </svg>
             <span class="btn-text">Alerts</span>
             <span id="alerts-badge" class="alerts-badge" aria-hidden="true" hidden>0</span>
           </button>
