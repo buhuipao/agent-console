@@ -168,37 +168,38 @@
   margin: 0 0 0.4rem;
 }
 
-/* -------------------------------------------------------------- status bar */
+/* ----------------------------------------------------------- status counts
 
-.statusbar {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  flex: none;
-  padding: 0.3rem calc(var(--safe-right) + 0.6rem) 0.3rem calc(var(--safe-left) + 0.75rem);
-  background: var(--panel);
-  border-bottom: 1px solid var(--border);
-  overflow-x: auto;
-}
+   These used to own a whole row under the top bar, with a caption on the end explaining
+   that they count every session rather than the filtered ones. A second bar is a lot of
+   screen for four numbers, so they now sit inside the top bar itself and the caption is
+   the group's tooltip. */
 
 .status-counts {
   display: flex;
   align-items: center;
-  gap: 0.35rem;
-  flex: none;
+  gap: 0.3rem;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.status-counts::-webkit-scrollbar {
+  display: none;
 }
 
 .status-chip {
   display: inline-flex;
   align-items: center;
   gap: 0.3rem;
-  min-height: 34px;
-  padding: 0 0.5rem;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: var(--panel-alt);
+  min-height: var(--ctl);
+  padding: 0 0.45rem;
+  border-radius: var(--radius);
+  border: 1px solid transparent;
+  background: transparent;
   color: var(--muted);
-  font-size: var(--fs-sm);
+  font-size: var(--fs-xs);
   font-weight: 500;
   cursor: pointer;
   white-space: nowrap;
@@ -212,10 +213,9 @@
 }
 
 .status-chip.active {
-  border-color: var(--accent);
+  border-color: var(--accent-line);
   color: var(--text);
-  background: var(--panel-raised);
-  box-shadow: inset 0 0 0 1px var(--accent);
+  background: var(--accent-soft);
 }
 
 .status-chip-count {
@@ -224,41 +224,17 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* The label is what makes a bare number readable; only the narrowest phones drop it, and
+/* The label is what makes a bare number readable; only the narrowest screens drop it, and
    the coloured dot plus the chip's title still identify it there. */
 .status-chip-word {
   text-transform: lowercase;
 }
 
-.status-scope {
-  margin-left: auto;
-  flex: none;
-  font-size: var(--fs-2xs);
-  color: var(--faint);
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-}
-
-/* Only a genuinely tiny screen loses the word; at 390px all four chips plus their labels
-   still fit, and a bare coloured number is not something anyone can read at a glance. */
-@media (max-width: 359px) {
+/* Sharing the top bar with the brand and three controls, the words are the first thing
+   that has to give -- a dot and a number still read, a truncated bar does not. */
+@media (max-width: 720px) {
   .status-chip-word {
     display: none;
-  }
-}
-
-/* The scope caption drops to its own line rather than pushing the counts into a sideways
-   scroll: "these are every session, not the filtered ones" is the whole point of it. */
-@media (max-width: 560px) {
-  .statusbar {
-    flex-wrap: wrap;
-    padding-bottom: 0.15rem;
-  }
-
-  .status-scope {
-    margin-left: 0;
-    flex-basis: 100%;
-    font-size: var(--fs-2xs);
   }
 }
 
@@ -281,16 +257,9 @@
   max-height: min(70vh, calc(var(--app-height) - 7rem));
 }
 
-/* On one pane the detail owns the screen, exactly as the top bar does. */
-.app[data-layout="compact"]:not([data-route="dashboard"]) .statusbar {
+/* On one pane the detail owns the screen: the counts filter a list that is not on it. */
+.app[data-layout="compact"]:not([data-route="dashboard"]) .status-counts {
   display: none;
-}
-
-/* Only the board and the list are filtered by these counts, so on a short screen the
-   caption they carry is not worth a second row of chrome. */
-.app[data-short="true"] .statusbar {
-  padding-top: 0.15rem;
-  padding-bottom: 0.15rem;
 }
 
 /* ------------------------------------------------------------------ search */
@@ -303,9 +272,9 @@
 
 .search-input {
   width: 100%;
-  min-height: var(--tap);
+  min-height: var(--ctl);
   /* Room for the clear button, which is a full tap target rather than a decorative glyph. */
-  padding: 0.4rem 3rem 0.4rem 0.7rem;
+  padding: 0.25rem 2.5rem 0.25rem 0.6rem;
   border-radius: var(--radius);
   border: 1px solid var(--border);
   background: var(--panel-alt);
@@ -327,8 +296,8 @@
   right: calc(var(--safe-right) + 0.8rem);
   top: 50%;
   transform: translateY(-50%);
-  min-width: var(--tap);
-  min-height: var(--tap);
+  min-width: var(--ctl);
+  min-height: var(--ctl);
   border: none;
   border-radius: 50%;
   background: transparent;

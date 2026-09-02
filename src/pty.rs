@@ -369,6 +369,23 @@ fn process_terminal_output(
     status_bar_scrollback.process(parser, bytes);
 }
 
+/// Replays the rows above the screen into a parser that a checkpoint is about to repaint.
+///
+/// The trailing blank lines are the whole trick. Writing a row scrolls the one above it out
+/// of the viewport and into the scrollback, so after the rows alone the last screenful of
+/// them is still *on* the screen -- where the checkpoint's clear erases it, and that band of
+/// lines is simply gone. One blank line per visible row pushes every seeded row past the
+/// fold first, leaving a blank screen for the checkpoint to draw over. The browser terminal
+/// seeds itself the same way; see `seedScrollback` in `termview.js`.
+///
+/// Written straight to the parser rather than through [`process_terminal_output`]: these are
+/// rows a status bar has already been taken out of, not live output for it to capture again.
+fn seed_retained_rows(parser: &mut vt100::Parser, rows: &str) {
+    let height = usize::from(parser.screen().size().0);
+    parser.process(rows.as_bytes());
+    parser.process("\r\n".repeat(height).as_bytes());
+}
+
 fn terminal_screen_view(
     parser: &vt100::Parser,
     status_bar_scrollback: &StatusBarScrollback,
@@ -1857,9 +1874,12 @@ impl RemoteTerminal {
             &DaemonRequest::Poll {
                 id: self.id.lock().unwrap().clone(),
                 offset: requested,
-                // The TUI rebuilds its own scrollback from the bytes and the status-bar rows
-                // as it always has; only a client attaching from nothing needs the snapshot.
-                scrollback: false,
+                // Asking costs nothing on the ordinary path -- the daemon only builds the
+                // snapshot alongside a checkpoint, which is exactly the answer this client
+                // cannot rebuild a history from. Attaching to a session whose raw tail has
+                // rolled over otherwise starts the TUI at one screenful with nothing above
+                // the fold, while the same session scrolls in a browser.
+                scrollback: true,
             },
         )?;
         let DaemonResponse::Poll {
@@ -1868,7 +1888,7 @@ impl RemoteTerminal {
             bytes,
             checkpoint,
             status_bar_rows,
-            scrollback: _,
+            scrollback: retained,
             cols,
             rows,
             alive,
@@ -1897,6 +1917,14 @@ impl RemoteTerminal {
         if checkpoint.is_some() || !bytes.is_empty() {
             let mut parser = self.parser.lock().unwrap();
             let mut scrollback = self.status_bar_scrollback.lock().unwrap();
+            // Only where the parser is the history. A provider whose rows the daemon keeps
+            // as status-bar scrollback sends those verbatim below, and the snapshot repeats
+            // them -- seeding both would show every line twice.
+            if let Some(retained) = retained.as_deref()
+                && status_bar_rows.as_ref().is_none_or(|rows| rows.is_empty())
+            {
+                seed_retained_rows(&mut parser, retained);
+            }
             if let Some(checkpoint) = checkpoint.as_deref() {
                 process_terminal_output(&mut parser, &mut scrollback, checkpoint);
             }
@@ -2615,6 +2643,7 @@ pub struct WorkspaceSession {
     last_layout_key: Option<WorkspaceLayoutKey>,
     clear_next_frame: bool,
     search: Option<WorkspaceSearch>,
+    rename: Option<WorkspaceRename>,
     help_open: bool,
     chrome: WorkspaceChrome,
     /// Kept from the last repaint because mouse and scroll input are resolved against the
@@ -2633,7 +2662,17 @@ type WorkspaceLayoutKey = ((u16, u16), usize, usize, Option<PaneTarget>, i16);
 #[derive(Default)]
 pub struct WorkspaceInputOutcome {
     pub search: Option<WorkspaceSearchUpdate>,
+    pub rename: Option<WorkspaceRenameUpdate>,
     pub exit: Option<WorkspaceExit>,
+}
+
+/// A session renamed from inside a workspace. Reported rather than applied on the spot for
+/// the same reason a search is: the alias lives in the `App`, which this frame does not hold.
+pub struct WorkspaceRenameUpdate {
+    pub session_key: String,
+    /// The name to keep, already trimmed. Empty means "clear it and go back to the derived
+    /// title", exactly as the dashboard's rename dialog reads an empty field.
+    pub alias: String,
 }
 
 impl WorkspaceSession {
@@ -3472,6 +3511,10 @@ pub struct WorkspaceChrome {
     pub sessions: Vec<String>,
     pub selected: usize,
     pub selected_session_key: Option<String>,
+    /// The selected session's title as the list draws it, which is what the rename prompt
+    /// opens on. The rendered `sessions` lines carry status glyphs and an agent column, so
+    /// they cannot be edited back into a name.
+    pub selected_session_title: Option<String>,
     pub search_query: String,
     pub status_counts: (usize, usize, usize, usize),
     pub preview: Vec<String>,
@@ -3484,17 +3527,25 @@ struct WorkspaceSearch {
     original_selected_session_key: Option<String>,
 }
 
+/// A rename in progress in the session list, and the session it is for.
+///
+/// The key is captured when the prompt opens rather than read again when it commits: typing
+/// does not move the selection, but a refresh between the two could.
+struct WorkspaceRename {
+    value: String,
+    session_key: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WorkspaceSearchInput {
+enum WorkspacePromptInput {
     Editing,
     Commit,
     Cancel,
 }
 
-fn apply_workspace_search_input(
-    search: &mut WorkspaceSearch,
-    input: &[u8],
-) -> (WorkspaceSearchInput, bool) {
+/// One line of typing, shared by the search and rename prompts: they differ in what they do
+/// with the value, not in how a line is edited.
+fn apply_prompt_input(value: &mut String, input: &[u8]) -> (WorkspacePromptInput, bool) {
     let mut text = Vec::new();
     let mut changed = false;
     let flush_text = |text: &mut Vec<u8>, value: &mut String| {
@@ -3517,21 +3568,21 @@ fn apply_workspace_search_input(
 
     for byte in input {
         match *byte {
-            0x1b => return (WorkspaceSearchInput::Cancel, changed),
+            0x1b => return (WorkspacePromptInput::Cancel, changed),
             b'\r' | b'\n' => {
-                changed |= flush_text(&mut text, &mut search.value);
-                return (WorkspaceSearchInput::Commit, changed);
+                changed |= flush_text(&mut text, value);
+                return (WorkspacePromptInput::Commit, changed);
             }
             0x08 | 0x7f => {
-                changed |= flush_text(&mut text, &mut search.value);
-                changed |= search.value.pop().is_some();
+                changed |= flush_text(&mut text, value);
+                changed |= value.pop().is_some();
             }
             byte if byte.is_ascii_control() => {}
             byte => text.push(byte),
         }
     }
-    changed |= flush_text(&mut text, &mut search.value);
-    (WorkspaceSearchInput::Editing, changed)
+    changed |= flush_text(&mut text, value);
+    (WorkspacePromptInput::Editing, changed)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3556,6 +3607,7 @@ struct WorkspaceLayout {
 struct WorkspaceRenderState<'a> {
     focus: WorkspaceFocus,
     search: Option<&'a str>,
+    rename: Option<&'a str>,
     help: bool,
 }
 
@@ -4107,6 +4159,7 @@ enum SessionListInput {
     NewSession,
     OpenShell,
     ToggleArchive,
+    Rename,
 }
 
 fn session_list_input(bytes: &[u8]) -> Option<SessionListInput> {
@@ -4117,6 +4170,7 @@ fn session_list_input(bytes: &[u8]) -> Option<SessionListInput> {
         b"n" => Some(SessionListInput::NewSession),
         b"s" => Some(SessionListInput::OpenShell),
         b"x" => Some(SessionListInput::ToggleArchive),
+        b"e" => Some(SessionListInput::Rename),
         _ => None,
     }
 }
@@ -5015,6 +5069,7 @@ impl SessionTerminals {
             last_layout_key: None,
             clear_next_frame: true,
             search: None,
+            rename: None,
             help_open: false,
             chrome,
             layout,
@@ -5048,10 +5103,31 @@ impl SessionTerminals {
             state.last_signature.clear();
             return Ok(None);
         }
+        if let Some(active_rename) = state.rename.as_mut() {
+            let (rename_input, _) = apply_prompt_input(&mut active_rename.value, &input);
+            match rename_input {
+                WorkspacePromptInput::Cancel => {
+                    state.rename = None;
+                }
+                WorkspacePromptInput::Commit => {
+                    let rename = state.rename.take().expect("the prompt was just borrowed");
+                    outcome.rename = Some(WorkspaceRenameUpdate {
+                        session_key: rename.session_key,
+                        alias: rename.value.trim().to_owned(),
+                    });
+                    state.exit = WorkspaceExit::RefreshSessions;
+                    state.last_signature.clear();
+                    return Ok(Some(state.exit));
+                }
+                WorkspacePromptInput::Editing => {}
+            }
+            state.last_signature.clear();
+            return Ok(None);
+        }
         if let Some(active_search) = state.search.as_mut() {
-            let (search_input, changed) = apply_workspace_search_input(active_search, &input);
+            let (search_input, changed) = apply_prompt_input(&mut active_search.value, &input);
             match search_input {
-                WorkspaceSearchInput::Cancel => {
+                WorkspacePromptInput::Cancel => {
                     outcome.search = Some(WorkspaceSearchUpdate::Cancel {
                         query: active_search.original_query.clone(),
                         selected_session_key: active_search.original_selected_session_key.clone(),
@@ -5059,18 +5135,18 @@ impl SessionTerminals {
                     state.exit = WorkspaceExit::RefreshSessions;
                     return Ok(Some(state.exit));
                 }
-                WorkspaceSearchInput::Commit => {
+                WorkspacePromptInput::Commit => {
                     if changed {
                         outcome.search =
                             Some(WorkspaceSearchUpdate::Preview(active_search.value.clone()));
                     }
                     state.search = None;
                 }
-                WorkspaceSearchInput::Editing if changed => {
+                WorkspacePromptInput::Editing if changed => {
                     outcome.search =
                         Some(WorkspaceSearchUpdate::Preview(active_search.value.clone()));
                 }
-                WorkspaceSearchInput::Editing => {}
+                WorkspacePromptInput::Editing => {}
             }
             state.last_signature.clear();
             return Ok(None);
@@ -5108,6 +5184,20 @@ impl SessionTerminals {
                             Some(SessionListInput::ToggleArchive) => {
                                 state.exit = WorkspaceExit::ToggleArchive;
                                 return Ok(Some(state.exit));
+                            }
+                            Some(SessionListInput::Rename) => {
+                                if let Some(session_key) = state.chrome.selected_session_key.clone()
+                                {
+                                    state.rename = Some(WorkspaceRename {
+                                        value: state
+                                            .chrome
+                                            .selected_session_title
+                                            .clone()
+                                            .unwrap_or_default(),
+                                        session_key,
+                                    });
+                                    state.last_signature.clear();
+                                }
                             }
                             None => {}
                         }
@@ -5416,6 +5506,10 @@ impl SessionTerminals {
                         .search
                         .as_ref()
                         .map(|search: &WorkspaceSearch| search.value.as_str()),
+                    rename: state
+                        .rename
+                        .as_ref()
+                        .map(|rename: &WorkspaceRename| rename.value.as_str()),
                     help: state.help_open,
                 },
                 &state.render_bindings,
@@ -5617,6 +5711,7 @@ fn render_workspace(
         WorkspaceRenderState {
             focus,
             search: None,
+            rename: None,
             help: false,
         },
         &WorkspaceBindings::from_config(&AgentConsoleConfig::default()),
@@ -5650,6 +5745,7 @@ fn render_workspace_frame(
     let WorkspaceRenderState {
         focus,
         search,
+        rename,
         help,
     } = state;
     if clear {
@@ -5789,6 +5885,11 @@ fn render_workspace_frame(
         (
             " WORKSPACE HELP ".to_owned(),
             format!("  {} or Esc close", bindings.label("help")),
+        )
+    } else if let Some(name) = rename {
+        (
+            " RENAME SESSION ".to_owned(),
+            format!("  {name}█  ·  Enter save  Esc cancel  empty clears the name"),
         )
     } else if let Some(query) = search {
         (
@@ -10147,6 +10248,7 @@ mod tests {
             sessions: vec!["▾ repo".into(), "○ Cdx select output".into()],
             selected: 1,
             selected_session_key: None,
+            selected_session_title: None,
             search_query: String::new(),
             status_counts: (0, 0, 1, 0),
             preview: vec!["preview".into()],
@@ -10487,6 +10589,7 @@ mod tests {
         assert_eq!(session_list_input(b"j"), Some(SessionListInput::Next));
         assert_eq!(session_list_input(b"\r"), Some(SessionListInput::Activate));
         assert_eq!(session_list_input(b"n"), Some(SessionListInput::NewSession));
+        assert_eq!(session_list_input(b"e"), Some(SessionListInput::Rename));
         assert_eq!(session_list_input(b"s"), Some(SessionListInput::OpenShell));
         assert_eq!(
             session_list_input(b"x"),
@@ -10502,9 +10605,9 @@ mod tests {
             original_selected_session_key: None,
         };
 
-        let (input, changed) = apply_workspace_search_input(&mut search, b"\x7f\x7f\x7fnew\r");
+        let (input, changed) = apply_prompt_input(&mut search.value, b"\x7f\x7f\x7fnew\r");
 
-        assert_eq!(input, WorkspaceSearchInput::Commit);
+        assert_eq!(input, WorkspacePromptInput::Commit);
         assert!(changed);
         assert_eq!(search.value, "new");
     }
@@ -10516,6 +10619,7 @@ mod tests {
             sessions: vec!["repo  codex".into()],
             selected: 0,
             selected_session_key: None,
+            selected_session_title: None,
             search_query: String::new(),
             status_counts: (0, 0, 1, 0),
             preview: vec!["preview".into()],
@@ -10544,6 +10648,7 @@ mod tests {
             sessions: vec!["repo  codex".into()],
             selected: 0,
             selected_session_key: None,
+            selected_session_title: None,
             search_query: String::new(),
             status_counts: (0, 0, 1, 0),
             preview: vec!["preview".into()],
@@ -10578,6 +10683,7 @@ mod tests {
             sessions: vec!["▾ repo".into(), "○ Cdx current task".into()],
             selected: 1,
             selected_session_key: None,
+            selected_session_title: None,
             search_query: String::new(),
             status_counts: (0, 0, 1, 0),
             preview: vec!["preview".into()],
@@ -10605,6 +10711,7 @@ mod tests {
             sessions: vec!["▾ repo".into(), "○ Cdx current task".into()],
             selected: 1,
             selected_session_key: None,
+            selected_session_title: None,
             search_query: String::new(),
             status_counts: (2, 1, 18, 3),
             preview: vec!["preview".into()],
@@ -10762,6 +10869,7 @@ mod tests {
             sessions: vec!["▾ repo".into(), "Cdx fix focus".into()],
             selected: 1,
             selected_session_key: None,
+            selected_session_title: None,
             search_query: String::new(),
             status_counts: (0, 0, 1, 0),
             preview: vec!["preview".into()],
@@ -10808,6 +10916,7 @@ mod tests {
             sessions: vec!["▾ repo".into(), "○ Cdx inspect shell".into()],
             selected: 1,
             selected_session_key: None,
+            selected_session_title: None,
             search_query: String::new(),
             status_counts: (0, 0, 1, 0),
             preview: vec!["preview".into()],
@@ -10846,6 +10955,7 @@ mod tests {
             sessions: vec!["▾ repo".into(), "○ Cdx inspect session".into()],
             selected: 1,
             selected_session_key: None,
+            selected_session_title: None,
             search_query: String::new(),
             status_counts: (0, 0, 1, 0),
             preview: vec!["preview".into()],
@@ -10883,6 +10993,7 @@ mod tests {
             sessions: vec!["▾ repo".into(), "○ Cdx inspect session".into()],
             selected: 1,
             selected_session_key: None,
+            selected_session_title: None,
             search_query: String::new(),
             status_counts: (0, 0, 1, 0),
             preview: vec!["preview".into()],
@@ -10914,6 +11025,7 @@ mod tests {
             sessions: vec!["▾ repo".into(), "○ Cdx inspect session".into()],
             selected: 1,
             selected_session_key: None,
+            selected_session_title: None,
             search_query: String::new(),
             status_counts: (0, 1, 1, 0),
             preview: vec!["preview".into()],
@@ -10974,6 +11086,7 @@ mod tests {
             sessions: vec!["▾ repo".into(), "○ Cla latency".into()],
             selected: 1,
             selected_session_key: Some("claude:latency".into()),
+            selected_session_title: None,
             search_query: "latency".into(),
             status_counts: (0, 0, 1, 0),
             preview: vec!["preview".into()],
@@ -10990,6 +11103,7 @@ mod tests {
             WorkspaceRenderState {
                 focus: WorkspaceFocus::Sessions,
                 search: Some("latency"),
+                rename: None,
                 help: false,
             },
             &WorkspaceBindings::from_config(&AgentConsoleConfig::default()),
@@ -11017,6 +11131,7 @@ mod tests {
             sessions: vec!["▾ repo".into(), "○ Cdx KEEP".into(), "○ Cdx DROP".into()],
             selected: 1,
             selected_session_key: Some("codex:keep".into()),
+            selected_session_title: None,
             search_query: String::new(),
             status_counts: (0, 0, 2, 0),
             preview: vec!["preview".into()],
@@ -11030,6 +11145,7 @@ mod tests {
             WorkspaceRenderState {
                 focus: WorkspaceFocus::Sessions,
                 search: None,
+                rename: None,
                 help: false,
             },
             &bindings,
@@ -11054,6 +11170,7 @@ mod tests {
             WorkspaceRenderState {
                 focus: WorkspaceFocus::Sessions,
                 search: Some("keep"),
+                rename: None,
                 help: false,
             },
             &bindings,
@@ -11074,6 +11191,7 @@ mod tests {
             sessions: vec!["▾ repo".into(), "○ Cla latency".into()],
             selected: 1,
             selected_session_key: Some("claude:latency".into()),
+            selected_session_title: None,
             search_query: String::new(),
             status_counts: (0, 0, 1, 0),
             preview: vec!["preview".into()],
@@ -11090,6 +11208,7 @@ mod tests {
             WorkspaceRenderState {
                 focus: WorkspaceFocus::Sessions,
                 search: None,
+                rename: None,
                 help: true,
             },
             &WorkspaceBindings::from_config(&AgentConsoleConfig::default()),
@@ -11127,6 +11246,7 @@ mod tests {
             sessions: vec!["▾ repo".into(), "Cdx current task".into()],
             selected: 1,
             selected_session_key: None,
+            selected_session_title: None,
             search_query: String::new(),
             status_counts: (0, 0, 1, 0),
             preview: vec!["STALE SESSION PREVIEW".into()],
@@ -11172,6 +11292,7 @@ mod tests {
             sessions: vec!["▾ repo".into(), "○ Cdx inspect history".into()],
             selected: 1,
             selected_session_key: None,
+            selected_session_title: None,
             search_query: String::new(),
             status_counts: (0, 0, 1, 0),
             preview: vec!["preview".into()],
@@ -11263,6 +11384,7 @@ mod tests {
             ],
             selected: 1,
             selected_session_key: None,
+            selected_session_title: None,
             search_query: String::new(),
             status_counts: (0, 1, 1, 0),
             preview: vec!["preview".into()],
@@ -11704,6 +11826,64 @@ mod tests {
             stream.write_all(response.as_bytes()).unwrap();
             stream.write_all(b"\n").unwrap();
         });
+    }
+
+    /// A session whose raw tail has rolled over answers a first poll with a checkpoint --
+    /// one screenful -- and nothing else. A TUI that did not ask for the rows above it
+    /// attached to a day-old agent with no history at all: the wheel found nothing to scroll
+    /// while the very same session scrolled fine in a browser, which does ask.
+    #[cfg(unix)]
+    #[test]
+    fn a_tui_attaching_past_the_raw_tail_scrolls_the_rows_above_the_checkpoint() {
+        let root = tempdir().unwrap();
+        let socket = root.path().join("daemon.sock");
+        let asked = Arc::new(Mutex::new(String::new()));
+        let seen = Arc::clone(&asked);
+        serve_one_request(&socket, move |line| {
+            *seen.lock().unwrap() = line;
+            serde_json::to_string(&DaemonResponse::Poll {
+                start: 4096,
+                end: 4096,
+                bytes: Vec::new(),
+                checkpoint: Some(b"\x1b[2J\x1b[HSCREEN".to_vec()),
+                status_bar_rows: Some(Vec::new()),
+                scrollback: Some(
+                    (1..=12)
+                        .map(|row| format!("history-{row}"))
+                        .collect::<Vec<_>>()
+                        .join("\r\n"),
+                ),
+                cols: 40,
+                rows: 6,
+                alive: true,
+                exit: None,
+            })
+            .unwrap()
+        });
+
+        let terminal =
+            RemoteTerminal::connect(socket, "agent|claude:one".into(), "owner".into(), (40, 6))
+                .unwrap();
+
+        let request = asked.lock().unwrap().clone();
+        assert!(
+            request.contains("\"scrollback\":true"),
+            "a client attaching from nothing has to ask for the rows it cannot replay: {request}"
+        );
+        assert!(
+            terminal.scroll_viewport(3) > 0,
+            "a checkpoint-only attach left the wheel with nothing above the fold"
+        );
+        let scrolled = terminal
+            .screen_view()
+            .rows
+            .iter()
+            .map(|row| plain_text(row))
+            .collect::<String>();
+        assert!(
+            scrolled.contains("history-"),
+            "scrolling back landed on: {scrolled}"
+        );
     }
 
     /// Tolerating the version gap field by field is what let an upgrade go quiet: the older

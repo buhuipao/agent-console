@@ -2,6 +2,50 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-09-02
+
+### Changed
+- The web UI is redesigned around the density it always needed. The status
+  counts moved into the top bar, so the app opens with one bar of chrome
+  instead of two; the session list shows a one-line title over a line of
+  monospace facts (status, agent, age, branch) under a one-line workspace
+  header, which roughly halves a row's height and doubles what fits on screen;
+  the view tabs are underlined rather than boxed; the summary is a line with a
+  rule under it rather than a card; and a turn's tool calls read as a log on a
+  rail instead of a stack of bordered, filled boxes competing with the reply
+  beside them. Buttons share one system with a single accent -- only "New
+  session" and "Send" are primary -- and every control is 32px under a pointer
+  and the full 44px under a finger. The document's default type steps down with
+  it: conversation prose and the board's task lines were set two steps above the
+  list rows beside them, which read as a reading app rather than a console.
+
+### Added
+- Sessions can be renamed from the list itself, on both surfaces. The TUI's
+  rename dialog now has a default key (`e`) and a footer hint -- it existed
+  before but nothing was bound to it -- and every row in the web sidebar
+  carries a Rename entry in the overflow menu beside its Archive one. In the
+  TUI's own session list -- the one inside an open workspace -- `e` opens the
+  same prompt on the status line, saving with Enter and clearing with an empty
+  value. All of them open on the title the list is showing rather than on an
+  empty field, because renaming is almost always trimming a long derived title
+  down to something readable.
+
+### Fixed
+- A session driven entirely through a slash command is titled by what the user
+  asked for, not by the prose a hook injected afterwards. Claude marks the
+  turns it writes on the user's behalf with `isMeta`, which the title parser
+  now skips, and it reads a slash command's arguments -- so `/goal ship the
+  release` titles the session "ship the release" instead of "A session-scoped
+  Stop hook is now active with condition: ...". Titles cached under the old
+  rules are re-derived once rather than pinned forever.
+- The TUI can scroll back through an agent's history again on a session whose
+  output has outgrown the daemon's retained byte tail. Such a session answers a
+  first poll with a checkpoint -- one screenful -- instead of replayable bytes,
+  and the TUI never asked for the rows above it, so attaching to a long-running
+  agent gave a terminal with nothing above the fold while the very same session
+  scrolled fine in a browser, which does ask. The wheel found no history to move
+  and quietly handed the event to the agent instead.
+
 ## [0.2.2] - 2026-09-01
 
 ### Added

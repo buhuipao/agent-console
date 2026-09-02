@@ -316,6 +316,7 @@ impl AgentConsoleConfig {
                     format!("{:<22} {}", "new session", "N"),
                     format!("{:<22} {}", "open shell", "S"),
                     format!("{:<22} {}", "archive / restore", "X"),
+                    format!("{:<22} {}", "rename session", "E"),
                 ]);
             }
             for (action, label) in actions {
@@ -528,7 +529,7 @@ fn default_dashboard_keys(action: &str) -> &'static [&'static str] {
         "alert" => &["a"],
         "retry_summary" => &["r"],
         "search" => &["/"],
-        "alias" => &[],
+        "alias" => &["e"],
         "archive" => &["x"],
         "help" => &["?"],
         _ => &[],
@@ -840,8 +841,9 @@ mod tests {
         assert_eq!(config.dashboard_action("x"), Some("archive"));
         assert_eq!(config.dashboard_action("t"), Some("takeover"));
         assert_eq!(config.dashboard_action("r"), Some("retry_summary"));
+        assert_eq!(config.dashboard_action("e"), Some("alias"));
         assert_eq!(config.dashboard_action(":"), None);
-        for key in ["y", "i", "u", "m", "e", "f", "g", "w", "c", "v", "p", "o"] {
+        for key in ["y", "i", "u", "m", "f", "g", "w", "c", "v", "p", "o"] {
             assert_eq!(
                 config.dashboard_action(key),
                 None,
@@ -891,6 +893,7 @@ mod tests {
             ("new session", "N"),
             ("open shell", "S"),
             ("archive / restore", "X"),
+            ("rename session", "E"),
             ("focus last shell", "m"),
             ("focus agent", "h"),
             ("select shell", "Alt-1, 2, 3, 4, 5, 6, 7, 8, 9"),

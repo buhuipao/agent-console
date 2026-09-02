@@ -1,9 +1,10 @@
 // Renaming a session.
 //
-// The field is prefilled with the session's `alias` -- the explicit name -- and never with
-// `title`, which is usually the derived one (the first prompt, or the directory). Prefilling
-// the derived title would turn every rename dialog someone opened and confirmed into a
-// permanent alias pinning whatever the title happened to be that day.
+// The field opens on the title the list is showing -- the session's `alias` when it has one,
+// otherwise the derived title (the first prompt, or the directory). Renaming is nearly always
+// editing a long derived title down to something readable, and an empty field makes that
+// retyping. Confirming the prefill unchanged does pin that title as an explicit name, which
+// is what asking to rename and then keeping the name means; Clear puts it back to derived.
 //
 // The alias is written through the same store the TUI reads, so a rename here retitles the
 // session in a running TUI too.
@@ -45,10 +46,10 @@ export function openRenameDialog(key) {
   const session = getSession(key);
   if (!session) return;
   currentKey = key;
-  nodes.input.value = session.alias || "";
+  nodes.input.value = session.alias || session.title || "";
   nodes.hint.textContent = session.alias
     ? "Clearing the name restores the title Agent Console derives from the session."
-    : `Without a name this session is titled “${session.title}”.`;
+    : "Saving keeps this as the session's name; clearing it later restores the derived title.";
   nodes.clear.hidden = !session.alias;
   nodes.error.hidden = true;
   nodes.overlay.hidden = false;

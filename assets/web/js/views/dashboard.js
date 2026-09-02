@@ -8,6 +8,7 @@
 // the thing anyone reading that number was about to do by hand.
 
 import { ApiError, archiveSession } from "../api.js";
+import { openRenameDialog } from "../dialogs/rename.js";
 import { byId, clear, el, inferHome, prettyPath, toast } from "../dom.js";
 import { sessionHash } from "../router.js";
 import {
@@ -163,6 +164,10 @@ function render(state) {
   // scroll position and fight with a tap that is already in flight.
   const next = describe(workspaces, state.error);
   if (next === signature) return;
+  // An open row menu is a live interaction, and every row's age string changes often enough
+  // that a rebuild would land under someone's finger. Leaving `signature` alone means the
+  // next poll after the menu closes still picks the change up.
+  if (document.querySelector(".row-menu:not([hidden])")) return;
   signature = next;
 
   clear(nodes.list);
@@ -221,28 +226,29 @@ function workspaceSection(workspace, home) {
     el("span", { text: String(workspace.sessions.length) }),
   ]);
 
+  // The path is the tooltip rather than a second line: it disambiguates two groups with
+  // the same basename, which is rare, and it cost a line on every group, which is not.
   const header = el(
     "button",
     {
       class: "workspace-header",
       type: "button",
       "aria-expanded": String(!isCollapsed),
-      title: workspace.path || "workspace",
+      title: prettyPath(workspace.path, home) || "workspace",
     },
     [
       el("span", { class: "workspace-caret", "aria-hidden": "true", text: "▾" }),
-      el("span", { class: "workspace-icon", "aria-hidden": "true", text: "📁" }),
-      el("span", { class: "workspace-labels" }, [
-        el("span", { class: "workspace-name", text: workspace.name }),
-        el("span", { class: "workspace-path", text: prettyPath(workspace.path, home) }),
-      ]),
+      el("span", { class: "workspace-name", text: workspace.name }),
       tally,
     ],
   );
 
   const list = el("ul", { class: "workspace-sessions" });
   for (const session of workspace.sessions) {
-    list.append(el("li", { class: "session-row-wrap" }, [sessionRow(session, home), archiveButton(session)]));
+    list.append(el("li", { class: "session-row-wrap" }, [
+      sessionRow(session, home),
+      ...rowOverflow(session),
+    ]));
   }
 
   const section = el("section", {
@@ -273,7 +279,9 @@ function sessionRow(session, home) {
       ? el("span", { text: session.activity_age, title: "time since last activity" })
       : null,
     session.branch ? el("span", { class: "sep", text: "·" }) : null,
-    session.branch ? el("span", { text: session.branch, title: "git branch" }) : null,
+    session.branch
+      ? el("span", { class: "branch", text: session.branch, title: "git branch" })
+      : null,
     pending
       ? el("span", {
           class: "decision-flag",
@@ -284,13 +292,15 @@ function sessionRow(session, home) {
     session.archived ? el("span", { class: "archived-flag", text: "archived" }) : null,
   ]);
 
+  // The title is one clipped line, so the tooltip carries it in full alongside the path --
+  // otherwise a row whose title is a paragraph of prompt is unidentifiable at a glance.
   const row = el(
     "a",
     {
       class: "session-row" + (session.key === activeKey ? " active" : ""),
       href: sessionHash(session.key),
       dataset: { key: session.key },
-      title: prettyPath(session.cwd, home),
+      title: `${session.title}\n${prettyPath(session.cwd, home)}`,
     },
     [
       el("span", { class: `dot ${session.status}`, "aria-hidden": "true" }),
@@ -303,23 +313,79 @@ function sessionRow(session, home) {
   return row;
 }
 
-/** Per-row archive, so tidying the list does not mean opening every session first. It is a
-    sibling of the row link rather than a child: a button inside an anchor is not valid HTML
-    and swallows the tap on touch. */
-function archiveButton(session) {
-  const label = session.archived ? "Restore session" : "Archive session";
-  return el("button", {
-    class: "row-archive",
+/** One glyph and the menu it opens, for renaming and archiving from the list itself.
+ *
+ * Both were labelled buttons floating over the row, and two controls wide enough to read
+ * covered the title they belonged to -- the one thing that says which session is about to
+ * be renamed. A single glyph fits the gutter the row reserves for it, and the actions get
+ * room to be named properly once the menu is open.
+ *
+ * Siblings of the row link rather than children: a button inside an anchor is not valid
+ * HTML and swallows the tap on touch. */
+function rowOverflow(session) {
+  const menu = el("div", { class: "row-menu", role: "menu", hidden: true }, [
+    el("button", {
+      class: "menu-item",
+      type: "button",
+      role: "menuitem",
+      text: "Rename session",
+      onclick: (event) => {
+        event.preventDefault();
+        closeRowMenus();
+        openRenameDialog(session.key);
+      },
+    }),
+    el("button", {
+      class: "menu-item",
+      type: "button",
+      role: "menuitem",
+      text: session.archived ? "Restore session" : "Archive session",
+      onclick: (event) => {
+        event.preventDefault();
+        closeRowMenus();
+        toggleArchive(session, event.currentTarget);
+      },
+    }),
+  ]);
+
+  const button = el("button", {
+    class: "row-menu-btn",
     type: "button",
-    title: label,
-    "aria-label": `${label}: ${session.title}`,
-    text: session.archived ? "Restore" : "Archive",
+    "aria-haspopup": "true",
+    "aria-expanded": "false",
+    title: "Rename or archive",
+    "aria-label": `Actions for ${session.title}`,
+    text: "⋯",
     onclick: (event) => {
       event.preventDefault();
-      toggleArchive(session, event.currentTarget);
+      const opening = menu.hidden;
+      closeRowMenus();
+      if (!opening) return;
+      menu.hidden = false;
+      button.setAttribute("aria-expanded", "true");
     },
   });
+
+  return [button, menu];
 }
+
+/** Closes whichever row menu is open. Called before opening another, and by the document
+    handlers below, so at most one is ever up. */
+function closeRowMenus() {
+  for (const menu of document.querySelectorAll(".row-menu")) menu.hidden = true;
+  for (const button of document.querySelectorAll(".row-menu-btn")) {
+    button.setAttribute("aria-expanded", "false");
+  }
+}
+
+document.addEventListener("click", (event) => {
+  if (event.target instanceof Element && event.target.closest(".row-menu, .row-menu-btn")) return;
+  closeRowMenus();
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") closeRowMenus();
+});
 
 async function toggleArchive(session, button) {
   button.disabled = true;

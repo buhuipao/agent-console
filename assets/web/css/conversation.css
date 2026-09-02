@@ -105,7 +105,7 @@
 
 .decision-question {
   margin: 0 0 0.5rem;
-  font-size: var(--fs-md);
+  font-size: var(--fs-base);
   line-height: 1.4;
   color: var(--text);
   overflow-wrap: anywhere;
@@ -162,22 +162,30 @@
   line-height: 1.3;
 }
 
+/* A bordered card for one line of text put a third bar between the tabs and the first
+   message. It is a rule with a line on it now: same words, no box, and the detail still
+   expands underneath when it is asked for. */
 .summary-card {
-  margin: 0.5rem calc(var(--safe-right) + 0.7rem) 0 calc(var(--safe-left) + 0.7rem);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+  margin: 0;
+  border: none;
+  border-bottom: 1px solid var(--border-soft);
+  border-radius: 0;
   background: var(--panel);
-  font-size: var(--fs-sm);
+  font-size: var(--fs-xs);
 }
 
 .summary-card > summary {
   list-style: none;
   cursor: pointer;
-  padding: 0.55rem 0.75rem;
+  padding: 0.15rem calc(var(--safe-right) + 0.7rem) 0.15rem calc(var(--safe-left) + 0.7rem);
   display: flex;
   align-items: center;
   gap: 0.45rem;
-  min-height: var(--tap);
+  min-height: var(--ctl);
+}
+
+.summary-card > summary:hover {
+  background: var(--panel-alt);
 }
 
 .summary-card > summary::-webkit-details-marker {
@@ -202,14 +210,14 @@
 }
 
 .summary-card-empty {
-  padding: 0.35rem 0.75rem;
+  padding: 0 calc(var(--safe-right) + 0.7rem) 0 calc(var(--safe-left) + 0.7rem);
 }
 
 .summary-empty-row {
   display: flex;
   align-items: center;
   gap: 0.45rem;
-  min-height: var(--tap);
+  min-height: var(--ctl);
 }
 
 .summary-task.muted {
@@ -218,18 +226,20 @@
 
 .summary-retry {
   flex: none;
-  min-height: 32px;
-  padding: 0 0.55rem;
-  border-radius: 7px;
-  border: 1px solid var(--border);
-  background: var(--panel-alt);
-  color: var(--text);
-  font-size: var(--fs-xs);
+  min-height: 24px;
+  padding: 0 0.45rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  font-size: var(--fs-2xs);
   cursor: pointer;
 }
 
 .summary-retry:hover:not(:disabled) {
   background: var(--panel-raised);
+  border-color: var(--border);
+  color: var(--text);
 }
 
 .summary-retry:disabled {
@@ -238,7 +248,7 @@
 }
 
 .summary-body {
-  padding: 0 0.75rem 0.7rem;
+  padding: 0 calc(var(--safe-right) + 0.7rem) 0.55rem calc(var(--safe-left) + 0.7rem);
   color: var(--muted);
 }
 
@@ -270,10 +280,10 @@
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
   overscroll-behavior: contain;
-  padding: 0.75rem calc(var(--safe-right) + 0.7rem) 0.5rem calc(var(--safe-left) + 0.7rem);
+  padding: 0.55rem calc(var(--safe-right) + 0.7rem) 0.5rem calc(var(--safe-left) + 0.7rem);
   display: flex;
   flex-direction: column;
-  gap: 0.7rem;
+  gap: 0.5rem;
 }
 
 .msg {
@@ -293,8 +303,8 @@
 }
 
 .msg-body {
-  border-radius: 12px;
-  padding: 0.6rem 0.8rem;
+  border-radius: var(--radius);
+  padding: 0.5rem 0.7rem;
   border: 1px solid var(--border);
   background: var(--panel);
   min-width: 0;
@@ -435,11 +445,20 @@
 
 /* --------------------------------------------------- thinking / tool blocks */
 
+/* Every tool call used to be its own bordered, filled card. A turn with a dozen of them
+   read as a dozen competing containers stacked against the one bubble that held the reply.
+   They are a log now -- a rail on the left, monospace, no fill -- which is both what they
+   are and what makes the assistant's prose the thing that stands out. */
 .fold {
-  border: 1px solid var(--border-soft);
-  border-radius: 8px;
-  background: var(--panel-alt);
+  border: none;
+  border-left: 2px solid var(--border);
+  border-radius: 0;
+  background: transparent;
   overflow: hidden;
+}
+
+.fold[open] {
+  border-left-color: var(--accent-line);
 }
 
 .fold > summary {
@@ -448,9 +467,10 @@
   display: flex;
   align-items: center;
   gap: 0.45rem;
-  padding: 0.4rem 0.55rem;
-  min-height: 38px;
-  font-size: var(--fs-sm);
+  padding: 0.1rem 0.5rem;
+  min-height: 26px;
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
   color: var(--muted);
 }
 
@@ -459,7 +479,8 @@
 }
 
 .fold > summary:hover {
-  background: var(--panel-raised);
+  background: var(--panel-alt);
+  color: var(--text);
 }
 
 .fold-caret {
@@ -482,7 +503,7 @@
 }
 
 .fold-detail {
-  padding: 0.1rem 0.6rem 0.55rem;
+  padding: 0.1rem 0.6rem 0.45rem;
   font-size: var(--fs-sm);
   color: var(--text);
   overflow-wrap: anywhere;
@@ -497,15 +518,18 @@
   color: var(--muted);
 }
 
+/* The tool's name, in the row's own monospace. A boxed chip on every line turned the
+   stream back into a column of buttons; weight and colour separate it from the argument
+   beside it without drawing another border. */
 .chip {
   flex: none;
-  padding: 0.1rem 0.4rem;
-  border-radius: 5px;
-  border: 1px solid var(--border);
-  background: var(--panel-raised);
+  padding: 0;
+  border: none;
+  background: transparent;
   color: var(--text);
   font-family: var(--mono);
   font-size: var(--fs-xs);
+  font-weight: 600;
 }
 
 .chip.ok {
@@ -520,7 +544,7 @@
 
 .fold.thinking {
   background: transparent;
-  border-style: dashed;
+  border-left-style: dashed;
 }
 
 .fold.error > summary {
@@ -731,10 +755,18 @@
   opacity: 0.5;
 }
 
+/* Bottom-aligned: the prompt field grows as it is typed into and the buttons stay level
+   with its last line rather than floating in the middle of a tall box. */
 .composer-side {
   display: flex;
+  align-items: flex-end;
   gap: 0.4rem;
   flex: none;
+}
+
+.composer-side .btn {
+  min-height: 36px;
+  padding: 0 0.85rem;
 }
 
 .composer-hint {

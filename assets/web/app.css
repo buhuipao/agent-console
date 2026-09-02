@@ -84,9 +84,16 @@
   --safe-bottom: env(safe-area-inset-bottom, 0px);
   --safe-left: env(safe-area-inset-left, 0px);
   --safe-right: env(safe-area-inset-right, 0px);
-  --radius: 10px;
-  --radius-sm: 7px;
+  --radius: 8px;
+  --radius-sm: 6px;
   --tap: 44px;
+  /* The height every button, chip and input actually gets. A pointer does not need a
+     44px target and pays for it in rows lost off the bottom of the list, so the touch
+     minimum is applied where it is needed -- see `.app[data-touch="true"]` -- rather
+     than to every control on every device. */
+  --ctl: 32px;
+  /* One row of the session list, and the chrome bars that frame it. */
+  --bar: 46px;
   /* Overwritten from JS when the desktop split is dragged. */
   --sidebar-width: 360px;
   /* Overwritten from JS with visualViewport.height so the composer stays above
@@ -123,7 +130,12 @@ body {
   background: var(--bg);
   color: var(--text);
   font-family: var(--sans);
-  font-size: var(--fs-md);
+  /* The document default, which conversation prose and anything else unsized inherits.
+     It was a step higher, which read as a reading app rather than a console: beside a
+     14px list row a 17.5px paragraph is not emphasis, it is a mismatch. Headlines that
+     should stand above it -- the brand, a session title, a card's task -- say so
+     themselves rather than relying on everything else being large too. */
+  font-size: var(--fs-base);
   line-height: var(--lh-body);
   overflow: hidden;
   overscroll-behavior: none;
@@ -157,6 +169,11 @@ a {
   }
 }
 
+/* A finger gets the full 44px target; a mouse does not. */
+.app[data-touch="true"] {
+  --ctl: var(--tap);
+}
+
 /* ------------------------------------------------------------------ shell */
 
 .app {
@@ -172,7 +189,8 @@ a {
   align-items: center;
   gap: 0.5rem;
   flex: none;
-  padding: calc(var(--safe-top) + 0.45rem) calc(var(--safe-right) + 0.6rem) 0.45rem
+  min-height: calc(var(--safe-top) + var(--bar));
+  padding: calc(var(--safe-top) + 0.3rem) calc(var(--safe-right) + 0.6rem) 0.3rem
     calc(var(--safe-left) + 0.6rem);
   background: var(--panel);
   border-bottom: 1px solid var(--border);
@@ -180,10 +198,13 @@ a {
 
 .brand {
   margin: 0;
+  flex: none;
   min-width: 0;
-  font-size: var(--fs-xl);
+  /* The brand is a landmark, not the headline: the session you are reading is. It sits a
+     step down from the display sizes it used to use so the two do not compete. */
+  font-size: var(--fs-md);
   font-weight: 650;
-  letter-spacing: -0.015em;
+  letter-spacing: -0.01em;
 }
 
 .brand-link {
@@ -203,7 +224,8 @@ a {
 .topbar-actions {
   margin-left: auto;
   display: flex;
-  gap: 0.4rem;
+  align-items: center;
+  gap: 0.35rem;
   flex: none;
 }
 
@@ -241,14 +263,14 @@ a {
   align-items: center;
   justify-content: center;
   gap: 0.35rem;
-  min-height: var(--tap);
-  min-width: var(--tap);
-  padding: 0 0.75rem;
+  min-height: var(--ctl);
+  min-width: var(--ctl);
+  padding: 0 0.6rem;
   border-radius: var(--radius);
   border: 1px solid var(--border);
   background: var(--panel-alt);
   color: var(--text);
-  font-size: var(--fs-base);
+  font-size: var(--fs-sm);
   font-weight: 500;
   line-height: 1;
   cursor: pointer;
@@ -285,11 +307,19 @@ a {
   outline-offset: 2px;
 }
 
+/* Exactly two things in this UI are primary -- starting a session and sending a prompt.
+   Everything else is ghost or quiet, so the accent still means "this is the action". */
 .btn-primary {
   background: var(--accent);
   border-color: var(--accent);
   color: var(--accent-ink);
   font-weight: 650;
+}
+
+/* A glyph-only control: square, no padding to make it lopsided. */
+.btn-square {
+  padding: 0;
+  width: var(--ctl);
 }
 
 .btn-primary:hover:not(:disabled) {
@@ -305,6 +335,14 @@ a {
 
 .btn-ghost {
   background: transparent;
+  border-color: transparent;
+  color: var(--muted);
+}
+
+.btn-ghost:hover:not(:disabled) {
+  background: var(--panel-alt);
+  border-color: var(--border);
+  color: var(--text);
 }
 
 .btn-icon {
@@ -408,9 +446,10 @@ svg.btn-icon {
 .session-header {
   display: flex;
   align-items: center;
-  gap: 0.55rem;
+  gap: 0.5rem;
   flex: none;
-  padding: 0.4rem calc(var(--safe-right) + 0.6rem) 0.4rem calc(var(--safe-left) + 0.6rem);
+  min-height: var(--bar);
+  padding: 0.25rem calc(var(--safe-right) + 0.6rem) 0.25rem calc(var(--safe-left) + 0.6rem);
   border-bottom: 1px solid var(--border-soft);
   background: var(--panel);
 }
@@ -447,12 +486,15 @@ svg.btn-icon {
   text-overflow: ellipsis;
 }
 
+/* Path, branch, age: facts about the session rather than prose, so they are set in the
+   same monospace the terminals use and sit a step dimmer than the title above them. */
 .session-meta {
   display: flex;
   align-items: center;
   gap: 0.4rem;
-  font-size: var(--fs-xs);
-  color: var(--muted);
+  font-family: var(--mono);
+  font-size: var(--fs-2xs);
+  color: var(--faint);
   min-width: 0;
 }
 
@@ -494,13 +536,14 @@ svg.btn-icon {
   display: block;
   width: 100%;
   text-align: left;
-  min-height: var(--tap);
+  min-height: var(--ctl);
   padding: 0 0.7rem;
   border: none;
   border-radius: var(--radius-sm);
   background: transparent;
+  color: var(--text);
   cursor: pointer;
-  font-size: var(--fs-base);
+  font-size: var(--fs-sm);
 }
 
 .menu-item:hover {
@@ -518,12 +561,17 @@ svg.btn-icon {
 
 /* -------------------------------------------------------------------- tabs */
 
+/* Underlined rather than boxed. Three filled pills on their own strip read as a third
+   toolbar; an underline is the same information in a third of the height, and the active
+   view is still named in colour, weight and position rather than colour alone. */
 .tabs {
   display: flex;
-  gap: 0.3rem;
+  align-items: stretch;
+  gap: 0.15rem;
   flex: none;
-  padding: 0.35rem calc(var(--safe-right) + 0.6rem) 0.35rem calc(var(--safe-left) + 0.6rem);
-  border-bottom: 1px solid var(--border-soft);
+  min-height: 34px;
+  padding: 0 calc(var(--safe-right) + 0.6rem) 0 calc(var(--safe-left) + 0.6rem);
+  border-bottom: 1px solid var(--border);
   background: var(--panel);
 }
 
@@ -531,14 +579,17 @@ svg.btn-icon {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-height: 36px;
-  padding: 0 0.85rem;
-  border-radius: 8px;
-  border: 1px solid transparent;
+  padding: 0 0.7rem;
+  border: none;
+  border-bottom: 2px solid transparent;
   color: var(--muted);
   text-decoration: none;
-  font-size: var(--fs-base);
+  font-size: var(--fs-sm);
   font-weight: 500;
+}
+
+.app[data-touch="true"] .tabs {
+  min-height: var(--tap);
 }
 
 .tab:hover {
@@ -546,9 +597,8 @@ svg.btn-icon {
 }
 
 .tab.active {
-  background: var(--panel-raised);
-  border-color: var(--border);
   color: var(--text-strong);
+  border-bottom-color: var(--accent);
   font-weight: 600;
 }
 
@@ -641,7 +691,6 @@ svg.btn-icon {
 }
 
 .app[data-fullscreen="true"] .topbar,
-.app[data-fullscreen="true"] .statusbar,
 .app[data-fullscreen="true"] .sidebar {
   display: none;
 }

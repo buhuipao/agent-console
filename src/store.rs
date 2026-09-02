@@ -11,6 +11,17 @@ use serde::{Deserialize, Serialize};
 use crate::model::{Session, SessionSummary};
 
 const STATE_VERSION: u32 = 1;
+/// Bumped whenever the rules that pick a session's first prompt change.
+///
+/// A title is cached so it survives a transcript that no longer starts where it used to, and
+/// that cache is otherwise permanent: the first prompt a session was ever seen with is the
+/// one it keeps. Recording which rules parsed it is what lets a fix reach the sessions that
+/// were misparsed under the old ones, exactly once, instead of only new sessions.
+///
+/// 1 skips the turns Claude injects on the user's behalf (`isMeta`) and reads a slash
+/// command's arguments, so a session driven through `/goal` is titled by the goal rather
+/// than by the Stop hook prose that followed it.
+const PROMPT_RULES: u32 = 1;
 const EVENT_GENERATION_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -21,6 +32,10 @@ pub struct CachedSession {
     pub pending_shell_injection: Option<String>,
     #[serde(default)]
     pub first_prompt: Option<String>,
+    /// Which [`PROMPT_RULES`] parsed `first_prompt`. Absent from anything written before the
+    /// stamp existed, which reads as 0 and re-derives.
+    #[serde(default)]
+    pub first_prompt_rules: u32,
     #[serde(default)]
     pub alias: Option<String>,
     #[serde(default)]
@@ -149,7 +164,7 @@ impl StateStore {
         session
             .pending_shell_injection
             .clone_from(&cached.pending_shell_injection);
-        if cached.first_prompt.is_some() {
+        if cached.first_prompt.is_some() && cached.first_prompt_rules >= PROMPT_RULES {
             session.first_prompt.clone_from(&cached.first_prompt);
         }
         session.apply_deterministic_status(
@@ -168,7 +183,9 @@ impl StateStore {
                     cached.alias.clone(),
                     cached.archived,
                     cached.managed_transcript_fingerprint.clone(),
-                    cached.first_prompt.clone(),
+                    (cached.first_prompt_rules >= PROMPT_RULES)
+                        .then(|| cached.first_prompt.clone())
+                        .flatten(),
                 )
             })
             .unwrap_or_default();
@@ -180,6 +197,7 @@ impl StateStore {
                 summary_updated_at: session.summary_updated_at,
                 pending_shell_injection: session.pending_shell_injection.clone(),
                 first_prompt: metadata.3.or_else(|| session.first_prompt.clone()),
+                first_prompt_rules: PROMPT_RULES,
                 alias: metadata.0,
                 archived: metadata.1,
                 managed_transcript_fingerprint: metadata.2,
@@ -474,6 +492,45 @@ mod tests {
             unavailable_reason: None,
             discovered_after_startup: false,
         }
+    }
+
+    /// A title parsed under the old rules -- which let a hook's injected prose through --
+    /// is pinned by this cache for the life of the session, so fixing the parser alone would
+    /// leave every session already on disk wearing the wrong name. Stamping which rules a
+    /// title was parsed under lets exactly one refresh take the newly parsed one.
+    #[test]
+    fn a_title_cached_under_older_parsing_rules_is_re_derived_once() {
+        let root = tempdir().unwrap();
+        let (mut store, _) = StateStore::load(root.path().to_owned()).unwrap();
+        let mut cached = session();
+        cached.first_prompt = Some("A session-scoped Stop hook is now active".into());
+        store.update(&cached);
+        // What a build that predates the stamp left behind.
+        store
+            .state
+            .sessions
+            .get_mut("claude:id")
+            .unwrap()
+            .first_prompt_rules = 0;
+
+        let mut refreshed = session();
+        refreshed.first_prompt = Some("Open-source the lantunnel repo".into());
+        store.apply(&mut refreshed);
+        assert_eq!(
+            refreshed.first_prompt.as_deref(),
+            Some("Open-source the lantunnel repo"),
+            "a stale title has to give way to the one parsed under the current rules"
+        );
+
+        store.update(&refreshed);
+        let mut later = session();
+        later.first_prompt = Some("A later prompt must not rename the session".into());
+        store.apply(&mut later);
+        assert_eq!(
+            later.first_prompt.as_deref(),
+            Some("Open-source the lantunnel repo"),
+            "re-deriving is a one-off; the title stays put afterwards"
+        );
     }
 
     #[test]

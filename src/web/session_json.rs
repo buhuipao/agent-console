@@ -51,8 +51,8 @@ pub(crate) struct SessionJson {
     pub key: String,
     pub title: String,
     /// The user-set name, when there is one. `title` already falls back to the derived name,
-    /// so this exists for the rename dialog: it has to prefill with what the user typed, not
-    /// with the first prompt it would otherwise be showing.
+    /// so this exists to tell the two apart: the rename dialog opens on the title either way,
+    /// but only a session that carries an explicit name is offered a way to clear it.
     pub alias: Option<String>,
     pub agent: AgentKind,
     pub status: SessionStatus,

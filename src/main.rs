@@ -486,10 +486,11 @@ fn run_workspace(
             // frame actually spends its time -- hold this session's terminal lock instead, and
             // the wait at the end holds nothing at all.
             let outcome = drive.apply_input()?;
-            let chrome = shared
-                .lock()
-                .unwrap()
-                .workspace_frame_chrome(&mut drive, outcome.search);
+            let chrome = shared.lock().unwrap().workspace_frame_chrome(
+                &mut drive,
+                outcome.search,
+                outcome.rename,
+            );
             let exit = match outcome.exit {
                 Some(exit) => Some(exit),
                 None => drive.render(chrome)?,
@@ -1415,6 +1416,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         hint(" alert  "),
         key(app.dashboard_key_label("search")),
         hint(" search  "),
+        key(app.dashboard_key_label("alias")),
+        hint(" rename  "),
         key(app.dashboard_key_label("archive")),
         hint(" archive/restore  "),
         key(app.dashboard_key_label("help")),
@@ -2348,6 +2351,7 @@ mod tests {
             "new",
             "alert",
             "search",
+            "rename",
             "archive/restore",
             "help",
             "quit",

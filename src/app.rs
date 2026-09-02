@@ -19,7 +19,8 @@ use crate::{
     model::{AgentKind, Session, SessionStatus, SessionSummary, unix_timestamp},
     pty::{
         TerminalManager, WorkspaceChrome, WorkspaceExit, WorkspaceFocus, WorkspaceInputOutcome,
-        WorkspaceSearchUpdate, WorkspaceSession, bracketed_paste, staged_shell_text,
+        WorkspaceRenameUpdate, WorkspaceSearchUpdate, WorkspaceSession, bracketed_paste,
+        staged_shell_text,
     },
     store::StateStore,
     summary::{SummaryBackend, SummaryJob, SummaryWorker},
@@ -303,9 +304,13 @@ fn observe_workspace(
     alive: &mut HashSet<String>,
     pending_rekeys: &mut Vec<(String, String)>,
     search_update: Option<WorkspaceSearchUpdate>,
+    rename: Option<WorkspaceRenameUpdate>,
 ) -> WorkspaceChrome {
     if let Some(search_update) = search_update {
         runtime.apply_workspace_search(search_update);
+    }
+    if let Some(rename) = rename {
+        runtime.apply_workspace_rename(rename);
     }
     for (old_key, new_key) in runtime.tick(alive) {
         if alive.remove(&old_key) {
@@ -544,12 +549,11 @@ impl App {
             self.banner = Some("no selected session".into());
             return;
         };
-        let value = self
-            .runtime
-            .store
-            .alias(&session.key)
-            .unwrap_or_default()
-            .to_owned();
+        // Opened on the title the list is showing, name or not: renaming is nearly always
+        // editing a derived title down to something shorter, and an empty field would make
+        // that retyping. Confirming it unchanged pins the title, which is what asking to
+        // rename and then keeping the name means.
+        let value = self.session_title(session);
         self.text_dialog = Some(TextDialog {
             kind: TextDialogKind::Alias,
             original_value: value.clone(),
@@ -933,7 +937,7 @@ impl App {
     fn attach_workspace(&mut self, drive: &mut WorkspaceDrive) -> io::Result<()> {
         drive.alive = self.terminals.alive_keys().into_iter().collect();
         drive.pending_rekeys.clear();
-        let chrome = self.workspace_frame_chrome(drive, None);
+        let chrome = self.workspace_frame_chrome(drive, None, None);
         drive.attached = Some(self.terminals.begin_workspace(
             &drive.session,
             drive.focus,
@@ -954,12 +958,14 @@ impl App {
         &mut self,
         drive: &mut WorkspaceDrive,
         search: Option<WorkspaceSearchUpdate>,
+        rename: Option<WorkspaceRenameUpdate>,
     ) -> WorkspaceChrome {
         observe_workspace(
             &mut self.runtime,
             &mut drive.alive,
             &mut drive.pending_rekeys,
             search,
+            rename,
         )
     }
 
@@ -1407,6 +1413,19 @@ impl RuntimeState {
         }
     }
 
+    /// Applies a rename a workspace frame reported, on the same terms as the dashboard's
+    /// rename dialog: trimmed, and an empty value clears the name back to the derived title.
+    fn apply_workspace_rename(&mut self, rename: WorkspaceRenameUpdate) {
+        let alias = rename.alias.trim();
+        self.store.set_alias(
+            &rename.session_key,
+            (!alias.is_empty()).then(|| alias.to_owned()),
+        );
+        if let Err(error) = self.store.save_incremental() {
+            self.banner = Some(format!("cannot save the session name: {error}"));
+        }
+    }
+
     fn apply_workspace_search(&mut self, update: WorkspaceSearchUpdate) {
         match update {
             WorkspaceSearchUpdate::Preview(query) => {
@@ -1559,6 +1578,10 @@ impl RuntimeState {
                 .then(|| self.sessions.get(self.selected))
                 .flatten()
                 .map(|session| session.key.clone()),
+            selected_session_title: selected_visible
+                .then(|| self.sessions.get(self.selected))
+                .flatten()
+                .map(|session| self.session_title(session)),
             search_query: self.filter.query.clone(),
             status_counts: session_status_counts(&self.sessions),
             preview,
@@ -2903,6 +2926,33 @@ mod tests {
             app.session_title(&app.runtime.sessions[0]),
             "Implement signed releases",
             "the parsed prompt must replace the provisional session-id title"
+        );
+    }
+
+    /// Renaming starts from what the list already shows. The session worth renaming is the
+    /// one wearing a wall of derived prose, and retyping that from an empty field just to
+    /// trim it is not a rename anyone finishes.
+    #[test]
+    fn the_rename_dialog_opens_on_the_title_the_list_shows() {
+        let mut app = App::test_fixture();
+        app.sessions[0].first_prompt = Some("Open-source the lantunnel repo".into());
+        app.selected = 0;
+
+        app.open_alias_dialog();
+        assert_eq!(
+            app.text_dialog.as_ref().map(|dialog| dialog.value.as_str()),
+            Some("Open-source the lantunnel repo")
+        );
+
+        app.cancel_text_dialog();
+        let key = app.sessions[0].key.clone();
+        app.set_session_alias(&key, Some("release blocker"))
+            .unwrap();
+        app.open_alias_dialog();
+        assert_eq!(
+            app.text_dialog.as_ref().map(|dialog| dialog.value.as_str()),
+            Some("release blocker"),
+            "a session that already has a name opens on that name, not on the derived title"
         );
     }
 

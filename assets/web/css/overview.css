@@ -171,7 +171,7 @@
 
 .card-task {
   margin: 0.3rem 0 0;
-  font-size: var(--fs-md);
+  font-size: var(--fs-base);
   font-weight: 600;
   line-height: var(--lh-tight);
   color: var(--text-strong);
@@ -190,7 +190,7 @@
   display: flex;
   gap: 0.45rem;
   margin: 0.35rem 0 0;
-  font-size: var(--fs-sm);
+  font-size: var(--fs-xs);
   line-height: 1.45;
   color: var(--muted);
 }
@@ -277,7 +277,7 @@
 
 .board-row-task {
   display: block;
-  font-size: var(--fs-base);
+  font-size: var(--fs-sm);
   line-height: var(--lh-tight);
   white-space: nowrap;
   overflow: hidden;

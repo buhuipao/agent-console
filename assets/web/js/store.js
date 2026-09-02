@@ -158,7 +158,7 @@ function normaliseSession(raw) {
     status: raw.status || "idle",
     cwd: raw.cwd || "",
     branch: raw.branch || null,
-    /** The explicit rename, distinct from the derived `title` a rename dialog must not prefill. */
+    /** The explicit rename, distinct from the derived `title` the rename dialog falls back to. */
     alias: raw.alias ?? null,
     archived: Boolean(raw.archived),
     managed_alive: raw.managed_alive !== false,

@@ -991,6 +991,13 @@ fn claude_prompt_from_record(value: &Value) -> Option<String> {
     if value.get("type").and_then(Value::as_str) != Some("user") {
         return None;
     }
+    // Claude marks every turn it writes on the user's behalf -- a hook's directive, a
+    // command's own echo -- with `isMeta`. None of it is anything a person typed, and a
+    // session driven entirely through `/goal` ended up titled with a Stop hook's prose
+    // because the injected records were the only ones left after the wrappers were dropped.
+    if value.get("isMeta").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
     let content = value.get("message")?.get("content");
     let has_tool_result = content
         .and_then(Value::as_array)
@@ -1097,11 +1104,33 @@ fn user_prompt_text(value: &str) -> Option<String> {
     if let Some(objective) = codex_goal_objective(value) {
         return Some(objective);
     }
+    if let Some(request) = slash_command_request(value) {
+        return Some(request);
+    }
     if is_internal_context(value) {
         return None;
     }
     let text = strip_image_attachments(value);
     (!text.is_empty() && !is_internal_context(&text)).then_some(text)
+}
+
+/// What a person typed after a slash command. Claude stores `/goal ship it` as
+/// `<command-name>/goal</command-name>...<command-args>ship it</command-args>`, which
+/// `is_internal_context` drops whole -- and with it the only words in a session someone drove
+/// entirely through commands. The arguments alone name the work; the command's own name does
+/// not, so `/clear` and `/model` still count as nothing said.
+fn slash_command_request(value: &str) -> Option<String> {
+    let value = value.trim_start();
+    if !value.starts_with("<command-name>") {
+        return None;
+    }
+    let args = value
+        .split_once("<command-args>")?
+        .1
+        .split_once("</command-args>")?
+        .0;
+    let args = strip_image_attachments(args);
+    (!args.is_empty() && !is_internal_context(&args)).then_some(args)
 }
 
 fn codex_goal_objective(value: &str) -> Option<String> {
@@ -2163,6 +2192,58 @@ mod tests {
         ] {
             assert!(is_internal_context(value), "{value}");
         }
+    }
+
+    /// A session driven entirely through `/goal` was titled with the prose a Stop hook
+    /// injected on the user's behalf -- "A session-scoped Stop hook is now active with
+    /// condition: ..." -- because the only records that were not command wrappers were the
+    /// injected ones. Claude marks those `isMeta`, and the words the user actually typed are
+    /// the command's arguments.
+    #[test]
+    fn an_injected_hook_directive_cannot_title_a_session_its_slash_command_can() {
+        let root = tempdir().unwrap();
+        let codex = root.path().join("codex");
+        let claude = root.path().join("claude/project");
+        fs::create_dir_all(&codex).unwrap();
+        fs::create_dir_all(&claude).unwrap();
+        let cwd = root.path().join("repo");
+        fs::create_dir(&cwd).unwrap();
+        let claude_id = Uuid::new_v4().to_string();
+        let mut transcript = fs::File::create(claude.join(format!("{claude_id}.jsonl"))).unwrap();
+        for (content, is_meta) in [
+            (
+                "<local-command-caveat>Caveat: the messages below were generated",
+                true,
+            ),
+            (
+                "<command-name>/goal</command-name>\n<command-message>goal</command-message>\n<command-args>Open-source the lantunnel repo under Apache 2.0</command-args>",
+                false,
+            ),
+            (
+                "A session-scoped Stop hook is now active with condition: \"Open-source the lantunnel repo\". Briefly acknowledge the goal, then immediately start working toward it.",
+                true,
+            ),
+        ] {
+            let record = serde_json::json!({
+                "type":"user","sessionId":claude_id,"cwd":cwd,"isMeta":is_meta,
+                "message":{"role":"user","content":content}
+            });
+            writeln!(transcript, "{record}").unwrap();
+        }
+
+        let sessions = discover(&DiscoveryPaths {
+            codex_sessions: codex,
+            claude_projects: root.path().join("claude"),
+            pi_sessions: PathBuf::new(),
+        });
+        let session = sessions
+            .iter()
+            .find(|session| session.provider_session_id == claude_id)
+            .unwrap();
+        assert_eq!(
+            session.list_title(),
+            "Open-source the lantunnel repo under Apache 2.0"
+        );
     }
 
     #[test]
