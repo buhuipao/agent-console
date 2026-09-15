@@ -16,7 +16,6 @@ use crate::{
 
 const MAX_PROVIDER_FILES: usize = 60;
 const MAX_VISIBLE_SESSIONS: usize = 50;
-const RECENT_SESSION_SECONDS: u64 = 7 * 24 * 60 * 60;
 const HEAD_BYTES: usize = 64 * 1024;
 const TAIL_BYTES: usize = 128 * 1024;
 const MAX_ACTIVITY: usize = 12;
@@ -106,8 +105,6 @@ pub fn discover_cached(paths: &DiscoveryPaths, cache: &mut DiscoveryCache) -> Ve
             .cmp(&left.transcript_modified_at)
             .then_with(|| left.key.cmp(&right.key))
     });
-    let cutoff = crate::model::unix_timestamp().saturating_sub(RECENT_SESSION_SECONDS);
-    sessions.retain(|session| session.transcript_modified_at >= cutoff);
     sessions.truncate(MAX_VISIBLE_SESSIONS);
     sessions
 }
@@ -1178,9 +1175,16 @@ fn strip_image_attachments(value: &str) -> String {
 
 pub(crate) fn is_internal_context(value: &str) -> bool {
     let value = value.trim_start();
-    value
+    matches!(
+        value.trim_end(),
+        "[Request interrupted by user]" | "[Request interrupted by user for tool use]"
+    ) || value
         .strip_prefix("# AGENTS.md instructions")
-        .is_some_and(|rest| rest.trim_start().starts_with("<INSTRUCTIONS>"))
+        .is_some_and(|rest| {
+            let rest = rest.trim_start();
+            rest.starts_with("<INSTRUCTIONS>")
+                || rest.starts_with("for ") && rest.contains("<INSTRUCTIONS>")
+        })
         || [
             "<environment_context>",
             "<codex_internal_context",
@@ -1285,6 +1289,9 @@ mod tests {
             serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"Fix login"}})
         )
         .unwrap();
+        codex_file
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60))
+            .unwrap();
 
         let claude_id = Uuid::new_v4().to_string();
         let mut claude_file = fs::File::create(claude.join(format!("{claude_id}.jsonl"))).unwrap();
@@ -1511,7 +1518,7 @@ mod tests {
                     "role": "user",
                     "content": [{
                         "type": "input_text",
-                        "text": "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nUse repository rules.\n</INSTRUCTIONS><environment_context>\n<cwd>/tmp/repo</cwd>\n</environment_context>"
+                        "text": "# AGENTS.md instructions for /tmp/repo\n\n<INSTRUCTIONS>\nUse repository rules.\n</INSTRUCTIONS><environment_context>\n<cwd>/tmp/repo</cwd>\n</environment_context>"
                     }]
                 }
             }),
@@ -1558,6 +1565,15 @@ mod tests {
             user_prompt_text("# AGENTS.md instructions for end users"),
             Some("# AGENTS.md instructions for end users".into())
         );
+        for header in [
+            "# AGENTS.md instructions",
+            "# AGENTS.md instructions for /tmp/repo",
+            "# AGENTS.md instructions for C:\\Users\\user\\repo",
+        ] {
+            let context = format!("{header}\n\n<INSTRUCTIONS>\nRepository rules\n</INSTRUCTIONS>");
+            assert!(is_internal_context(&context), "{header}");
+            assert_eq!(user_prompt_text(&clean_text(&context)), None, "{header}");
+        }
     }
 
     #[test]
@@ -2189,9 +2205,15 @@ mod tests {
             "<user_shell_command>\n<command>\ngit status\n</command>",
             "<subagent_notification>\n{\"agent_path\":\"019f\"}",
             "<turn_aborted>\nThe user interrupted the previous turn",
+            "[Request interrupted by user]",
+            "[Request interrupted by user for tool use]",
         ] {
             assert!(is_internal_context(value), "{value}");
+            assert_eq!(user_prompt_text(value), None, "{value}");
         }
+        assert!(!is_internal_context(
+            "[Request interrupted by user] Explain this error"
+        ));
     }
 
     /// A session driven entirely through `/goal` was titled with the prose a Stop hook

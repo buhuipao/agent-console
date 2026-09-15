@@ -8,6 +8,7 @@ mod doctor;
 mod events;
 mod model;
 mod providers;
+mod prune;
 mod pty;
 mod store;
 mod summary;
@@ -80,6 +81,10 @@ fn dispatch() -> io::Result<()> {
             args.next();
             run_doctor()
         }
+        Some("prune-archived") => {
+            args.next();
+            prune::run(args)
+        }
         Some("pty-daemon") => {
             args.next();
             args.next()
@@ -125,6 +130,8 @@ fn cli_help() -> &'static str {
         "  agent-console [--host H] [--port P] [--auth U:P] [--no-web]\n",
         "                                        Open the dashboard, serving the web UI too\n",
         "  agent-console doctor                 Check providers and terminal prerequisites\n",
+        "  agent-console prune-archived [--days N] [--dry-run]\n",
+        "                                        Delete old archived sessions after typed confirmation\n",
         "  agent-console web [--host H] [--port P] [--auth U:P]\n",
         "                                        Serve the web/PWA dashboard alone, with no TUI\n",
         "  agent-console --help                 Show this help\n",

@@ -85,6 +85,7 @@ Files:
 ```text
 state.db                    SQLite session cache, metadata, event cursors/index.
 state.json                  One-time legacy migration input only.
+maintenance.lock            Shared by dashboards; exclusive during confirmed cleanup.
 events/<provider>-<id>.jsonl[.1]  Two bounded hook/event generations.
 summary-schema.json         Schema passed to non-interactive summarizers.
 pi-hooks.mts                Generated pi extension bridging its events to `hook pi`.
@@ -332,8 +333,11 @@ written is recorded in diagnostics and the session starts without it.
 ### 7.4 Refresh
 
 - Perform discovery on startup.
-- Display at most the 50 most recently modified sessions from the last seven
-  days. Managed sessions remain visible for the current process lifetime.
+- Discover at most the 50 most recently modified sessions. Retain managed
+  sessions for the current process lifetime. By default, hide archived sessions
+  after seven days without transcript activity. `hide_archived_after_days` in
+  `config.toml` changes the cutoff; `0` disables it. A search can find hidden
+  archived sessions so they can be restored. Unarchived sessions have no age cutoff.
 - Refresh transcript metadata every two seconds.
 - Preserve selection by stable session key.
 - Refresh is automatic; there is no manual refresh key.
@@ -617,6 +621,7 @@ n                Open new-session dialog
 a                Jump to the next unread waiting/failed alert
 r                Retry the selected session's summary, clearing backoff
 /                Search sessions by metadata, provider, workspace, or status
+e                Rename the selected session
 x                Archive the selected session, or restore an archived one
 ?                 Open the effective key-binding panel
 q or Esc         Quit (Esc closes a dialog first)
@@ -625,6 +630,7 @@ Ctrl-^            Add and focus a Shell (Agent or Shell focus)
 Ctrl-N/X         Next / close Shell (Shell focus only; forwarded in Agent)
 j/k or Up/Down   Select session (FOCUS SESSIONS only)
 /                 Search sessions (FOCUS SESSIONS only)
+e                Rename session (FOCUS SESSIONS only)
 a                Jump to next unread alert (FOCUS SESSIONS only)
 ?                 Open Workspace key-binding panel (FOCUS SESSIONS only)
 n/s              New session / add Shell (FOCUS SESSIONS only)
@@ -651,9 +657,11 @@ A notification is created only when a background session transitions into
 the session task and pending decision or failure reason.
 
 The left list is grouped by exact workspace path. Each session row shows its
-provider, status/age, and title. The title is the session's first user prompt,
-excluding provider-injected setup records such as `# AGENTS.md instructions`,
-and falls back to branch or a short session ID. It never follows the latest
+provider, status/age, and title. The title is the session's first text prompt,
+excluding provider-injected setup records such as `# AGENTS.md instructions`
+and `# AGENTS.md instructions for <directory>`, and falls back to branch or a
+short session ID. Titles cached under older parsing rules are re-derived once,
+preserving user aliases and archive state. It never follows the latest
 prompt or the rolling summary, so a session keeps one stable identity for its
 whole life, including discovery refreshes and application restarts; slash
 commands or shell echoes cannot rename it. The right side begins with a
@@ -680,8 +688,24 @@ independent agent or shell viewport under the pointer using either SGR or
 legacy X10 mouse input.
 Aliases and archive state are persistent user metadata. Archive moves a
 session into one dimmed `Archived` group after all active workspace groups.
-Archived sessions remain selectable and `x` restores them to their workspace
-group. The alias always takes display precedence over generated summary text.
+Visible archived sessions remain selectable and `x` restores them to their
+workspace group. Search includes old archived sessions hidden by the configured
+age cutoff. The alias always takes display precedence over generated summary text.
+
+`agent-console prune-archived [--days N] [--dry-run]` explicitly deletes archived
+sessions older than N days (default 7, independent of the display cutoff) on
+macOS and Linux. Preview the IDs, titles, ages and provider artifact paths first;
+deletion requires a terminal and the exact typed phrase `DELETE <count> ARCHIVED
+SESSIONS`. An empty or different response cancels. There is no unattended
+confirmation flag. Cleanup holds an exclusive maintenance lock, so dashboards
+and web servers must be closed. Open managed sessions are skipped and an open
+external provider process prevents deletion. Recheck archive membership,
+activity and file fingerprints after confirmation. Remove the selected provider
+transcripts and Claude session artifacts, matching rows in Codex's versioned
+state/history/goals/queue/memories databases, provider history/index entries,
+and console cache, legacy cache and event records. Shared file edits use a lock,
+check for intervening writes and replace atomically; SQLite edits are transactional
+per database. Errors stop cleanup; already completed removals are reported.
 
 Each card compactly shows task, priority detail, workspace/branch, next
 step, status, activity age, and open-shell count. Selection changes update both

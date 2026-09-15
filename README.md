@@ -243,6 +243,38 @@ unrecognized value keeps every provider enabled.
 
 ## Controls
 
+Archived sessions are hidden from the default list after seven days without
+transcript activity. Search still finds them for restoration. To change the
+cutoff, put this at the top of `~/.config/agent-console/config.toml` (before any
+section headings); `0` disables hiding:
+
+```toml
+hide_archived_after_days = 7
+```
+
+### Delete old archived sessions
+
+On macOS and Linux, preview archived sessions with more than seven days of
+inactivity and their provider records:
+
+```sh
+agent-console prune-archived --dry-run
+agent-console prune-archived --days 7
+```
+
+The second command requires an interactive terminal. After the preview, type
+the exact phrase shown, such as `DELETE 3 ARCHIVED SESSIONS`. Enter alone, a
+different phrase, or EOF cancels. `--days` is a positive number and defaults to
+7 independently of the display setting above.
+
+Close Agent Console dashboards and web servers before deletion. Sessions with
+open agent or shell terminals are skipped; close those sessions before retrying.
+The command rechecks the preview before deleting provider transcripts, Claude
+session artifacts, matching Codex database rows, provider history/index entries,
+and Agent Console cache/event records. A changed record stops cleanup.
+
+### Keyboard controls
+
 Dashboard:
 
 | Key | Action |
@@ -252,6 +284,7 @@ Dashboard:
 | `s` | Open a shell |
 | `n` | Create a session |
 | `/` | Search sessions as you type |
+| `e` | Rename the selected session |
 | `x` | Archive or restore |
 | `a` | Jump to the next alert |
 | `r` | Retry the selected session's summary now |
@@ -278,6 +311,7 @@ With the Sessions list focused:
 | `↑` / `↓`, `j` / `k` | Select a session |
 | `Enter`, `Ctrl-\` | Open/resume and focus its agent |
 | `/` | Search sessions as you type |
+| `e` | Rename the selected session |
 | `a` | Jump to the next unread alert |
 | `?` | Show the Workspace key bindings |
 | `n` | Create a session in the selected workspace |
@@ -323,11 +357,14 @@ overridden in the configuration file.
 
 ## Notes
 
-- A session is titled by its first user prompt and keeps that title across
+- A session is titled by its first text prompt and keeps that title across
   discovery refreshes and application restarts.
-  Provider-injected setup records such as `# AGENTS.md instructions` do not
-  count as user prompts. Later prompts and summaries never rename it. Bind the
-  `alias` action in `[keys.dashboard]` to set your own title instead.
+  Provider-injected setup records such as `# AGENTS.md instructions`, including
+  the `for <directory>` form, do not count as user prompts. Titles cached under
+  older parsing rules are re-derived once. Later prompts and summaries never
+  rename it. Press `e` on the dashboard or focused Sessions list to set your own
+  title; Enter saves, Esc cancels, and an empty value restores the default.
+  The dashboard binding is configurable through `alias` in `[keys.dashboard]`.
 - Summaries use the session's own provider and run outside the coding
   conversation, and appear in the session preview beside the first prompt rather
   than in the title. Disable them with `AGENT_CONSOLE_SUMMARIZER=off`.

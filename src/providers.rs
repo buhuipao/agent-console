@@ -67,7 +67,6 @@ pub fn is_enabled(kind: AgentKind) -> bool {
     enabled().iter().any(|adapter| adapter.kind == kind)
 }
 
-#[cfg(test)]
 pub fn adapter(kind: AgentKind) -> &'static ProviderAdapter {
     ADAPTERS
         .iter()

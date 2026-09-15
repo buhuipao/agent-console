@@ -16,6 +16,8 @@ const CONFIG_ENV: &str = "AGENT_CONSOLE_CONFIG";
 #[serde(deny_unknown_fields)]
 pub struct AgentConsoleConfig {
     #[serde(default)]
+    hide_archived_after_days: Option<u64>,
+    #[serde(default)]
     providers: ProviderConfig,
     #[serde(default)]
     pub(crate) summary: SummaryConfig,
@@ -153,6 +155,10 @@ pub struct ProviderCommand {
 }
 
 impl AgentConsoleConfig {
+    pub(crate) fn hide_archived_after_days(&self) -> u64 {
+        self.hide_archived_after_days.unwrap_or(7)
+    }
+
     pub fn load() -> io::Result<Self> {
         let Some(path) = config_path() else {
             return Ok(Self::default());

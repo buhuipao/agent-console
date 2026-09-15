@@ -223,6 +223,7 @@ pub struct RuntimeState {
     /// the suppression would only lose alerts nobody ever saw.
     suppress_selected_notifications: bool,
     filter: SessionFilter,
+    hide_archived_after_days: u64,
     store: StateStore,
     event_index: events::EventIndex,
     summary_worker: SummaryWorker,
@@ -402,6 +403,7 @@ impl App {
                 notifications: VecDeque::new(),
                 suppress_selected_notifications: true,
                 filter: SessionFilter::default(),
+                hide_archived_after_days: config.hide_archived_after_days(),
                 store,
                 event_index,
                 summary_worker,
@@ -1462,7 +1464,10 @@ impl RuntimeState {
         // and an unfiltered dashboard is the common case.
         let query = query.trim();
         if query.is_empty() {
-            return true;
+            let retention = self.hide_archived_after_days.saturating_mul(24 * 60 * 60);
+            return retention == 0
+                || !self.store.archived(&session.key)
+                || unix_timestamp().saturating_sub(session.transcript_modified_at) <= retention;
         }
         let query = query.to_lowercase();
         let alias = self.store.alias(&session.key).unwrap_or_default();
@@ -2128,6 +2133,7 @@ impl App {
                 notifications: VecDeque::new(),
                 suppress_selected_notifications: true,
                 filter: SessionFilter::default(),
+                hide_archived_after_days: AgentConsoleConfig::default().hide_archived_after_days(),
                 store,
                 event_index,
                 summary_worker,
@@ -2274,6 +2280,7 @@ mod tests {
                 notifications: VecDeque::new(),
                 suppress_selected_notifications: true,
                 filter: SessionFilter::default(),
+                hide_archived_after_days: AgentConsoleConfig::default().hide_archived_after_days(),
                 store,
                 event_index,
                 summary_worker: worker,
@@ -2668,6 +2675,7 @@ mod tests {
         second.agent = AgentKind::Claude;
         second.cwd = app.sessions[0].cwd.clone();
         second.summary.task = "Investigate latency".into();
+        second.transcript_modified_at = unix_timestamp();
         app.sessions.push(second);
         app.selected = 1;
 
@@ -2693,6 +2701,36 @@ mod tests {
         app.toggle_selected_archive().unwrap();
         assert_eq!(app.session_display_order(), vec![0, 1]);
         assert_eq!(app.session_title(&app.sessions[1]), "urgent release");
+    }
+
+    #[test]
+    fn old_archived_sessions_are_hidden_by_default_but_searchable() {
+        let mut app = App::test_fixture();
+        let mut old = fixture_session("codex:old");
+        old.transcript_modified_at = unix_timestamp() - 8 * 24 * 60 * 60;
+        app.sessions.push(old);
+        assert_eq!(app.session_display_order(), vec![0, 1]);
+        app.runtime.store.toggle_archived("codex:old");
+        assert_eq!(app.session_display_order(), vec![0]);
+        assert!(app.session_matches(&app.sessions[1], "archived"));
+        app.runtime.filter.query = "old".into();
+        assert_eq!(app.session_display_order(), vec![1]);
+        app.runtime.filter.query.clear();
+        for days in [30, 0] {
+            let config = AgentConsoleConfig::parse(
+                &format!("hide_archived_after_days = {days}"),
+                Path::new("config.toml"),
+            );
+            app.runtime.hide_archived_after_days = config.unwrap().hide_archived_after_days();
+            assert_eq!(app.session_display_order(), vec![0, 1]);
+        }
+        app.runtime.hide_archived_after_days = 7;
+        app.sessions[1].transcript_modified_at = unix_timestamp();
+        assert_eq!(app.session_display_order(), vec![0, 1]);
+        assert!(
+            AgentConsoleConfig::parse("hide_archived_after_days = -1", Path::new("config.toml"))
+                .is_err()
+        );
     }
 
     #[test]

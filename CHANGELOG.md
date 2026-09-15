@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- `prune-archived [--days N] [--dry-run]` previews old archived sessions and
+  removes their provider and console records only after an exact typed
+  confirmation in a terminal. Open sessions and changes after preview prevent
+  deletion; an exclusive maintenance lock keeps dashboards from restoring stale
+  cache entries during cleanup.
+- `hide_archived_after_days` defaults to 7; archived sessions older than the
+  cutoff are hidden from unfiltered lists and remain searchable. Set it to 0
+  to disable hiding. Unarchived sessions have no age cutoff.
+
+### Fixed
+- Codex titles skip `# AGENTS.md instructions for <directory>` and use the first
+  text prompt. Previously cached titles are re-derived, preserving manual names.
+- Claude's automatic request-interrupted markers are skipped when deriving titles.
+- The focused Workspace Sessions list shows `e rename` in its footer, including
+  while a session notice is displayed.
+
 ## [0.3.1] - 2026-09-15
 
 ### Maintenance

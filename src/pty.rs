@@ -1657,7 +1657,7 @@ fn terminal_session_key(id: &str) -> Option<String> {
 }
 
 #[cfg(unix)]
-fn process_is_alive(pid: u32) -> bool {
+pub(crate) fn process_is_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
@@ -1667,7 +1667,7 @@ fn process_is_alive(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-fn process_is_alive(_pid: u32) -> bool {
+pub(crate) fn process_is_alive(_pid: u32) -> bool {
     false
 }
 
@@ -1786,6 +1786,48 @@ pub fn daemon_health(socket: &Path) -> io::Result<Option<()>> {
 #[cfg(not(unix))]
 pub fn daemon_health(_socket: &Path) -> io::Result<Option<()>> {
     Ok(None)
+}
+
+pub(crate) fn prune_session_terminals(socket: &Path, key: &str, remove: bool) -> io::Result<()> {
+    if !socket.exists() {
+        return Ok(());
+    }
+    let DaemonResponse::List(ids) = daemon_request(
+        socket,
+        &DaemonRequest::List {
+            prefix: String::new(),
+        },
+    )?
+    else {
+        return Err(io::Error::other("cannot inspect daemon terminals"));
+    };
+    let ids = ids
+        .into_iter()
+        .filter(|id| terminal_session_key(id).as_deref() == Some(key))
+        .collect::<Vec<_>>();
+    for id in &ids {
+        match daemon_request(
+            socket,
+            &DaemonRequest::Poll {
+                id: id.clone(),
+                offset: u64::MAX,
+                scrollback: false,
+            },
+        )? {
+            DaemonResponse::Poll { alive: false, .. } => {}
+            _ => {
+                return Err(io::Error::other(format!(
+                    "close the agent and shells for {key} before pruning"
+                )));
+            }
+        }
+    }
+    if remove {
+        for id in ids {
+            response_ok(daemon_request(socket, &DaemonRequest::Terminate { id })?)?;
+        }
+    }
+    Ok(())
 }
 
 /// The protocol the daemon at `socket` speaks, or `None` when no daemon is running.
@@ -5921,7 +5963,7 @@ fn render_workspace_frame(
         let badge = format!(" {focus_name} ");
         let shortcuts = match focus {
             WorkspaceFocus::Sessions => format!(
-                "{} dashboard  {} focus  {search_label}  {} alert  {} help  ↑↓/j/k select  Enter agent  {} agent  {} shell  n new  s +shell  x archive",
+                "{} dashboard  {} focus  e rename  {search_label}  {} alert  {} help  ↑↓/j/k select  Enter agent  {} agent  {} shell  n new  s +shell  x archive",
                 bindings.label("dashboard"),
                 bindings.label("focus"),
                 bindings.label("session_alert"),
@@ -5949,7 +5991,7 @@ fn render_workspace_frame(
             |notice| {
                 let essentials = match focus {
                     WorkspaceFocus::Sessions => format!(
-                        "{} dashboard  {} focus  {} agent  {} shell  n new  s +shell  x archive",
+                        "{} dashboard {} focus e rename {} agent {} shell n new s +shell x archive",
                         bindings.label("dashboard"),
                         bindings.label("focus"),
                         bindings.label("hide_shells"),
@@ -10977,6 +11019,7 @@ mod tests {
 
         assert!(output.contains("FOCUS SESSIONS"));
         assert!(output.contains("SESSION ARCHIVED"));
+        assert!(output.contains("e rename"));
         assert!(output.contains("n new"));
         assert!(output.contains("s +shell"));
         assert!(output.contains("x archive"));
@@ -10987,7 +11030,7 @@ mod tests {
     }
 
     #[test]
-    fn focused_session_list_footer_shows_search_alert_and_help() {
+    fn focused_session_list_footer_shows_rename_search_alert_and_help() {
         let terminals = SessionTerminals::default();
         let chrome = WorkspaceChrome {
             sessions: vec!["▾ repo".into(), "○ Cdx inspect session".into()],
@@ -11016,6 +11059,7 @@ mod tests {
         assert!(output.contains("/ search"));
         assert!(output.contains("a alert"));
         assert!(output.contains("? help"));
+        assert!(output.contains("e rename"));
     }
 
     #[test]

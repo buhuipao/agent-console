@@ -21,7 +21,9 @@ const STATE_VERSION: u32 = 1;
 /// 1 skips the turns Claude injects on the user's behalf (`isMeta`) and reads a slash
 /// command's arguments, so a session driven through `/goal` is titled by the goal rather
 /// than by the Stop hook prose that followed it.
-const PROMPT_RULES: u32 = 1;
+/// 2 also skips Codex instruction headings that include `for <directory>`.
+/// 3 skips Claude's automatic request-interrupted markers.
+const PROMPT_RULES: u32 = 3;
 const EVENT_GENERATION_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -65,6 +67,7 @@ pub struct StateStore {
     state: PersistedState,
     connection: Connection,
     defer_writes_until_clean_exit: bool,
+    _maintenance_lock: fs::File,
 }
 
 impl StateStore {
@@ -77,6 +80,10 @@ impl StateStore {
 
     pub fn load(root: PathBuf) -> io::Result<(Self, Option<String>)> {
         ensure_private_dir(&root)?;
+        let maintenance_lock = maintenance_lock(&root)?;
+        maintenance_lock.try_lock_shared().map_err(|error| {
+            io::Error::other(format!("session cleanup is in progress: {error}"))
+        })?;
         let database_path = root.join("state.db");
         let connection = Connection::open(&database_path).map_err(io::Error::other)?;
         make_private_file(&database_path)?;
@@ -94,6 +101,7 @@ impl StateStore {
                     state: database_state,
                     connection,
                     defer_writes_until_clean_exit: false,
+                    _maintenance_lock: maintenance_lock,
                 },
                 None,
             ));
@@ -108,6 +116,7 @@ impl StateStore {
                         state,
                         connection,
                         defer_writes_until_clean_exit: false,
+                        _maintenance_lock: maintenance_lock,
                     };
                     store.write()?;
                     set_database_meta(&store.connection, "legacy_state_imported", "1")?;
@@ -123,6 +132,7 @@ impl StateStore {
                         state,
                         connection,
                         defer_writes_until_clean_exit: true,
+                        _maintenance_lock: maintenance_lock,
                     },
                     Some(
                         "state cache has an unsupported version; it will be replaced on clean exit"
@@ -136,6 +146,7 @@ impl StateStore {
                     state: PersistedState::default(),
                     connection,
                     defer_writes_until_clean_exit: true,
+                    _maintenance_lock: maintenance_lock,
                 },
                 Some(format!(
                     "state cache is malformed; ignored until clean exit: {error}"
@@ -377,6 +388,19 @@ pub fn state_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".local/state/agent-console"))
 }
 
+pub(crate) fn maintenance_lock(root: &Path) -> io::Result<fs::File> {
+    ensure_private_dir(root)?;
+    let path = root.join("maintenance.lock");
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)?;
+    make_private_file(&path)?;
+    Ok(file)
+}
+
 pub fn atomic_append_jsonl(path: &Path, line: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         ensure_private_dir(parent)?;
@@ -531,6 +555,45 @@ mod tests {
             Some("Open-source the lantunnel repo"),
             "re-deriving is a one-off; the title stays put afterwards"
         );
+    }
+
+    #[test]
+    fn codex_instruction_titles_cached_under_rules_one_are_re_derived() {
+        let root = tempdir().unwrap();
+        let (mut store, _) = StateStore::load(root.path().to_owned()).unwrap();
+        let mut parsed = session();
+        parsed.agent = crate::model::AgentKind::Codex;
+        parsed.key = "codex:id".into();
+        parsed.first_prompt = Some("Fix the upload button".into());
+        store.state.sessions.insert(
+            parsed.key.clone(),
+            CachedSession {
+                first_prompt: Some(
+                    "# AGENTS.md instructions for /tmp/repo <INSTRUCTIONS> Rules".into(),
+                ),
+                first_prompt_rules: 1,
+                alias: Some("My upload task".into()),
+                archived: true,
+                ..CachedSession::default()
+            },
+        );
+
+        store.apply(&mut parsed);
+        assert_eq!(
+            parsed.first_prompt.as_deref(),
+            Some("Fix the upload button")
+        );
+        store.update(&parsed);
+        store.save_clean_exit().unwrap();
+        let (loaded, _) = StateStore::load(root.path().to_owned()).unwrap();
+        parsed.first_prompt = Some("A later prompt".into());
+        loaded.apply(&mut parsed);
+        assert_eq!(
+            parsed.first_prompt.as_deref(),
+            Some("Fix the upload button")
+        );
+        assert_eq!(loaded.alias(&parsed.key), Some("My upload task"));
+        assert!(loaded.archived(&parsed.key));
     }
 
     #[test]

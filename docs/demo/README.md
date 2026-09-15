@@ -10,7 +10,7 @@ rm -rf /tmp/ac-demo-home /tmp/ac-demo-state
 cp -R tests/fixtures/readme-demo/home /tmp/ac-demo-home
 mkdir -p /tmp/ac-demo-state
 
-# 2. Refresh transcript timestamps; discovery only shows the last seven days.
+# 2. Refresh transcript timestamps so the demo sessions sort ahead of older ones.
 i=0
 for f in /tmp/ac-demo-home/.claude/projects/demo/*.jsonl \
          /tmp/ac-demo-home/.codex/sessions/2026/07/18/*.jsonl; do
