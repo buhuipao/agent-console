@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.1] - 2026-09-15
+
+### Maintenance
+- Update the package version to 0.3.1.
+
 ## [0.3.0] - 2026-09-02
 
 ### Changed
