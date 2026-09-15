@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.3.2] - 2026-09-15
 
 ### Added
 - `prune-archived [--days N] [--dry-run]` previews old archived sessions and
