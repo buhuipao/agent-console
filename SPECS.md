@@ -430,7 +430,10 @@ Entering a workspace:
    focus, allowing nested providers to distinguish `Ctrl-Enter` from Enter
    without changing interactive Shell input.
 8. Session-list focus is navigation, not a separate command mode. Up/Down or
-   `j`/`k` selects sessions; Enter activates the selected Agent; `/` searches
+   `j`/`k` selects sessions or folded workspaces. Space folds or expands the
+   selected workspace; `gg`/`G` selects the first/last list row. A folded
+   workspace takes one selectable row and its hidden sessions are skipped.
+   Enter expands a folded workspace or activates the selected Agent; `/` searches
    sessions live; `a` jumps to the next unread alert; `?` opens the effective
    Workspace key-binding panel; `n` opens a new-session dialog using the
    selected workspace; `s` creates a Shell;
@@ -615,6 +618,8 @@ shows the error on screen.
 
 ```text
 Up/Down or j/k   Select a session
+Space            Fold / expand the selected workspace
+gg / G           Select the first / last list row
 Enter            Open workspace focused on the selected agent
 s                Add shell and open workspace focused on it
 n                Open new-session dialog
@@ -629,6 +634,8 @@ Ctrl-\ / Ctrl-Q  Focus cycle / Dashboard (all Workspace modes)
 Ctrl-^            Add and focus a Shell (Agent or Shell focus)
 Ctrl-N/X         Next / close Shell (Shell focus only; forwarded in Agent)
 j/k or Up/Down   Select session (FOCUS SESSIONS only)
+Space            Fold / expand workspace (FOCUS SESSIONS only)
+gg / G           First / last list row (FOCUS SESSIONS only)
 /                 Search sessions (FOCUS SESSIONS only)
 e                Rename session (FOCUS SESSIONS only)
 a                Jump to next unread alert (FOCUS SESSIONS only)
@@ -646,6 +653,14 @@ session-lease conflict that offers force takeover. Discovery is automatic.
 Manual refresh, pinning, per-session summary
 enable/disable, and separate provider/status/workspace cycling filters are not
 part of the interaction model. Live search covers those metadata dimensions.
+
+Folding is shared by the Dashboard and Workspace session lists for the life of
+the console. Expanded workspace headings remain labels; a folded workspace is
+one navigation target. Space or Enter expands it. Session actions such as
+rename or archive require an expanded session. Archived sessions stay in the
+separate Archived group. List jumps follow the current search and fold state;
+empty lists ignore them. `gg` accepts consecutive presses or one input batch;
+another key cancels a pending `g`. Agent, Shell, and dialog input is unchanged.
 
 Each shell has a user-visible name. Shells that exit remain as panes with their
 exit status until explicitly closed. The Workspace records a capture boundary
@@ -832,6 +847,10 @@ Automated tests must cover:
     policy, route wiring behind the credential and App-lock checks, transcript
     paging with cursor recovery, and blocking-dialog parsing with the two-step
     cursor answer.
+14. Workspace folding, navigation through folded rows, and split/batched `gg`
+    and `G`, including child input and modified keys. Run
+    `cargo build --locked` and `expect tests/e2e/session_list_controls.exp` for
+    the terminal regression.
 
 Manual smoke test:
 

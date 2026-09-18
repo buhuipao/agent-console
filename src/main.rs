@@ -536,8 +536,12 @@ fn handle_dashboard_event(
     current_exe: &Path,
 ) -> io::Result<DashboardOutcome> {
     match event {
-        Event::Mouse(mouse) => handle_dashboard_mouse(app, mouse),
+        Event::Mouse(mouse) => {
+            app.list_g_pending = false;
+            handle_dashboard_mouse(app, mouse);
+        }
         Event::Key(key) if key.kind == KeyEventKind::Press => {
+            let pending_g = std::mem::take(&mut app.list_g_pending);
             if app.dialog.is_some() {
                 return handle_dialog_key(app, key.code, current_exe);
             } else if app.text_dialog.is_some() {
@@ -552,6 +556,18 @@ fn handle_dashboard_event(
                 }
                 if let Some(action) = app.dashboard_action(&key_name) {
                     return Ok(handle_dashboard_action(app, action, current_exe));
+                }
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+                {
+                    match key.code {
+                        KeyCode::Char(' ') => app.toggle_selected_workspace(),
+                        KeyCode::Char('G') => app.select_list_edge(true),
+                        KeyCode::Char('g') if pending_g => app.select_list_edge(false),
+                        KeyCode::Char('g') => app.list_g_pending = true,
+                        _ => {}
+                    }
                 }
             }
         }
@@ -569,6 +585,7 @@ fn handle_dashboard_action(
         "quit" => return DashboardOutcome::Quit,
         "next" => app.select_next(),
         "previous" => app.select_previous(),
+        "enter" if app.selected_workspace_collapsed() => app.toggle_selected_workspace(),
         "enter" => return attach_agent(app, current_exe),
         "takeover" => return force_attach_agent(app, current_exe),
         "shell" => return attach_shell(app, current_exe),
@@ -1063,9 +1080,16 @@ fn draw_sessions(frame: &mut Frame, area: Rect, app: &App) {
     let mut selected_last_line = 0;
     let mut last_workspace = None;
     let mut archived_group = false;
-    for index in app.session_display_order() {
+    for index in app.session_list_order() {
         let session = &app.sessions[index];
         let archived = app.session_archived(session);
+        let collapsed = app.workspace_collapsed(session);
+        let selected = index == app.selected;
+        let base = if selected {
+            Style::default().bg(Color::Rgb(45, 53, 72))
+        } else {
+            Style::default()
+        };
         if archived && !archived_group {
             lines.push(Line::from(Span::styled(
                 "▾ Archived",
@@ -1082,20 +1106,20 @@ fn draw_sessions(frame: &mut Frame, area: Rect, app: &App) {
                 .and_then(|value| value.to_str())
                 .unwrap_or_else(|| session.cwd.to_str().unwrap_or("workspace"));
             lines.push(Line::from(Span::styled(
-                format!("▾ {label}"),
-                Style::default()
+                format!("{} {label}", if collapsed { "▸" } else { "▾" }),
+                (if collapsed { base } else { Style::default() })
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             )));
             last_workspace = Some(&session.cwd);
         }
+        if collapsed {
+            if selected {
+                selected_last_line = lines.len();
+            }
+            continue;
+        }
         let (symbol, color) = status_style(session.status, app.tick_count);
-        let selected = index == app.selected;
-        let base = if selected {
-            Style::default().bg(Color::Rgb(45, 53, 72))
-        } else {
-            Style::default()
-        };
         lines.push(Line::from(vec![
             Span::styled(if selected { "▸" } else { " " }, base.fg(Color::White)),
             Span::styled(format!("{symbol} "), base.fg(color)),
@@ -1228,7 +1252,11 @@ fn session_priority(session: &model::Session) -> (&'static str, String, Color) {
 }
 
 fn draw_session_overview(frame: &mut Frame, area: Rect, app: &App) {
-    let order = app.session_display_order();
+    let order = app
+        .session_display_order()
+        .into_iter()
+        .filter(|&index| !app.workspace_collapsed(&app.sessions[index]))
+        .collect::<Vec<_>>();
     let selected = order
         .iter()
         .position(|index| *index == app.selected)
@@ -1245,6 +1273,16 @@ fn draw_session_overview(frame: &mut Frame, area: Rect, app: &App) {
         .padding(Padding::uniform(1));
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
+    if app.selected_workspace_collapsed() {
+        frame.render_widget(
+            Paragraph::new(format!(
+                "Workspace · {}\nSpace or Enter expands this workspace",
+                app.sessions[app.selected].cwd.display()
+            )),
+            inner,
+        );
+        return;
+    }
     if order.is_empty() {
         frame.render_widget(Paragraph::new("Press [n] to start a session."), inner);
         return;
@@ -2365,6 +2403,75 @@ mod tests {
         ] {
             assert!(rendered.contains(label), "missing dashboard hint: {label}");
         }
+    }
+
+    #[test]
+    fn dashboard_space_and_vim_jumps_follow_visible_rows() {
+        let mut app = App::test_fixture();
+        app.sessions[0].cwd = "/tmp/alpha".into();
+        let mut sibling = app.sessions[0].clone();
+        sibling.key = "codex:sibling".into();
+        let mut last = sibling.clone();
+        last.key = "codex:last".into();
+        last.cwd = "/tmp/beta".into();
+        app.sessions.extend([sibling, last]);
+        let press = |app: &mut App, code| {
+            let outcome = handle_dashboard_event(
+                app,
+                Event::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+                Path::new("unused"),
+            )
+            .unwrap();
+            assert!(matches!(outcome, DashboardOutcome::Continue));
+        };
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(app.selected, 2);
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.selected, 2);
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.selected, 0);
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.session_list_order(), [0, 2]);
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal
+            .draw(|frame| draw_sessions(frame, frame.area(), &app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("▸ alpha"));
+        assert_eq!(
+            rendered.matches("Cdx").count(),
+            1,
+            "only beta's session is drawn"
+        );
+        let folded = buffer
+            .content()
+            .iter()
+            .find(|cell| cell.symbol() == "▸")
+            .unwrap();
+        assert_eq!(folded.bg, Color::Rgb(45, 53, 72));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.selected, 2);
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.selected, 0);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.session_list_order(), [0, 1, 2]);
+        press(&mut app, KeyCode::Char('G'));
+        for key in ['g', '?', '?', 'g'] {
+            press(&mut app, KeyCode::Char(key));
+        }
+        assert_eq!(app.selected, 2, "opening help cancels a pending g");
+        press(&mut app, KeyCode::Char('/'));
+        for key in ['g', 'g', 'G', ' '] {
+            press(&mut app, KeyCode::Char(key));
+        }
+        assert_eq!(app.text_dialog.as_ref().unwrap().value, "ggG ");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.selected, 2);
     }
 
     #[test]

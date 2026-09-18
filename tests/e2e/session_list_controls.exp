@@ -1,0 +1,146 @@
+#!/usr/bin/expect -f
+
+set timeout 10
+set repo [file normalize [file join [file dirname [info script]] ../..]]
+set binary [file join $repo target debug agent-console]
+set scratch [exec mktemp -d /tmp/agent-console-list-e2e.XXXXXX]
+set env(AGENT_CONSOLE_STATE_DIR) [file join $scratch state]
+set env(AGENT_CONSOLE_CONFIG) [file join $scratch config.toml]
+set env(AGENT_CONSOLE_SUMMARIZER) off
+set env(AGENT_CONSOLE_PROVIDERS) pi
+set env(PI_CODING_AGENT_DIR) [file join $scratch pi]
+file mkdir [file join $scratch alpha] [file join $scratch beta]
+file mkdir [file join $scratch pi sessions test]
+set config [open $env(AGENT_CONSOLE_CONFIG) w]
+puts $config {[providers]}
+puts $config {pi = ["/bin/sh", "-c", "printf x >> \"$AGENT_CONSOLE_STATE_DIR/launches\"; printf 'fake pi ready\\n'; exec /bin/cat"]}
+puts $config {[keys.workspace]}
+puts $config {previous_shell = ["b"]}
+close $config
+foreach {id workspace title age} {
+    alpha-new alpha {Alpha newest} 0
+    beta-only beta {Beta only} 10
+    alpha-old alpha {Alpha older} 20
+} {
+    set path [file join $scratch pi sessions test "2026-09-18T00-00-00-000Z_$id.jsonl"]
+    set output [open $path w]
+    puts $output [format {{"type":"session","version":3,"id":"%s","cwd":"%s"}} $id [file join $scratch $workspace]]
+    puts $output [format {{"type":"message","message":{"role":"user","content":[{"type":"text","text":"%s"}]}}} $title]
+    close $output
+    file mtime $path [expr {[clock seconds] - $age}]
+}
+log_user 0
+log_file -a -noappend [file join $scratch terminal.log]
+
+proc cleanup {} {
+    global binary scratch spawn_id
+    catch {exec kill -KILL [exp_pid -i $spawn_id]}
+    catch {exec $binary pty-daemon-stop [file join $scratch state pty-daemon.sock]}
+}
+
+proc expect_text {pattern label} {
+    global spawn_id scratch
+    expect {
+        -i $spawn_id -re $pattern { puts "ok $label" }
+        -i $spawn_id timeout {
+            cleanup
+            puts stderr "FAIL $label; terminal log: $scratch/terminal.log"
+            exit 1
+        }
+        -i $spawn_id eof {
+            cleanup
+            puts stderr "FAIL $label: console exited; terminal log: $scratch/terminal.log"
+            exit 1
+        }
+    }
+}
+
+spawn /bin/sh -c [format {stty rows 30 columns 160; exec "%s" --no-web} $binary]
+expect_text {Agent Console} dashboard
+send -- "\r"
+expect_text {FOCUS AGENT} agent
+send -- "\036"
+expect_text {FOCUS SHELL} shell-for-focus-check
+send -- "printf '%s\\n' 'gg G SHELL_INPUT'\r"
+expect_text {gg G SHELL_INPUT} shell-input-passthrough
+send -- "\034"
+expect_text {FOCUS SESSIONS} sessions
+send -- "G"
+expect_text {SESSION PREVIEW .*Beta only} last-row
+send -- "gg"
+expect_text {SESSION PREVIEW .*Alpha newest} batched-first-row
+send -- "j"
+expect_text {SESSION PREVIEW .*Alpha older} next-session
+send -- " "
+expect_text {SESSION PREVIEW .*▸ alpha} fold-from-sibling
+send -- "x"
+expect_text {SESSION PREVIEW .*▸ alpha} archive-keeps-folded-row
+send -- "j"
+expect_text {SESSION PREVIEW .*Beta only} move-past-folded-workspace
+send -- "k"
+expect_text {SESSION PREVIEW .*▸ alpha} select-folded-workspace
+send -- "G"
+expect_text {SESSION PREVIEW .*Beta only} jump-past-folded-workspace
+send -- "g"
+after 250
+send -- "g"
+expect_text {SESSION PREVIEW .*▸ alpha} split-first-row
+send -- " "
+expect_text {SESSION PREVIEW .*Alpha newest} expand-with-space
+send -- "G"
+expect_text {SESSION PREVIEW .*Beta only} last-workspace
+send -- " "
+expect_text {SESSION PREVIEW .*▸ beta} fold-last-workspace
+send -- "gg"
+expect_text {SESSION PREVIEW .*Alpha newest} select-session-with-shell
+send -- "G"
+expect_text {SESSION PREVIEW .*▸ beta} folded-workspace-with-other-session-attached
+send -- "1bmy"
+send -- "?"
+expect_text {WORKSPACE KEY BINDINGS} folded-row-keeps-session-focus
+send -- "\033"
+expect_text {FOCUS SESSIONS} close-help
+send -- "k"
+expect_text {SESSION PREVIEW .*Alpha older} move-above-folded-workspace
+send -- " "
+expect_text {SESSION PREVIEW .*▸ alpha} fold-all-workspaces
+send -- "G"
+expect_text {SESSION PREVIEW .*▸ beta} last-folded-row
+send -- "gg"
+expect_text {SESSION PREVIEW .*▸ alpha} first-folded-row
+send -- "\r"
+expect_text {SESSION PREVIEW .*Alpha newest} enter-expands-workspace
+send -- "j"
+expect_text {SESSION PREVIEW .*Alpha older} select-session-to-archive
+send -- "x"
+expect_text {SESSION PREVIEW .*Alpha older} archive-session
+send -- "gg"
+expect_text {SESSION PREVIEW .*Alpha newest} select-workspace-to-fold
+send -- " "
+expect_text {SESSION PREVIEW .*▸ alpha} fold-workspace-with-archived-session
+send -- "G"
+expect_text {SESSION PREVIEW .*Alpha older} jump-to-archived-session
+send -- "x"
+expect_text {SESSION PREVIEW .*▸ alpha} restore-into-folded-workspace
+expect_text {FOCUS SESSIONS} restore-keeps-workspace-open
+send -- " "
+expect_text {SESSION PREVIEW .*Alpha newest} expand-restored-workspace
+set launches [open [file join $scratch state launches] r]
+set count [string length [read $launches]]
+close $launches
+if {$count != 1} {
+    cleanup
+    error "list navigation launched a provider"
+}
+send -- "\r"
+expect_text {FOCUS AGENT} return-to-agent
+send -- "gg G SPACE_INPUT\r"
+expect_text {gg G SPACE_INPUT} child-input-passthrough
+send -- "\021"
+expect_text {Agent Console} return-to-dashboard
+send -- "q"
+expect eof
+cleanup
+log_file
+file delete -force $scratch
+puts "E2E passed: workspace folding, row navigation, gg/G, and child input"

@@ -2644,6 +2644,9 @@ pub enum WorkspaceExit {
     NewSession,
     OpenShell,
     ToggleArchive,
+    ToggleWorkspace,
+    FirstSession,
+    LastSession,
     RefreshSessions,
     PreviousSession(WorkspaceFocus),
     NextSession(WorkspaceFocus),
@@ -3552,6 +3555,7 @@ struct PendingAlternateCopy {
 pub struct WorkspaceChrome {
     pub sessions: Vec<String>,
     pub selected: usize,
+    /// Also anchors a folded workspace's selection when cancelling search.
     pub selected_session_key: Option<String>,
     /// The selected session's title as the list draws it, which is what the rename prompt
     /// opens on. The rendered `sessions` lines carry status glyphs and an agent column, so
@@ -3885,6 +3889,9 @@ enum WorkspaceCommand {
     Help,
     PreviousSession,
     NextSession,
+    ToggleWorkspace,
+    FirstSession,
+    LastSession,
     SelectShell(usize),
     ToggleMaximize,
     ToggleShellArea,
@@ -3951,6 +3958,11 @@ impl WorkspaceBindings {
                 }
             }
         }
+        commands.extend([
+            (b" ".to_vec(), WorkspaceCommand::ToggleWorkspace),
+            (b"gg".to_vec(), WorkspaceCommand::FirstSession),
+            (b"G".to_vec(), WorkspaceCommand::LastSession),
+        ]);
         Self { commands, labels }
     }
 
@@ -4291,51 +4303,51 @@ impl Default for WorkspaceInputRouter {
 impl WorkspaceInputRouter {
     fn route(&mut self, input: &[u8], focus: WorkspaceFocus) -> Vec<WorkspaceInput> {
         let mut routed = Vec::new();
+        if focus != WorkspaceFocus::Sessions && self.pending == b"g" {
+            self.pending.clear();
+        }
         for &byte in input {
+            if self.pending == b"g" && byte != b'g' {
+                self.pending.clear();
+            }
             self.pending.push(byte);
-            loop {
-                if let Some(event) = workspace_mouse_event(&self.pending) {
+            if let Some(event) = workspace_mouse_event(&self.pending) {
+                self.pending.clear();
+                routed.push(WorkspaceInput::Mouse(event));
+                continue;
+            }
+            if is_workspace_mouse_prefix(&self.pending) {
+                continue;
+            }
+            if let Some(command) = self.bindings.command(&self.pending) {
+                if workspace_command_active(command, focus, &self.pending) {
                     self.pending.clear();
-                    routed.push(WorkspaceInput::Mouse(event));
-                    break;
-                }
-                if is_workspace_mouse_prefix(&self.pending) {
-                    break;
-                }
-                if let Some(command) = self.bindings.command(&self.pending) {
-                    if workspace_command_active(command, focus, &self.pending) {
-                        self.pending.clear();
-                        routed.push(WorkspaceInput::Command(command));
-                        break;
-                    }
-                    let byte = self.pending.remove(0);
-                    match routed.last_mut() {
-                        Some(WorkspaceInput::Forward(bytes)) => bytes.push(byte),
-                        _ => routed.push(WorkspaceInput::Forward(vec![byte])),
-                    }
-                    if self.pending.is_empty() {
-                        break;
-                    }
+                    routed.push(WorkspaceInput::Command(command));
                     continue;
                 }
-                if self.bindings.is_prefix(&self.pending) {
-                    break;
-                }
-                let byte = self.pending.remove(0);
-                match routed.last_mut() {
-                    Some(WorkspaceInput::Forward(bytes)) => bytes.push(byte),
-                    _ => routed.push(WorkspaceInput::Forward(vec![byte])),
-                }
-                if self.pending.is_empty() {
-                    break;
-                }
+            } else if (self.bindings.is_prefix(&self.pending)
+                && (focus == WorkspaceFocus::Sessions || self.pending != b"g"))
+                || self.pending == b"\x1bO"
+                || (self.pending.starts_with(b"\x1b[")
+                    && self.pending[2..]
+                        .iter()
+                        .all(|byte| (0x20..=0x3f).contains(byte)))
+            {
+                continue;
+            }
+            // Keep an unbound or inactive key intact: its suffix is not another shortcut.
+            let input = std::mem::take(&mut self.pending);
+            match routed.last_mut() {
+                Some(WorkspaceInput::Forward(bytes)) => bytes.extend(input),
+                _ => routed.push(WorkspaceInput::Forward(input)),
             }
         }
         routed
     }
 
     fn flush(&mut self) -> Option<Vec<u8>> {
-        (!self.pending.is_empty()).then(|| std::mem::take(&mut self.pending))
+        (!self.pending.is_empty() && self.pending != b"g")
+            .then(|| std::mem::take(&mut self.pending))
     }
 }
 
@@ -4361,6 +4373,9 @@ fn workspace_command_active(
             focus == WorkspaceFocus::Shell
         }
         WorkspaceCommand::PreviousShell
+        | WorkspaceCommand::ToggleWorkspace
+        | WorkspaceCommand::FirstSession
+        | WorkspaceCommand::LastSession
         | WorkspaceCommand::Search
         | WorkspaceCommand::Help
         | WorkspaceCommand::SelectShell(_)
@@ -5229,6 +5244,7 @@ impl SessionTerminals {
                             }
                             Some(SessionListInput::Rename) => {
                                 if let Some(session_key) = state.chrome.selected_session_key.clone()
+                                    && state.chrome.selected_session_title.is_some()
                                 {
                                     state.rename = Some(WorkspaceRename {
                                         value: state
@@ -5257,6 +5273,22 @@ impl SessionTerminals {
                 }
                 continue;
             };
+            if state.focus == WorkspaceFocus::Sessions
+                && state.chrome.selected_session_title.is_none()
+                && matches!(
+                    command,
+                    WorkspaceCommand::NewShell
+                        | WorkspaceCommand::PreviousShell
+                        | WorkspaceCommand::SelectShell(_)
+                        | WorkspaceCommand::ToggleMaximize
+                        | WorkspaceCommand::ToggleShellArea
+                        | WorkspaceCommand::GrowShell
+                        | WorkspaceCommand::ShrinkShell
+                        | WorkspaceCommand::CopyCommandBlock
+                )
+            {
+                continue;
+            }
             match command {
                 WorkspaceCommand::Dashboard => return Ok(Some(state.exit)),
                 WorkspaceCommand::Alert => {
@@ -5281,6 +5313,11 @@ impl SessionTerminals {
                     state.exit = WorkspaceExit::NextSession(state.focus);
                     return Ok(Some(state.exit));
                 }
+                WorkspaceCommand::ToggleWorkspace => {
+                    return Ok(Some(WorkspaceExit::ToggleWorkspace));
+                }
+                WorkspaceCommand::FirstSession => return Ok(Some(WorkspaceExit::FirstSession)),
+                WorkspaceCommand::LastSession => return Ok(Some(WorkspaceExit::LastSession)),
                 WorkspaceCommand::SelectShell(index) => {
                     if index < self.shells.len() {
                         self.selected_shell = index;
@@ -6128,6 +6165,8 @@ fn workspace_help_lines(bindings: &WorkspaceBindings) -> Vec<String> {
         String::new(),
         "WORKSPACE · SESSIONS".into(),
         format!("{:<24} {}", "select session", "↑/↓, J/K"),
+        format!("{:<24} {}", "fold / expand workspace", "Space"),
+        format!("{:<24} {}", "first / last list row", "gg / G"),
         format!("{:<24} {}", "open agent", "Enter"),
         format!("{:<24} {}", "search sessions", bindings.label("search")),
         format!(
@@ -8506,6 +8545,21 @@ mod tests {
             ),
             (b"\x11", WorkspaceCommand::Dashboard, WorkspaceFocus::Shell),
             (b"a", WorkspaceCommand::Alert, WorkspaceFocus::Sessions),
+            (
+                b" ",
+                WorkspaceCommand::ToggleWorkspace,
+                WorkspaceFocus::Sessions,
+            ),
+            (
+                b"gg",
+                WorkspaceCommand::FirstSession,
+                WorkspaceFocus::Sessions,
+            ),
+            (
+                b"G",
+                WorkspaceCommand::LastSession,
+                WorkspaceFocus::Sessions,
+            ),
             (b"\x1e", WorkspaceCommand::NewShell, WorkspaceFocus::Agent),
             (b"\x0e", WorkspaceCommand::NextShell, WorkspaceFocus::Shell),
             (b"\x18", WorkspaceCommand::CloseShell, WorkspaceFocus::Shell),
@@ -8552,6 +8606,57 @@ mod tests {
                     routed.first(),
                     Some(WorkspaceInput::Command(command)) if command == expected
                 ));
+            }
+        }
+    }
+
+    #[test]
+    fn vim_list_jumps_wait_for_a_second_g_and_leave_child_input_unchanged() {
+        let mut router = WorkspaceInputRouter::default();
+        assert!(router.route(b"g", WorkspaceFocus::Sessions).is_empty());
+        assert!(router.flush().is_none());
+        assert!(matches!(
+            router.route(b"g", WorkspaceFocus::Sessions).as_slice(),
+            [WorkspaceInput::Command(WorkspaceCommand::FirstSession)]
+        ));
+        assert!(router.route(b"g", WorkspaceFocus::Sessions).is_empty());
+        assert!(
+            matches!(router.route(b"j", WorkspaceFocus::Sessions).as_slice(), [WorkspaceInput::Forward(bytes)] if bytes == b"j")
+        );
+        assert!(router.route(b"g", WorkspaceFocus::Sessions).is_empty());
+        assert!(matches!(
+            router.route(b"G", WorkspaceFocus::Sessions).as_slice(),
+            [WorkspaceInput::Command(WorkspaceCommand::LastSession)]
+        ));
+        for input in [
+            b"\x1b ".as_slice(),
+            b"\x1bg",
+            b"\x1bG",
+            b"\x1b[71;5u",
+            b"\x1bOG",
+        ] {
+            for split in 0..=input.len() {
+                let mut router = WorkspaceInputRouter::default();
+                let mut routed = router.route(&input[..split], WorkspaceFocus::Sessions);
+                routed.extend(router.route(&input[split..], WorkspaceFocus::Sessions));
+                let mut forwarded = Vec::new();
+                for event in routed {
+                    let WorkspaceInput::Forward(bytes) = event else {
+                        panic!("modified key became a shortcut: {input:?}");
+                    };
+                    forwarded.extend(bytes);
+                }
+                assert_eq!(forwarded, input);
+                assert!(router.route(b"g", WorkspaceFocus::Sessions).is_empty());
+            }
+        }
+        for focus in [WorkspaceFocus::Agent, WorkspaceFocus::Shell] {
+            assert!(router.route(b"g", WorkspaceFocus::Sessions).is_empty());
+            for input in [b"g".as_slice(), b"ggG ", b"\x1bg", b"\x1b[71;5u"] {
+                assert!(
+                    matches!(router.route(input, focus).as_slice(), [WorkspaceInput::Forward(bytes)] if bytes == input)
+                );
+                assert!(router.flush().is_none());
             }
         }
     }

@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- Space folds or expands the selected workspace in the terminal session lists.
+  Folded workspaces remain selectable as one row.
+- `gg` and `G` jump to the first and last visible list entries.
+
 ## [0.3.2] - 2026-09-15
 
 ### Added

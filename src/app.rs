@@ -223,6 +223,7 @@ pub struct RuntimeState {
     /// the suppression would only lose alerts nobody ever saw.
     suppress_selected_notifications: bool,
     filter: SessionFilter,
+    collapsed_workspaces: HashSet<PathBuf>,
     hide_archived_after_days: u64,
     store: StateStore,
     event_index: events::EventIndex,
@@ -327,6 +328,7 @@ pub struct App {
     pub dialog: Option<NewSessionDialog>,
     pub text_dialog: Option<TextDialog>,
     pub help_open: bool,
+    pub list_g_pending: bool,
     startup_cwd: PathBuf,
     pub terminals: TerminalManager,
     config: AgentConsoleConfig,
@@ -403,6 +405,7 @@ impl App {
                 notifications: VecDeque::new(),
                 suppress_selected_notifications: true,
                 filter: SessionFilter::default(),
+                collapsed_workspaces: HashSet::new(),
                 hide_archived_after_days: config.hide_archived_after_days(),
                 store,
                 event_index,
@@ -411,6 +414,7 @@ impl App {
             dialog: None,
             text_dialog: None,
             help_open: false,
+            list_g_pending: false,
             startup_cwd,
             terminals: TerminalManager::new(config.clone()),
             config,
@@ -428,10 +432,11 @@ impl App {
             .contains(&self.selected)
             .then(|| self.sessions.get(self.selected))
             .flatten()
+            .filter(|session| !self.workspace_collapsed(session))
     }
 
     pub fn select_next(&mut self) {
-        let order = self.session_display_order();
+        let order = self.session_list_order();
         if order.is_empty() {
             return;
         }
@@ -444,7 +449,7 @@ impl App {
     }
 
     pub fn select_previous(&mut self) {
-        let order = self.session_display_order();
+        let order = self.session_list_order();
         if order.is_empty() {
             return;
         }
@@ -458,6 +463,37 @@ impl App {
 
     pub fn session_display_order(&self) -> Vec<usize> {
         self.runtime.session_display_order()
+    }
+
+    pub fn select_list_edge(&mut self, last: bool) {
+        let order = self.session_list_order();
+        if let Some(&index) = if last { order.last() } else { order.first() } {
+            self.selected = index;
+            self.queue_selected_if_needed();
+        }
+    }
+
+    pub fn toggle_selected_workspace(&mut self) {
+        if !self.session_display_order().contains(&self.selected) {
+            return;
+        }
+        let session = &self.sessions[self.selected];
+        if self.session_archived(session) {
+            return;
+        }
+        let cwd = session.cwd.clone();
+        if !self.runtime.collapsed_workspaces.remove(&cwd) {
+            self.runtime.collapsed_workspaces.insert(cwd);
+        }
+        self.normalize_selection();
+    }
+
+    pub fn selected_workspace_collapsed(&self) -> bool {
+        self.session_list_order().contains(&self.selected)
+            && self
+                .sessions
+                .get(self.selected)
+                .is_some_and(|session| self.workspace_collapsed(session))
     }
 
     pub fn status_counts(&self) -> (usize, usize, usize, usize) {
@@ -722,6 +758,7 @@ impl App {
             .and_then(|value| value.to_str())
             .unwrap_or("session")
             .to_owned();
+        self.runtime.collapsed_workspaces.remove(&cwd);
         self.sessions.insert(
             0,
             Session {
@@ -826,6 +863,22 @@ impl App {
         exit: WorkspaceExit,
         current_exe: &Path,
     ) -> io::Result<bool> {
+        if self.selected_session().is_none()
+            && matches!(
+                exit,
+                WorkspaceExit::ActivateSession
+                    | WorkspaceExit::FocusShell
+                    | WorkspaceExit::OpenShell
+                    | WorkspaceExit::ToggleArchive
+            )
+        {
+            if exit == WorkspaceExit::ActivateSession && self.selected_workspace_collapsed() {
+                self.toggle_selected_workspace();
+                drive.session = self.prepare_selected_view(current_exe)?;
+            }
+            drive.focus = WorkspaceFocus::Sessions;
+            return Ok(false);
+        }
         match exit {
             WorkspaceExit::Dashboard => return Ok(true),
             WorkspaceExit::Alert => {
@@ -850,7 +903,12 @@ impl App {
                 drive.focus = WorkspaceFocus::Shell;
             }
             WorkspaceExit::NewSession => {
-                self.open_new_dialog_at(&drive.session.cwd);
+                let cwd = self
+                    .sessions
+                    .get(self.selected)
+                    .map_or(&drive.session.cwd, |session| &session.cwd)
+                    .clone();
+                self.open_new_dialog_at(&cwd);
                 return Ok(true);
             }
             WorkspaceExit::OpenShell => {
@@ -881,7 +939,9 @@ impl App {
                     Ok(false) => "SESSION RESTORED · returned to its workspace group".into(),
                     Err(error) => format!("cannot change archive state: {error}"),
                 };
-                drive.session = self.prepare_selected_view(current_exe)?;
+                if self.selected_session().is_some() {
+                    drive.session = self.prepare_selected_view(current_exe)?;
+                }
                 self.terminals.set_notice(&drive.session.key, notice);
                 drive.focus = WorkspaceFocus::Sessions;
             }
@@ -891,10 +951,28 @@ impl App {
                 }
                 drive.focus = WorkspaceFocus::Sessions;
             }
+            WorkspaceExit::ToggleWorkspace
+            | WorkspaceExit::FirstSession
+            | WorkspaceExit::LastSession => {
+                match exit {
+                    WorkspaceExit::ToggleWorkspace => self.toggle_selected_workspace(),
+                    WorkspaceExit::FirstSession => self.select_list_edge(false),
+                    WorkspaceExit::LastSession => self.select_list_edge(true),
+                    _ => unreachable!(),
+                }
+                drive.focus = WorkspaceFocus::Sessions;
+                if self.selected_session().is_some() {
+                    drive.session = self.prepare_selected_view(current_exe)?;
+                }
+            }
             WorkspaceExit::PreviousSession(next_focus) => {
                 self.select_previous();
                 drive.focus = next_focus;
-                drive.session = self.prepare_workspace_target(current_exe, next_focus)?;
+                if self.selected_session().is_some() {
+                    drive.session = self.prepare_workspace_target(current_exe, next_focus)?;
+                } else {
+                    drive.focus = WorkspaceFocus::Sessions;
+                }
                 if next_focus == WorkspaceFocus::Agent
                     && self.terminals.agent_alive(&drive.session.key)
                 {
@@ -904,7 +982,11 @@ impl App {
             WorkspaceExit::NextSession(next_focus) => {
                 self.select_next();
                 drive.focus = next_focus;
-                drive.session = self.prepare_workspace_target(current_exe, next_focus)?;
+                if self.selected_session().is_some() {
+                    drive.session = self.prepare_workspace_target(current_exe, next_focus)?;
+                } else {
+                    drive.focus = WorkspaceFocus::Sessions;
+                }
                 if next_focus == WorkspaceFocus::Agent
                     && self.terminals.agent_alive(&drive.session.key)
                 {
@@ -1247,6 +1329,11 @@ impl RuntimeState {
         mut discovered: Vec<Session>,
         alive: &HashSet<String>,
     ) -> Vec<(String, String)> {
+        let selected_workspace = self
+            .sessions
+            .get(self.selected)
+            .filter(|session| self.workspace_collapsed(session))
+            .map(|session| session.cwd.clone());
         let mut selected_key = self
             .sessions
             .get(self.selected)
@@ -1356,14 +1443,18 @@ impl RuntimeState {
         self.selected = selected_key
             .as_ref()
             .and_then(|key| self.sessions.iter().position(|session| &session.key == key))
+            .or_else(|| {
+                selected_workspace.and_then(|cwd| {
+                    self.sessions.iter().position(|session| {
+                        session.cwd == cwd
+                            && self.session_is_visible(session)
+                            && !self.store.archived(&session.key)
+                    })
+                })
+            })
             .unwrap_or(0)
             .min(self.sessions.len().saturating_sub(1));
-        let visible = self.session_display_order();
-        if !visible.contains(&self.selected)
-            && let Some(first) = visible.first()
-        {
-            self.selected = *first;
-        }
+        self.normalize_selection();
         self.last_discovery = Instant::now();
         self.queue_changed_sessions();
         self.queue_selected_if_needed();
@@ -1406,12 +1497,33 @@ impl RuntimeState {
         order
     }
 
+    pub fn workspace_collapsed(&self, session: &Session) -> bool {
+        !self.store.archived(&session.key) && self.collapsed_workspaces.contains(&session.cwd)
+    }
+
+    pub fn session_list_order(&self) -> Vec<usize> {
+        let mut folded = HashSet::new();
+        self.session_display_order()
+            .into_iter()
+            .filter(|&index| {
+                let session = &self.sessions[index];
+                !self.workspace_collapsed(session) || folded.insert(&session.cwd)
+            })
+            .collect()
+    }
+
     fn normalize_selection(&mut self) {
-        let order = self.session_display_order();
-        if !order.contains(&self.selected)
-            && let Some(first) = order.first()
-        {
-            self.selected = *first;
+        let order = self.session_list_order();
+        if !order.contains(&self.selected) {
+            let same_workspace = self.sessions.get(self.selected).and_then(|selected| {
+                order.iter().find(|&&index| {
+                    self.workspace_collapsed(&self.sessions[index])
+                        && self.sessions[index].cwd == selected.cwd
+                })
+            });
+            if let Some(&index) = same_workspace.or_else(|| order.first()) {
+                self.selected = index;
+            }
         }
     }
 
@@ -1512,11 +1624,15 @@ impl RuntimeState {
         let mut selected_row = 0;
         let mut last_workspace = None;
         let mut archived_group = false;
-        let order = self.session_display_order();
+        let order = self.session_list_order();
         let selected_visible = order.contains(&self.selected);
+        let selected_session = selected_visible
+            .then(|| self.sessions.get(self.selected))
+            .flatten();
         for index in order {
             let session = &self.sessions[index];
             let archived = self.store.archived(&session.key);
+            let collapsed = self.workspace_collapsed(session);
             if archived && !archived_group {
                 lines.push("▾ Archived".into());
                 archived_group = true;
@@ -1527,8 +1643,14 @@ impl RuntimeState {
                     .file_name()
                     .and_then(|value| value.to_str())
                     .unwrap_or_else(|| session.cwd.to_str().unwrap_or("workspace"));
-                lines.push(format!("▾ {label}"));
+                if collapsed && index == self.selected {
+                    selected_row = lines.len();
+                }
+                lines.push(format!("{} {label}", if collapsed { "▸" } else { "▾" }));
                 last_workspace = Some(&session.cwd);
+            }
+            if collapsed {
+                continue;
             }
             if index == self.selected {
                 selected_row = lines.len();
@@ -1541,10 +1663,14 @@ impl RuntimeState {
                 self.session_title(session)
             ));
         }
-        let preview = selected_visible
-            .then(|| self.sessions.get(self.selected))
-            .flatten()
+        let preview = selected_session
             .map(|session| {
+                if self.workspace_collapsed(session) {
+                    return vec![
+                        format!("Workspace · {}", session.cwd.display()),
+                        "Space or Enter expands this workspace".into(),
+                    ];
+                }
                 let mut preview = vec![
                     format!(
                         "{} · {} · {}",
@@ -1579,13 +1705,9 @@ impl RuntimeState {
         WorkspaceChrome {
             sessions: lines,
             selected: selected_row,
-            selected_session_key: selected_visible
-                .then(|| self.sessions.get(self.selected))
-                .flatten()
-                .map(|session| session.key.clone()),
-            selected_session_title: selected_visible
-                .then(|| self.sessions.get(self.selected))
-                .flatten()
+            selected_session_key: selected_session.map(|session| session.key.clone()),
+            selected_session_title: selected_session
+                .filter(|session| !self.workspace_collapsed(session))
                 .map(|session| self.session_title(session)),
             search_query: self.filter.query.clone(),
             status_counts: session_status_counts(&self.sessions),
@@ -1615,6 +1737,7 @@ impl RuntimeState {
             .suppress_selected_notifications
             .then(|| self.sessions.get(self.selected))
             .flatten()
+            .filter(|session| !self.workspace_collapsed(session))
             .map(|session| session.key.clone());
         let current = self
             .sessions
@@ -1741,6 +1864,7 @@ impl RuntimeState {
             return false;
         };
         self.selected = index;
+        self.collapsed_workspaces.remove(&self.sessions[index].cwd);
         self.filter = SessionFilter::default();
         notification.read = true;
         true
@@ -2133,6 +2257,7 @@ impl App {
                 notifications: VecDeque::new(),
                 suppress_selected_notifications: true,
                 filter: SessionFilter::default(),
+                collapsed_workspaces: HashSet::new(),
                 hide_archived_after_days: AgentConsoleConfig::default().hide_archived_after_days(),
                 store,
                 event_index,
@@ -2141,6 +2266,7 @@ impl App {
             dialog: None,
             text_dialog: None,
             help_open: false,
+            list_g_pending: false,
             startup_cwd: "/tmp".into(),
             terminals: TerminalManager::default(),
             config: AgentConsoleConfig::default(),
@@ -2280,6 +2406,7 @@ mod tests {
                 notifications: VecDeque::new(),
                 suppress_selected_notifications: true,
                 filter: SessionFilter::default(),
+                collapsed_workspaces: HashSet::new(),
                 hide_archived_after_days: AgentConsoleConfig::default().hide_archived_after_days(),
                 store,
                 event_index,
@@ -2288,6 +2415,7 @@ mod tests {
             dialog: None,
             text_dialog: None,
             help_open: false,
+            list_g_pending: false,
             startup_cwd: root.path().to_owned(),
             terminals: TerminalManager::default(),
             config: AgentConsoleConfig::default(),
@@ -2666,6 +2794,82 @@ mod tests {
             app.runtime.summary_queue.front().map(String::as_str),
             Some("codex:test")
         );
+    }
+
+    #[test]
+    fn folded_workspaces_stay_selectable_through_navigation_search_and_refresh() {
+        let mut app = App::test_fixture();
+        app.sessions[0].cwd = "/tmp/alpha".into();
+        let mut other = app.sessions[0].clone();
+        other.key = "codex:other".into();
+        other.cwd = "/tmp/beta".into();
+        let mut sibling = app.sessions[0].clone();
+        sibling.key = "codex:sibling".into();
+        sibling.provider_session_id = "sibling".into();
+        app.sessions.extend([other, sibling]);
+        app.selected = 2;
+        app.toggle_selected_workspace();
+        assert_eq!(app.session_list_order(), [0, 1]);
+        assert_eq!(app.selected, 0);
+        assert!(app.selected_session().is_none());
+        let chrome = app.runtime.workspace_chrome();
+        assert_eq!(chrome.sessions.len(), 3);
+        assert_eq!(chrome.sessions[chrome.selected], "▸ alpha");
+        assert!(chrome.selected_session_title.is_none());
+        assert!(app.toggle_selected_archive().is_err());
+
+        app.select_next();
+        assert_eq!(app.selected, 1);
+        app.select_previous();
+        assert_eq!(app.selected, 0);
+        app.select_previous();
+        assert_eq!(app.selected, 1, "movement wraps around visible rows");
+        app.toggle_selected_workspace();
+        app.select_list_edge(false);
+        assert_eq!(app.selected, 0);
+        app.select_list_edge(true);
+        assert_eq!(app.selected, 1);
+        assert_eq!(
+            app.runtime.workspace_chrome().sessions,
+            ["▸ alpha", "▸ beta"]
+        );
+        app.toggle_selected_workspace();
+
+        app.select_list_edge(false);
+        let original = app.runtime.workspace_chrome().selected_session_key;
+        app.runtime
+            .apply_workspace_search(WorkspaceSearchUpdate::Preview("sibling".into()));
+        assert_eq!(app.session_list_order(), [2]);
+        assert!(app.selected_workspace_collapsed());
+        app.runtime
+            .apply_workspace_search(WorkspaceSearchUpdate::Cancel {
+                query: String::new(),
+                selected_session_key: original,
+            });
+        assert_eq!(app.selected, 0);
+
+        let mut discovered = app.sessions.clone();
+        for session in &mut app.sessions {
+            session.transcript_path = Some("/tmp/fixture.jsonl".into());
+        }
+        discovered.remove(0);
+        discovered[0].transcript_modified_at = unix_timestamp() + 10;
+        app.runtime.apply_discovered(discovered, &HashSet::new());
+        assert_eq!(app.sessions[app.selected].cwd, Path::new("/tmp/alpha"));
+        assert!(app.selected_workspace_collapsed());
+        app.toggle_selected_workspace();
+        assert_eq!(app.selected_session().unwrap().key, "codex:sibling");
+
+        app.runtime.filter.query = "no matching session".into();
+        app.select_list_edge(false);
+        app.select_list_edge(true);
+        app.toggle_selected_workspace();
+        assert!(app.session_list_order().is_empty());
+        app.sessions.clear();
+        app.select_next();
+        app.select_previous();
+        app.select_list_edge(true);
+        app.toggle_selected_workspace();
     }
 
     #[test]

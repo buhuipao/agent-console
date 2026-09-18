@@ -280,6 +280,8 @@ Dashboard:
 | Key | Action |
 | --- | --- |
 | `↑` / `↓`, `j` / `k` | Select a session |
+| `Space` | Fold or expand the selected workspace |
+| `gg` / `G` | Select the first / last row in the list |
 | `Enter` | Open the selected agent |
 | `s` | Open a shell |
 | `n` | Create a session |
@@ -309,6 +311,8 @@ With the Sessions list focused:
 | Key | Action |
 | --- | --- |
 | `↑` / `↓`, `j` / `k` | Select a session |
+| `Space` | Fold or expand the selected workspace |
+| `gg` / `G` | Select the first / last row in the list |
 | `Enter`, `Ctrl-\` | Open/resume and focus its agent |
 | `/` | Search sessions as you type |
 | `e` | Rename the selected session |
@@ -322,6 +326,12 @@ With the Sessions list focused:
 | `+` / `_` | Grow or shrink the shell area |
 | `y` | Copy the latest shell command output |
 | `1` … `9` | Focus a numbered shell |
+
+A folded workspace takes one selectable row. Movement and `gg`/`G` skip its
+hidden sessions. `Space` or `Enter` expands it. Folding lasts until the console
+closes and is shared by both terminal lists. These keys remain normal input in
+Agent and Shell panes and in text dialogs. Archived sessions stay in their own
+group.
 
 After `h` or `m`, use `Ctrl-\` until focus returns to Sessions; the normal split
 layout is restored automatically.
