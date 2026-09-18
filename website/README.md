@@ -39,6 +39,15 @@ the command above after the reviewed changes reach `main`.
 After each deployment, verify the public HTTPS page, the HTTP-to-HTTPS redirect,
 `/robots.txt`, `/sitemap.xml`, the screenshot, and the video. An unknown path must
 return HTTP 404. Check that the served HTML and CSS match the deployed commit.
+The manual CI run performs these live checks from a GitHub-hosted runner:
+
+```sh
+gh workflow run ci.yml --ref main --repo buhuipao/agent-console
+```
+
+It compares all public assets with the checked-out commit and tests video range
+requests. Normal push and pull-request runs only check the local site files.
+
 To restore an earlier site, deploy its `website/` directory from a clean
 worktree; this also restores its static assets.
 

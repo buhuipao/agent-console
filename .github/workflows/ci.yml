@@ -20,6 +20,28 @@ jobs:
       - uses: actions/checkout@v6
       - name: Check website links and metadata
         run: python3 tests/website.py
+      - name: Verify the deployed website
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          site_url=https://agent-console.buhuipao.com
+          check_dir=$(mktemp -d)
+          curl --fail --silent --show-error --retry 3 --max-time 30 "$site_url/" -D "$check_dir/headers" -o "$check_dir/index.html"
+          cmp website/public/index.html "$check_dir/index.html"
+          grep -qi '^content-type: text/html' "$check_dir/headers"
+          grep -qi '^x-content-type-options: nosniff' "$check_dir/headers"
+          for file in style.css robots.txt sitemap.xml assets/favicon.svg assets/dashboard.png assets/demo.mp4; do
+            curl --fail --silent --show-error --retry 3 --max-time 30 "$site_url/$file" -o "$check_dir/asset"
+            cmp "website/public/$file" "$check_dir/asset"
+          done
+          redirect=$(curl --silent --show-error --max-time 30 -o /dev/null -w '%{http_code} %{redirect_url}' "http://agent-console.buhuipao.com/?check=redirect")
+          [[ "$redirect" =~ ^30[18]\ https://agent-console.buhuipao.com/\?check=redirect$ ]]
+          status=$(curl --silent --show-error --max-time 30 -o "$check_dir/missing" -w '%{http_code}' "$site_url/website-health-missing")
+          test "$status" = 404
+          cmp website/public/404.html "$check_dir/missing"
+          status=$(curl --silent --show-error --max-time 30 -H 'Range: bytes=0-99' -o "$check_dir/range" -w '%{http_code}' "$site_url/assets/demo.mp4")
+          test "$status" = 206
+          test "$(wc -c < "$check_dir/range")" -eq 100
+          echo "Live HTML, assets, HTTPS redirect, 404, and video range checks passed."
 
   quality:
     runs-on: ubuntu-24.04
