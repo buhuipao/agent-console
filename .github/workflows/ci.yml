@@ -25,8 +25,12 @@ jobs:
         run: |
           site_url=https://agent-console.buhuipao.com
           check_dir=$(mktemp -d)
-          curl --fail --silent --show-error --retry 3 --max-time 30 "$site_url/" -D "$check_dir/headers" -o "$check_dir/index.html"
-          cmp website/public/index.html "$check_dir/index.html"
+          curl --fail-with-body --silent --show-error --retry 3 --max-time 30 "$site_url/" -D "$check_dir/headers" -o "$check_dir/index.html" || {
+            grep -Ei '^(HTTP/|server:|cf-ray:|cf-mitigated:)' "$check_dir/headers" || true
+            head -c 2000 "$check_dir/index.html"
+            exit 1
+          }
+          diff -u website/public/index.html "$check_dir/index.html"
           grep -qi '^content-type: text/html' "$check_dir/headers"
           grep -qi '^x-content-type-options: nosniff' "$check_dir/headers"
           for file in style.css robots.txt sitemap.xml assets/favicon.svg assets/dashboard.png assets/demo.mp4; do
