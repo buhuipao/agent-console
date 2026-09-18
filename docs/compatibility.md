@@ -2,10 +2,10 @@
 
 The supported floor and the versions exercised for this release are:
 
-| Provider | Supported floor | Contract fixtures | Real local smoke |
+| Provider | Supported floor | Contract fixtures | Local version/help smoke |
 | --- | ---: | --- | --- |
-| Codex CLI | 0.100.0 | 0.100.0, 0.144.5 | 0.151.0 |
-| Claude Code | 2.0.0 | 2.0.0, 2.1.214 | 2.1.251 |
+| Codex CLI | 0.100.0 | 0.100.0, 0.144.5 | 0.155.0 |
+| Claude Code | 2.0.0 | 2.0.0, 2.1.214 | 2.1.276 |
 | pi | 0.84.0 | — | 0.84.4 |
 
 Compatibility means the provider exposes the resume and hook-configuration
@@ -22,10 +22,13 @@ model the CLI contract rather than provider rendering, which remains owned by
 the provider. `tests/e2e/real_provider_doctor.sh` runs the same no-model smoke
 against locally installed/configured binaries.
 
-`tests/e2e/real_provider_sessions.exp` is the release-only interactive smoke:
-it starts one empty real session per provider, refreshes discovery, stops the
-PTY daemon, and re-enters through the provider resume contract. It never sends
-a prompt.
+`tests/e2e/real_provider_sessions.exp` is the release-only interactive smoke
+for Codex and Claude. It starts empty sessions, exits and resumes Codex, then
+stops the PTY daemon before resuming Claude. It never sends a prompt.
+
+For this release, Codex session creation and resume passed locally. Claude's
+interactive check remains unverified because the local CLI could not load its
+required organization-managed settings. Its version/help checks passed.
 
 ## Packaged platforms
 

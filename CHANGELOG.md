@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-09-18
+
 ### Added
 - Add a public product website at `agent-console.buhuipao.com`, with a recorded
   demo, feature overview, install guide, FAQs, and `support@buhuipao.com` contact.
