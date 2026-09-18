@@ -36,17 +36,26 @@ The custom-domain route creates the Cloudflare DNS record and certificate.
 Keep credentials outside the repository. CI checks the site; deployment uses
 the command above after the reviewed changes reach `main`.
 
-After each deployment, verify the public HTTPS page, the HTTP-to-HTTPS redirect,
-`/robots.txt`, `/sitemap.xml`, the screenshot, and the video. An unknown path must
-return HTTP 404. Check that the served HTML and CSS match the deployed commit.
-The manual CI run performs these live checks from a GitHub-hosted runner:
+CI checks local site files. After each deployment, verify the public HTTPS page,
+the HTTP-to-HTTPS redirect, `/robots.txt`, `/sitemap.xml`, the screenshot, and the
+video. An unknown path must return HTTP 404. Video range requests should return
+HTTP 206. Check that served content matches the deployed commit.
 
-```sh
-gh workflow run ci.yml --ref main --repo buhuipao/agent-console
-```
+The zone's existing Bot Fight Mode can challenge automated clients, including
+GitHub runners, with HTTP 403. Keep that protection in place. Use an ordinary
+browser and [Google's Rich Results Test](https://search.google.com/test/rich-results)
+to check public rendering and search access. A successful Google fetch does not
+verify redirects, unknown-path responses, or video range requests.
 
-It compares all public assets with the checked-out commit and tests video range
-requests. Normal push and pull-request runs only check the local site files.
+`Cache-Control: no-transform` prevents Cloudflare from injecting scripts or
+rewriting the contact link, which keeps the strict content security policy
+compatible with this static page. It does not bypass bot challenges. Responses
+must revalidate so changes to assets without versioned filenames appear promptly.
+
+The initial Google live test on 2026-09-18 returned HTTP 200, loaded all requested
+page resources, and found valid software application and organization data.
+Its fetched text and links matched the source. Automated redirect, 404, and video
+range checks were blocked by Bot Fight Mode and remain unverified in production.
 
 To restore an earlier site, deploy its `website/` directory from a clean
 worktree; this also restores its static assets.
@@ -76,6 +85,7 @@ Reference guidance checked on 2026-09-18:
 - [Google: AI features and websites](https://developers.google.com/search/docs/appearance/ai-features)
 - [Cloudflare: static assets](https://developers.cloudflare.com/workers/static-assets/)
 - [Cloudflare: custom domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)
+- [Cloudflare: JavaScript detections and no-transform](https://developers.cloudflare.com/cloudflare-challenges/challenge-types/javascript-detections/#if-your-origin-sends-a-no-transform-header)
 
 Production reachability, search indexing, rankings, and AI citations are
 separate checks. This setup does not prove indexing or citations. Check search

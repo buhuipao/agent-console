@@ -1,8 +1,6 @@
 /*
+  Cache-Control: public, max-age=0, must-revalidate, no-transform
   X-Content-Type-Options: nosniff
   Referrer-Policy: strict-origin-when-cross-origin
   X-Frame-Options: DENY
   Content-Security-Policy: default-src 'none'; style-src 'self'; img-src 'self'; media-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
-
-/assets/*
-  Cache-Control: public, max-age=86400
