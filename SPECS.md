@@ -656,7 +656,9 @@ part of the interaction model. Live search covers those metadata dimensions.
 
 Folding is shared by the Dashboard and Workspace session lists for the life of
 the console. Expanded workspace headings remain labels; a folded workspace is
-one navigation target. Space or Enter expands it. Session actions such as
+one navigation target. Workspace headings stay bold cyan when folded; selected
+folded rows use a dark background to keep the cyan text readable.
+Space or Enter expands it. Session actions such as
 rename or archive require an expanded session. Archived sessions stay in the
 separate Archived group. List jumps follow the current search and fold state;
 empty lists ignore them. `gg` accepts consecutive presses or one input batch;

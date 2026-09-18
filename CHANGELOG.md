@@ -9,6 +9,10 @@ All notable changes to this project will be documented in this file.
   Folded workspaces remain selectable as one row.
 - `gg` and `G` jump to the first and last visible list entries.
 
+### Fixed
+- Folded workspace rows keep the same bold cyan text as expanded headings,
+  including when selected.
+
 ## [0.3.2] - 2026-09-15
 
 ### Added

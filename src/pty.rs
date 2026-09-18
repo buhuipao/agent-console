@@ -6241,13 +6241,19 @@ fn render_sidebar(
         .take(visible)
         .enumerate()
     {
-        if session.starts_with("▾ ") {
+        let collapsed = session.starts_with("▸ ");
+        if collapsed || session.starts_with("▾ ") {
             let label = fit_text(session, layout.sidebar_width);
+            let background = if collapsed && index == chrome.selected {
+                "\x1b[48;2;45;53;72m"
+            } else {
+                ""
+            };
             write_at(
                 stdout,
                 row as u16 + list_top,
                 0,
-                format!("\x1b[1;36m{label}\x1b[0m").as_bytes(),
+                format!("{background}\x1b[1;36m{label}\x1b[0m").as_bytes(),
             )?;
             continue;
         }
@@ -11525,11 +11531,12 @@ mod tests {
 
     #[test]
     fn workspace_sidebar_colors_provider_labels_like_dashboard() {
-        let chrome = WorkspaceChrome {
+        let mut chrome = WorkspaceChrome {
             sessions: vec![
                 "▾ repo".into(),
                 "○ Cdx codex task".into(),
                 "! Cla claude task".into(),
+                "▸ folded".into(),
             ],
             selected: 1,
             selected_session_key: None,
@@ -11547,6 +11554,29 @@ mod tests {
         let output = String::from_utf8_lossy(&output);
         assert!(output.contains("\x1b[36mCdx\x1b[0m"));
         assert!(output.contains("\x1b[38;2;219;126;82mCla\x1b[0m"));
+
+        for selected in [1, 3] {
+            chrome.selected = selected;
+            for focused in [false, true] {
+                let mut output = Vec::new();
+                render_sidebar(&mut output, &chrome, &layout, focused).unwrap();
+                let mut terminal = vt100::Parser::new(40, 120, 0);
+                terminal.process(&output);
+                for row in [3, 6] {
+                    let cell = terminal.screen().cell(row, 2).unwrap();
+                    assert_eq!(cell.fgcolor(), vt100::Color::Idx(6));
+                    assert!(cell.bold());
+                }
+                assert_eq!(
+                    terminal.screen().cell(6, 2).unwrap().bgcolor(),
+                    if selected == 3 {
+                        vt100::Color::Rgb(45, 53, 72)
+                    } else {
+                        vt100::Color::Default
+                    }
+                );
+            }
+        }
     }
 
     #[test]
