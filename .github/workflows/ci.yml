@@ -14,6 +14,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  website:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check website links and metadata
+        run: python3 tests/website.py
+
   quality:
     runs-on: ubuntu-24.04
     steps:

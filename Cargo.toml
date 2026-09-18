@@ -10,7 +10,7 @@ keywords = ["cli", "tui", "codex", "claude", "agent"]
 # "pi" is deliberately left out of `keywords`: crates.io allows five, and a
 # two-letter term is not what anyone searches for.
 categories = ["command-line-utilities", "development-tools"]
-exclude = ["docs/assets/*", "tests/fixtures/*", "target/*"]
+exclude = ["docs/assets/*", "tests/fixtures/*", "target/*", "website/*"]
 
 [dependencies]
 axum = { version = "0.8.9", features = ["ws"] }

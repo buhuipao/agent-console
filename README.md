@@ -4,6 +4,10 @@ Agent Console is a local terminal dashboard for Codex, Claude Code, and pi. It
 discovers recent sessions, shows their current state, resumes the native agent
 UI, and keeps same-workspace shells beside each agent.
 
+[Website](https://agent-console.buhuipao.com/) ·
+[Downloads](https://github.com/buhuipao/agent-console/releases/latest) ·
+[Contact](mailto:support@buhuipao.com)
+
 ![Agent Console: 20 Codex and Claude Code sessions in one dashboard, jumping to
 the session waiting on an approval, searching across workspaces, and opening a
 shell in the session's own directory](docs/assets/demo.gif)
@@ -154,6 +158,8 @@ agent-console web --host 0.0.0.0 --port 8080 --auth alice:hunter2
 
 The page is an installable PWA, so "Add to Home Screen" gives it a standalone
 window and an offline app shell; sessions themselves always need the server.
+Install and offline support require HTTPS, or localhost on the host machine.
+Plain HTTP at a LAN IP does not provide the offline app shell on a phone.
 
 The browser gets the same session list, and can create, attach to, archive and
 terminate sessions. Each session has three views. **Conversation** reads the
@@ -413,11 +419,19 @@ Provider compatibility details are in
 
 ## Feedback
 
+Contact [support@buhuipao.com](mailto:support@buhuipao.com) for questions.
+
 Please use [GitHub Issues](https://github.com/buhuipao/agent-console/issues) for
 reproducible bugs and workflow feedback. Include your operating system,
 terminal, Codex, Claude Code, or pi version, and redacted `agent-console doctor`
 output when they are relevant. Do not post tokens, private prompts, unredacted
 paths, or full environment variables.
+
+## Product website
+
+The public single-page website is in `website/public`. It is deployed as static
+assets on Cloudflare at <https://agent-console.buhuipao.com/>. Local preview,
+validation, and deployment commands are in [website/README.md](website/README.md).
 
 ## License
 

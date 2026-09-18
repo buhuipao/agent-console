@@ -1,0 +1,13 @@
+{
+  "name": "agent-console-website",
+  "compatibility_date": "2026-09-18",
+  "workers_dev": false,
+  "preview_urls": false,
+  "assets": {
+    "directory": "./public",
+    "not_found_handling": "404-page"
+  },
+  "routes": [
+    { "pattern": "agent-console.buhuipao.com", "custom_domain": true }
+  ]
+}

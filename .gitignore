@@ -1,4 +1,6 @@
 /target/
+/.wrangler/
+/website/.wrangler/
 /web-articles/
 /tests/fixtures/e2e-home/.zsh_history
 *.p12

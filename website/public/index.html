@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agent Console — One Dashboard for Codex, Claude Code &amp; pi</title>
+  <meta name="description" content="Manage Codex, Claude Code, and pi sessions in one local dashboard. Resume agents, handle approvals, and use workspace shells from your terminal or browser.">
+  <meta name="robots" content="index, follow, max-image-preview:large">
+  <meta name="theme-color" content="#f7f9f5">
+  <link rel="canonical" href="https://agent-console.buhuipao.com/">
+  <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Agent Console">
+  <meta property="og:locale" content="en_US">
+  <meta property="og:url" content="https://agent-console.buhuipao.com/">
+  <meta property="og:title" content="Agent Console — All your agents. One place to work.">
+  <meta property="og:description" content="A local, open-source dashboard for Codex, Claude Code, and pi. Your agents, workspace shells, and approvals, together.">
+  <meta property="og:image" content="https://agent-console.buhuipao.com/assets/dashboard.png">
+  <meta property="og:image:alt" content="Agent Console terminal dashboard with demo sessions grouped by workspace and a session overview.">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Agent Console — All your agents. One place to work.">
+  <meta name="twitter:description" content="Manage Codex, Claude Code, and pi in one local terminal and browser dashboard.">
+  <meta name="twitter:image" content="https://agent-console.buhuipao.com/assets/dashboard.png">
+  <meta name="twitter:image:alt" content="Agent Console terminal dashboard with demo sessions grouped by workspace.">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "WebSite",
+        "@id": "https://agent-console.buhuipao.com/#website",
+        "url": "https://agent-console.buhuipao.com/",
+        "name": "Agent Console",
+        "inLanguage": "en"
+      },
+      {
+        "@type": "WebPage",
+        "@id": "https://agent-console.buhuipao.com/#webpage",
+        "url": "https://agent-console.buhuipao.com/",
+        "name": "Agent Console — One Dashboard for Codex, Claude Code & pi",
+        "isPartOf": { "@id": "https://agent-console.buhuipao.com/#website" },
+        "about": { "@id": "https://agent-console.buhuipao.com/#software" },
+        "inLanguage": "en"
+      },
+      {
+        "@type": ["SoftwareApplication", "SoftwareSourceCode"],
+        "@id": "https://agent-console.buhuipao.com/#software",
+        "name": "Agent Console",
+        "url": "https://agent-console.buhuipao.com/",
+        "description": "A local, open-source terminal and browser dashboard for Codex, Claude Code, and pi sessions, with native agent resume, approvals, and persistent workspace shells.",
+        "applicationCategory": "DeveloperApplication",
+        "operatingSystem": "macOS, Linux, Windows 10+",
+        "isAccessibleForFree": true,
+        "downloadUrl": "https://github.com/buhuipao/agent-console/releases/latest",
+        "codeRepository": "https://github.com/buhuipao/agent-console",
+        "license": ["https://github.com/buhuipao/agent-console/blob/main/LICENSE-MIT", "https://github.com/buhuipao/agent-console/blob/main/LICENSE-APACHE"],
+        "screenshot": "https://agent-console.buhuipao.com/assets/dashboard.png",
+        "featureList": ["Codex, Claude Code, and pi sessions", "Workspace grouping and search", "Native agent resume", "Persistent workspace shells", "Approval and failure alerts", "Terminal and browser access", "Installable browser app", "Provider diagnostics"],
+        "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD", "url": "https://agent-console.buhuipao.com/#install" },
+        "maintainer": { "@type": "Organization", "name": "Agent Console", "email": "support@buhuipao.com", "url": "https://agent-console.buhuipao.com/" }
+      }
+    ]
+  }
+  </script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <nav class="container nav" aria-label="Main navigation">
+      <a class="brand" href="/" aria-label="Agent Console home"><span class="brand-mark" aria-hidden="true">&gt;_</span> Agent Console</a>
+      <div class="nav-links">
+        <a href="#features">Features</a><a href="#workflow">Workflow</a><a href="#faq">FAQ</a>
+        <a href="https://github.com/buhuipao/agent-console">GitHub <span aria-hidden="true">↗</span></a>
+      </div>
+      <a class="button small" href="#install">Get started <span aria-hidden="true">↗</span></a>
+    </nav>
+  </header>
+
+  <main id="main">
+    <section class="hero grid-paper" aria-labelledby="hero-title">
+      <div class="container">
+        <p class="eyebrow"><span class="status-dot" aria-hidden="true"></span> OPEN SOURCE. ON YOUR MACHINE.</p>
+        <h1 id="hero-title">All your agents.<br><span>One place to work.</span></h1>
+        <p class="hero-copy">A local dashboard for <strong>Codex, Claude Code, and pi.</strong><br class="desktop-break"> Find the session that needs you. Pick up where you left off.<br class="desktop-break"> Keep your agents and workspace shells together.</p>
+        <div class="actions">
+          <a class="button" href="#install">Get Agent Console <span aria-hidden="true">↗</span></a>
+          <a class="button secondary" href="#demo"><span aria-hidden="true">▷</span> See it in action</a>
+        </div>
+        <p class="hero-note">Free to use <span>·</span> macOS, Linux &amp; Windows <span>·</span> Your existing agents</p>
+        <figure class="product-shot">
+          <div class="window-bar" aria-hidden="true"><span class="window-dots">● ● ●</span><span>agent-console / workspace overview</span><span>LOCAL</span></div>
+          <img src="/assets/dashboard.png" width="2075" height="1178" fetchpriority="high" alt="Agent Console showing Codex and Claude Code demo sessions grouped by workspace, with task summaries, branches, and failed-session status.">
+          <figcaption>One view across your workspaces. Real terminal UI, recorded with sample sessions.</figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <div class="provider-strip container" aria-label="Supported agents">
+      <span class="eyebrow">YOUR TOOLS. STILL YOUR TOOLS.</span>
+      <span class="provider"><span class="provider-icon" aria-hidden="true">⌘</span> Codex</span>
+      <span class="provider"><span class="provider-icon claude" aria-hidden="true">✳</span> Claude Code</span>
+      <span class="provider"><span class="provider-icon" aria-hidden="true">π</span> pi</span>
+      <a href="https://github.com/buhuipao/agent-console/blob/main/docs/compatibility.md">Compatibility <span aria-hidden="true">↗</span></a>
+    </div>
+
+    <section class="section container" id="features" aria-labelledby="features-title">
+      <div class="section-heading">
+        <div><p class="eyebrow">01 / THE BIG PICTURE</p><h2 id="features-title">More agents.<br>Less tab hunting.</h2></div>
+        <p>See what is working, what is waiting, and where to step in. Keep each task connected to its workspace.</p>
+      </div>
+      <div class="feature-grid">
+        <article class="feature"><span class="feature-symbol" aria-hidden="true">▤</span><h3>Every workspace, one view</h3><p>Discover recent Codex, Claude Code, and pi sessions. Group them by workspace, search across tasks and branches, and return to the right conversation.</p><div class="status-list"><span><i class="status-dot" aria-hidden="true"></i>Working</span><span><i class="status-dot amber" aria-hidden="true"></i>Waiting</span><span><i class="status-dot gray" aria-hidden="true"></i>Idle</span><span><i class="status-dot red" aria-hidden="true"></i>Failed</span></div></article>
+        <article class="feature"><span class="feature-symbol" aria-hidden="true">&gt;_</span><h3>The agent UI you already know</h3><p>Resume the provider’s native terminal interface. Keep its tools and shortcuts, with scrollback, mouse selection, and copy beside your session list.</p><p class="feature-detail">Your provider. Your configuration. Your conversation.</p></article>
+        <article class="feature"><span class="feature-symbol" aria-hidden="true">↳</span><h3>A shell in the right place</h3><p>Open multiple persistent shells in the agent’s working directory. Run checks, inspect a diff, copy command output, or send it back to the agent from the browser.</p><p class="feature-detail"><kbd>s</kbd> Open workspace shell</p></article>
+        <article class="feature"><span class="feature-symbol" aria-hidden="true">◉</span><h3>Know when you are needed</h3><p>See approval and failure alerts, then jump to the session that raised them. Read progress summaries generated by the session’s own provider.</p><p class="feature-detail"><kbd>a</kbd> Jump to the next alert</p></article>
+        <article class="feature"><span class="feature-symbol" aria-hidden="true">⇄</span><h3>Terminal to browser</h3><p>The dashboard starts a browser UI with the same sessions. Read conversations, send prompts, answer supported dialogs, and use Shell or Agent TUI views.</p><p class="feature-detail">Desktop, phone, or an installed browser app.</p></article>
+        <article class="feature"><span class="feature-symbol" aria-hidden="true">⌕</span><h3>A session list you can keep tidy</h3><p>Create, rename, archive, and restore sessions. Search by prompt, summary, path, branch, provider, or status. Run diagnostics when a provider needs attention.</p><p class="feature-detail"><code>agent-console doctor</code></p></article>
+      </div>
+      <div class="source-note"><strong>Also in the current source:</strong> fold workspace groups with <kbd>Space</kbd>, jump with <kbd>gg</kbd> / <kbd>G</kbd>, hide old archived sessions, and preview permanent cleanup with <code>prune-archived --dry-run</code>. <a href="https://github.com/buhuipao/agent-console/blob/main/CHANGELOG.md">Check release availability ↗</a></div>
+    </section>
+
+    <section class="workflow-section" id="workflow" aria-labelledby="workflow-title">
+      <div class="container section">
+        <div class="section-heading"><div><p class="eyebrow">02 / STAY IN THE FLOW</p><h2 id="workflow-title">From “what’s running?”<br>to the next useful action.</h2></div><p>Your console holds the context. You choose where your attention goes.</p></div>
+        <ol class="workflow-steps">
+          <li><span class="step-number">01</span><h3>Find your session</h3><p>Launch the console to discover saved conversations. Search for a task or choose a workspace.</p><code>/ search</code></li>
+          <li><span class="step-number">02</span><h3>Pick up the work</h3><p>Resume an agent in its native UI. Start a new session or open a shell beside it.</p><code>Enter resume · s shell</code></li>
+          <li><span class="step-number">03</span><h3>Step in when it matters</h3><p>Follow an alert, review the request, and answer it. Continue through the browser when you need it.</p><code>a next alert</code></li>
+        </ol>
+        <figure class="demo" id="demo">
+          <video controls playsinline preload="none" poster="/assets/dashboard.png" width="1400" height="800" aria-label="Agent Console terminal demonstration" aria-describedby="demo-caption">
+            <source src="/assets/demo.mp4" type="video/mp4">
+            <a href="/assets/demo.mp4">Download the Agent Console demo.</a>
+          </video>
+          <figcaption id="demo-caption"><strong>Watch the workflow.</strong> This silent recording uses sample data: browse 20 sessions across seven workspaces, jump to an approval alert, search sessions, and open a shell in the selected workspace.</figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <section class="section container browser-section" aria-labelledby="browser-title">
+      <div><p class="eyebrow">03 / A SECOND WAY IN</p><h2 id="browser-title">Same sessions.<br>A little more reach.</h2><p>Open the address shown in the dashboard to use Agent Console in your browser. Your terminal and browser share the same sessions and shell processes.</p><a class="text-link" href="https://github.com/buhuipao/agent-console#browser-access">Read the browser setup guide <span aria-hidden="true">↗</span></a></div>
+      <div class="browser-features">
+        <article><span class="mini-label">01</span><div><h3>Conversation</h3><p>Read formatted transcripts and send prompts. Answer supported approval and trust dialogs with visible options.</p></div></article>
+        <article><span class="mini-label">02</span><div><h3>Shell &amp; Agent TUI</h3><p>Switch between workspace shells and the agent’s own terminal. Use touch keys for Esc, Tab, Ctrl, and arrows on a phone.</p></div></article>
+        <article><span class="mini-label">03</span><div><h3>Installable browser app</h3><p>Add it to your home screen over HTTPS, or use localhost on the host machine. The app shell can load offline; live sessions require a connection to your running console.</p></div></article>
+      </div>
+      <p class="access-note"><strong>You control access.</strong> The server binds to localhost by default and requires a random token or HTTP Basic credentials. Remote access gives full shell control. Use a trusted network and a TLS reverse proxy before exposing it beyond that network.</p>
+    </section>
+
+    <section class="install-section grid-paper" id="install" aria-labelledby="install-title">
+      <div class="container section install-grid">
+        <div><p class="eyebrow">04 / GET STARTED</p><h2 id="install-title">Your next session,<br>all in one place.</h2><p>Install Agent Console, then run it from your terminal. Keep at least one supported agent installed and available on your <code>PATH</code>.</p><div class="actions"><a class="button" href="https://github.com/buhuipao/agent-console/releases/latest">Download a release <span aria-hidden="true">↗</span></a><a class="text-link" href="https://github.com/buhuipao/agent-console#install">Install guide ↗</a></div><p class="install-platforms">macOS: Apple Silicon &amp; Intel<br>Linux: ARM64 &amp; x86_64 · Windows 10+: x86_64</p></div>
+        <div class="install-code">
+          <div class="window-bar"><span>WITH A RUST TOOLCHAIN</span><span aria-hidden="true">&gt;_</span></div>
+          <pre><code><span class="code-comment"># Install the published crate</span>
+cargo install agent-console --locked
+
+<span class="code-comment"># Check your providers</span>
+agent-console doctor
+
+<span class="code-comment"># Open your dashboard</span>
+agent-console</code></pre>
+          <p>Want the newest source features? <a href="https://github.com/buhuipao/agent-console#install">Build from the repository with <code>make install</code>.</a> Release downloads and the published crate can lag behind the source.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="section container faq-section" id="faq" aria-labelledby="faq-title">
+      <div><p class="eyebrow">05 / GOOD TO KNOW</p><h2 id="faq-title">A few answers<br>before you start.</h2><p>Need a hand?<br><a href="mailto:support@buhuipao.com">support@buhuipao.com</a></p></div>
+      <div class="faq-list">
+        <details><summary>What is Agent Console?</summary><p>Agent Console is a local, open-source dashboard for Codex, Claude Code, and pi. It brings sessions, progress, alerts, native agent terminals, and workspace shells into one terminal and browser interface.</p></details>
+        <details><summary>Is Agent Console free?</summary><p>Yes. Agent Console is free and open source under your choice of the MIT or Apache-2.0 license. Your agent provider’s subscription or API charges still apply. Optional progress summaries use that provider too.</p></details>
+        <details><summary>Does it replace my coding agent?</summary><p>You keep using your installed Codex, Claude Code, or pi. Agent Console discovers saved sessions and resumes the provider’s native interface. Custom provider commands can include wrappers, proxies, and environment settings.</p></details>
+        <details><summary>Where do my sessions and data live?</summary><p>Agent Console runs on your machine and keeps its own state locally. Your coding agents continue to use their configured services. Progress summaries use the session’s own provider in a separate call; set <code>AGENT_CONSOLE_SUMMARIZER=off</code> to disable them. This public website does not connect to your console.</p></details>
+        <details><summary>Can I use it from my phone?</summary><p>Yes, when the phone can reach your running console. Configure the bind address and port, authenticate with the console’s token or HTTP Basic credentials, and use the responsive browser UI. Remote access needs a trusted network or a TLS reverse proxy. The phone does not host the agents.</p></details>
+        <details><summary>Can it attach to an agent already running elsewhere?</summary><p>Agent Console reconnects to live processes it launched and owns. For a session started in another terminal, it resumes from the provider’s saved transcript. Multiple console views share a terminal; an input lease controls which view can type.</p></details>
+        <details><summary>What are the current limits?</summary><p>Alerts reset when the console restarts. Shared terminals use the smallest attached viewport. pi does not report a waiting status, and its live status bridge needs a POSIX shell. Permanent archived-session cleanup is available on macOS and Linux in the current source. See the <a href="https://github.com/buhuipao/agent-console#known-limits">known limits</a> and <a href="https://github.com/buhuipao/agent-console/blob/main/docs/compatibility.md">provider compatibility guide</a> for details.</p></details>
+      </div>
+    </section>
+
+    <section class="closing container" aria-labelledby="closing-title"><span class="brand-mark" aria-hidden="true">&gt;_</span><h2 id="closing-title">Keep the context.<br>Get back to building.</h2><a class="button" href="#install">Get Agent Console <span aria-hidden="true">↗</span></a></section>
+  </main>
+
+  <footer class="container footer">
+    <div><a class="brand" href="/">Agent Console</a><p>Local tools. A clearer view.</p></div>
+    <nav aria-label="Resources"><a href="https://github.com/buhuipao/agent-console">Source code ↗</a><a href="https://github.com/buhuipao/agent-console/blob/main/CHANGELOG.md">Changelog ↗</a><a href="https://github.com/buhuipao/agent-console/issues">Report an issue ↗</a><a href="mailto:support@buhuipao.com">support@buhuipao.com</a></nav>
+    <p class="footer-note">Free and open source · <a href="https://github.com/buhuipao/agent-console/blob/main/LICENSE-MIT">MIT</a> / <a href="https://github.com/buhuipao/agent-console/blob/main/LICENSE-APACHE">Apache-2.0</a><br>Independent project. Codex, Claude Code, and pi belong to their respective owners.</p>
+  </footer>
+</body>
+</html>

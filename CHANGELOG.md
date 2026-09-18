@@ -5,6 +5,8 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- Add a public product website at `agent-console.buhuipao.com`, with a recorded
+  demo, feature overview, install guide, FAQs, and `support@buhuipao.com` contact.
 - Space folds or expands the selected workspace in the terminal session lists.
   Folded workspaces remain selectable as one row.
 - `gg` and `G` jump to the first and last visible list entries.
