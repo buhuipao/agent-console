@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-10-12
+
+### Fixed
+- The Windows release build compiles again. 0.3.5 was tagged but never
+  published because of this; its changes ship in 0.3.6.
+
 ## [0.3.5] - 2026-10-12
 
 ### Added

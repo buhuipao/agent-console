@@ -189,23 +189,38 @@ fn local_time(timestamp: u64) -> String {
     if timestamp == 0 {
         return "unknown".into();
     }
+    local_time_fields(timestamp).map_or_else(
+        || timestamp.to_string(),
+        |(year, month, day, hour, minute)| {
+            format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}")
+        },
+    )
+}
+
+#[cfg(unix)]
+fn local_time_fields(timestamp: u64) -> Option<(i32, i32, i32, i32, i32)> {
     let t = timestamp as libc::time_t;
     // SAFETY: `tm` is plain data and localtime_r only writes into it.
     let tm = unsafe {
         let mut tm = std::mem::zeroed::<libc::tm>();
         if libc::localtime_r(&t, &mut tm).is_null() {
-            return timestamp.to_string();
+            return None;
         }
         tm
     };
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}",
+    Some((
         tm.tm_year + 1900,
         tm.tm_mon + 1,
         tm.tm_mday,
         tm.tm_hour,
-        tm.tm_min
-    )
+        tm.tm_min,
+    ))
+}
+
+// Cleanup is supported on macOS and Linux only; other platforms print the raw timestamp.
+#[cfg(not(unix))]
+fn local_time_fields(_timestamp: u64) -> Option<(i32, i32, i32, i32, i32)> {
+    None
 }
 
 /// Prints rows as a bordered table, padding by terminal display width (CJK-safe).
