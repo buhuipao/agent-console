@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-10-12
+
 ### Added
 - `prune-archived --all` deletes every archived session, whatever its age, with
   the same preview and typed confirmation. It also removes the matching Codex,
