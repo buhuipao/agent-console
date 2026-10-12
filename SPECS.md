@@ -711,7 +711,9 @@ legacy X10 mouse input.
 Aliases and archive state are persistent user metadata. Archive moves a
 session into one dimmed `Archived` group after all active workspace groups.
 Visible archived sessions remain selectable while their group is expanded,
-and `x` restores them to their workspace group. Search includes old archived
+and `x` restores them to their workspace group. Archiving with `x` moves
+focus to the session above it, or to the session below when nothing is above, so
+focus stays in the live list. Search includes old archived
 sessions hidden by the configured age cutoff. The alias always takes display
 precedence over generated summary text.
 Browser archive and restore actions address sessions by key, independently of

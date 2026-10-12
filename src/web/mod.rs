@@ -347,7 +347,7 @@ mod tests {
             other.key = "codex:other".into();
             other.cwd = "/tmp/other".into();
             app.sessions.push(other);
-            app.toggle_selected_archive().unwrap();
+            app.toggle_session_archive("codex:test").unwrap();
             app.toggle_selected_group();
             app.selected = 1;
         }

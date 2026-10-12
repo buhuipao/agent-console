@@ -678,7 +678,28 @@ impl App {
             .selected_session()
             .map(|session| session.key.clone())
             .ok_or_else(|| "no selected session".to_owned())?;
-        self.toggle_session_archive(&key)
+        // Archiving leaves focus in the live list: the session above, else the one below.
+        let neighbor = (!self.runtime.store.archived(&key))
+            .then(|| {
+                let order = self.session_list_order();
+                let position = order
+                    .iter()
+                    .position(|&index| self.sessions[index].key == key)?;
+                let target = position.checked_sub(1).unwrap_or(position + 1);
+                order
+                    .get(target)
+                    .map(|&index| self.sessions[index].key.clone())
+            })
+            .flatten();
+        let archived = self.toggle_session_archive(&key)?;
+        if let Some(index) = neighbor.and_then(|neighbor| {
+            self.sessions
+                .iter()
+                .position(|session| session.key == neighbor)
+        }) {
+            self.selected = index;
+        }
+        Ok(archived)
     }
 
     /// Keyed browser actions are independent of terminal folding and search.
@@ -2945,10 +2966,7 @@ mod tests {
         app.toggle_selected_group();
         app.selected = 1;
         app.toggle_selected_archive().unwrap();
-        assert!(
-            app.selected_group_collapsed(),
-            "archive selects the folded Archived group"
-        );
+        assert_eq!(app.selected, 0, "archive moves focus to the session above");
         app.selected = 0;
         app.toggle_selected_group();
         app.select_list_edge(true);
@@ -3027,14 +3045,16 @@ mod tests {
 
         app.toggle_selected_archive().unwrap();
         assert_eq!(app.session_display_order(), vec![0, 1]);
-        assert_eq!(app.selected, 1);
+        assert_eq!(app.selected, 0, "archive moves focus to the session above");
         assert!(app.session_archived(&app.sessions[1]));
 
+        app.selected = 1;
         app.toggle_selected_archive().unwrap();
         app.selected = 0;
         app.toggle_selected_archive().unwrap();
         assert_eq!(app.session_display_order(), vec![1, 0]);
-        assert_eq!(app.selected, 0);
+        assert_eq!(app.selected, 1, "with nothing above, focus moves down");
+        app.selected = 0;
         app.toggle_selected_archive().unwrap();
         assert_eq!(app.session_display_order(), vec![0, 1]);
         assert_eq!(app.session_title(&app.sessions[1]), "urgent release");

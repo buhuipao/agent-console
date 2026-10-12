@@ -7,7 +7,13 @@ All notable changes to this project will be documented in this file.
 ### Added
 - `prune-archived --all` deletes every archived session, whatever its age, with
   the same preview and typed confirmation. It also removes the matching Codex,
-  Claude, and Pi records.
+  Claude, and Pi records. The preview is a table of ID, workspace, title, and
+  last activity.
+
+### Changed
+- Archiving a session with `x` now moves focus to the session above it, or to
+  the one below when nothing is above, instead of following it into the
+  Archived group.
 
 ## [0.3.4] - 2026-09-20
 
