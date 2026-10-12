@@ -8,7 +8,8 @@ All notable changes to this project will be documented in this file.
 - `prune-archived --all` deletes every archived session, whatever its age, with
   the same preview and typed confirmation. It also removes the matching Codex,
   Claude, and Pi records. The preview is a table of ID, workspace, title, and
-  last activity.
+  last activity. Provider file paths are no longer listed. If Agent Console is
+  still running, the command asks you to quit it first.
 
 ### Changed
 - Archiving a session with `x` now moves focus to the session above it, or to

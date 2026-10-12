@@ -159,6 +159,8 @@ fn workspace(paths: &BTreeSet<PathBuf>) -> String {
                 .or_else(|| value.pointer("/payload/cwd"))
                 .and_then(Value::as_str);
             if let Some(cwd) = cwd {
+                let cwd: String = cwd.chars().filter(|c| !c.is_control()).collect();
+                let cwd = cwd.as_str();
                 return match dirs::home_dir()
                     .and_then(|h| Path::new(cwd).strip_prefix(h).ok().map(Path::to_path_buf))
                 {
@@ -172,6 +174,10 @@ fn workspace(paths: &BTreeSet<PathBuf>) -> String {
 }
 
 fn shorten(text: &str, max: usize) -> String {
+    let text: String = text
+        .chars()
+        .filter(|c| !c.is_control() || c.is_whitespace())
+        .collect();
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() <= max {
         return flat;
