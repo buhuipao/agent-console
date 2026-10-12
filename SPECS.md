@@ -718,9 +718,10 @@ Browser archive and restore actions address sessions by key, independently of
 terminal folding and search. They preserve the terminal's current selection
 unless it must move to a visible row.
 
-`agent-console prune-archived [--days N] [--dry-run]` explicitly deletes archived
-sessions older than N days (default 7, independent of the display cutoff) on
-macOS and Linux. Preview the IDs, titles, ages and provider artifact paths first;
+`agent-console prune-archived [--days N | --all] [--dry-run]` explicitly deletes archived
+sessions older than N days (default 7, independent of the display cutoff), or every
+archived session with `--all`, on
+macOS and Linux. Preview a table of sessions (ID, workspace, title, last activity) first;
 deletion requires a terminal and the exact typed phrase `DELETE <count> ARCHIVED
 SESSIONS`. An empty or different response cancels. There is no unattended
 confirmation flag. Cleanup holds an exclusive maintenance lock, so dashboards

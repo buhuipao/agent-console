@@ -260,18 +260,21 @@ hide_archived_after_days = 7
 
 ### Delete old archived sessions
 
-On macOS and Linux, preview archived sessions with more than seven days of
-inactivity and their provider records:
+On macOS and Linux, preview archived sessions and their provider records. The
+default is sessions with more than seven days of inactivity; `--all` selects
+every archived session:
 
 ```sh
 agent-console prune-archived --dry-run
 agent-console prune-archived --days 7
+agent-console prune-archived --all
 ```
 
-The second command requires an interactive terminal. After the preview, type
+The last two commands require an interactive terminal. After the preview, type
 the exact phrase shown, such as `DELETE 3 ARCHIVED SESSIONS`. Enter alone, a
 different phrase, or EOF cancels. `--days` is a positive number and defaults to
-7 independently of the display setting above.
+7 independently of the display setting above. `--all` and `--days` cannot be
+combined.
 
 Close Agent Console dashboards and web servers before deletion. Sessions with
 open agent or shell terminals are skipped; close those sessions before retrying.

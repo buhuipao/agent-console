@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- `prune-archived --all` deletes every archived session, whatever its age, with
+  the same preview and typed confirmation. It also removes the matching Codex,
+  Claude, and Pi records.
+
 ## [0.3.4] - 2026-09-20
 
 ### Fixed

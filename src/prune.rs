@@ -10,13 +10,16 @@ use std::{
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::Value;
+use unicode_width::UnicodeWidthStr;
 
 use crate::{discovery::DiscoveryPaths, model::AgentKind, providers, pty, store};
 
+const TITLE_CHARS: usize = 30;
 const DAY: u64 = 24 * 60 * 60;
-const HELP: &str = "Usage: agent-console prune-archived [--days N] [--dry-run]\n\n\
+const HELP: &str = "Usage: agent-console prune-archived [--days N | --all] [--dry-run]\n\n\
 Delete archived sessions without activity for more than N days (default 7).\n\
-Preview lists the sessions and provider files. --dry-run stops after the preview.\n\
+--all deletes every archived session regardless of age.\n\
+Preview lists a table of sessions: ID, workspace, title and last activity. --dry-run stops after the preview.\n\
 Deletion requires an interactive terminal and typing DELETE <count> ARCHIVED SESSIONS.\n\
 Close Agent Console dashboards/web servers first; open agent/shell sessions are skipped.\n\
 Supported on macOS and Linux. There is no --yes or unattended deletion option.\n";
@@ -33,7 +36,8 @@ struct Candidate {
 }
 
 pub(crate) fn run(mut args: impl Iterator<Item = String>) -> io::Result<()> {
-    let mut days = 7_u64;
+    let mut days_arg = None;
+    let mut all = false;
     let mut dry_run = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -42,11 +46,13 @@ pub(crate) fn run(mut args: impl Iterator<Item = String>) -> io::Result<()> {
                 return Ok(());
             }
             "--dry-run" => dry_run = true,
+            "--all" => all = true,
             "--days" => {
-                days = args
+                days_arg = args
                     .next()
                     .and_then(|s| s.parse().ok())
                     .filter(|n: &u64| *n > 0 && n.checked_mul(DAY).is_some())
+                    .map(Some)
                     .ok_or_else(|| {
                         io::Error::new(
                             io::ErrorKind::InvalidInput,
@@ -62,27 +68,39 @@ pub(crate) fn run(mut args: impl Iterator<Item = String>) -> io::Result<()> {
             }
         }
     }
+    if all && days_arg.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--all and --days cannot be used together",
+        ));
+    }
+    // None means every archived session (--all).
+    let days = if all {
+        None
+    } else {
+        Some(days_arg.unwrap_or(7))
+    };
     let root =
         store::state_dir().ok_or_else(|| io::Error::other("cannot resolve state directory"))?;
     let paths = DiscoveryPaths::from_environment()
         .ok_or_else(|| io::Error::other("cannot resolve provider directories"))?;
     let now = crate::model::unix_timestamp();
     let candidates = plan(&root, &paths, days, now)?;
-    for candidate in &candidates {
-        println!(
-            "{}  {} days  {:?}",
-            candidate.key,
-            now.saturating_sub(candidate.last_activity) / DAY,
-            candidate.title
-        );
-        for path in &candidate.paths {
-            println!("  {:?}", path);
-        }
+    print_table(candidates.iter().map(|c| {
+        [
+            c.key.clone(),
+            workspace(&c.paths),
+            shorten(&c.title, TITLE_CHARS),
+            local_time(c.last_activity),
+        ]
+    }));
+    match days {
+        None => println!("{} archived sessions.", candidates.len()),
+        Some(days) => println!(
+            "{} archived sessions older than {days} days.",
+            candidates.len()
+        ),
     }
-    println!(
-        "{} archived sessions older than {days} days.",
-        candidates.len()
-    );
     println!(
         "Matching entries in provider databases, history/index files and Agent Console state are included."
     );
@@ -101,9 +119,15 @@ pub(crate) fn run(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         ));
     }
     let lock = store::maintenance_lock(&root)?;
-    lock.try_lock().map_err(|_| {
-        io::Error::other("close Agent Console dashboards/web servers before pruning")
-    })?;
+    if lock.try_lock().is_err() {
+        eprintln!(
+            "\nAgent Console is still running, so nothing was deleted.\n\
+             Please quit it first, then run this command again:\n  \
+             1. Quit the dashboard (press q) and stop any `agent-console web` server.\n  \
+             2. Run this command again from another terminal."
+        );
+        std::process::exit(1);
+    }
     if !confirm(&mut io::stdin().lock(), &mut io::stdout(), candidates.len())? {
         println!("Cancelled. No sessions deleted.");
         return Ok(());
@@ -111,6 +135,101 @@ pub(crate) fn run(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     apply(&root, &paths, days, now, &candidates)?;
     println!("Deleted {} archived sessions.", candidates.len());
     Ok(())
+}
+
+/// Working directory from the first transcript record that has one, shown relative to `~`.
+fn workspace(paths: &BTreeSet<PathBuf>) -> String {
+    for path in paths
+        .iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
+    {
+        let Ok(file) = fs::File::open(path) else {
+            continue;
+        };
+        for line in io::BufReader::new(file)
+            .lines()
+            .take(50)
+            .map_while(Result::ok)
+        {
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            let cwd = value
+                .get("cwd")
+                .or_else(|| value.pointer("/payload/cwd"))
+                .and_then(Value::as_str);
+            if let Some(cwd) = cwd {
+                return match dirs::home_dir()
+                    .and_then(|h| Path::new(cwd).strip_prefix(h).ok().map(Path::to_path_buf))
+                {
+                    Some(rest) => format!("~/{}", rest.display()),
+                    None => cwd.to_string(),
+                };
+            }
+        }
+    }
+    "?".into()
+}
+
+fn shorten(text: &str, max: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        return flat;
+    }
+    format!("{}...", flat.chars().take(max).collect::<String>())
+}
+
+fn local_time(timestamp: u64) -> String {
+    if timestamp == 0 {
+        return "unknown".into();
+    }
+    let t = timestamp as libc::time_t;
+    // SAFETY: `tm` is plain data and localtime_r only writes into it.
+    let tm = unsafe {
+        let mut tm = std::mem::zeroed::<libc::tm>();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            return timestamp.to_string();
+        }
+        tm
+    };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min
+    )
+}
+
+/// Prints rows as a bordered table, padding by terminal display width (CJK-safe).
+fn print_table(rows: impl Iterator<Item = [String; 4]>) {
+    let header = ["ID", "WORKSPACE", "TITLE", "LAST ACTIVITY"].map(String::from);
+    let rows: Vec<_> = rows.collect();
+    let widths: [usize; 4] = std::array::from_fn(|i| {
+        rows.iter()
+            .map(|r| r[i].width())
+            .chain([header[i].width()])
+            .max()
+            .unwrap_or(0)
+    });
+    let border = |left: &str, mid: &str, right: &str| {
+        let bars: Vec<String> = widths.iter().map(|w| "─".repeat(w + 2)).collect();
+        println!("{left}{}{right}", bars.join(mid));
+    };
+    let line = |row: &[String; 4]| {
+        let cells: Vec<String> = row
+            .iter()
+            .zip(widths)
+            .map(|(cell, w)| format!(" {cell}{} ", " ".repeat(w - cell.width())))
+            .collect();
+        println!("│{}│", cells.join("│"));
+    };
+    border("┌", "┬", "┐");
+    line(&header);
+    border("├", "┼", "┤");
+    rows.iter().for_each(line);
+    border("└", "┴", "┘");
 }
 
 fn confirmation(count: usize) -> String {
@@ -157,7 +276,12 @@ fn files_under(root: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
     Ok(())
 }
 
-fn plan(root: &Path, paths: &DiscoveryPaths, days: u64, now: u64) -> io::Result<Vec<Candidate>> {
+fn plan(
+    root: &Path,
+    paths: &DiscoveryPaths,
+    days: Option<u64>,
+    now: u64,
+) -> io::Result<Vec<Candidate>> {
     let database = root.join("state.db");
     if !database.exists() {
         return Ok(Vec::new());
@@ -186,7 +310,7 @@ fn plan(root: &Path, paths: &DiscoveryPaths, days: u64, now: u64) -> io::Result<
         .ok_or_else(|| io::Error::other("invalid Claude session directory"))?;
     let mut claude_metadata = Vec::new();
     files_under(&claude_home.join("sessions"), &mut claude_metadata)?;
-    let cutoff = now.saturating_sub(days.saturating_mul(DAY));
+    let cutoff = days.map_or(u64::MAX, |d| now.saturating_sub(d.saturating_mul(DAY)));
     let mut candidates = Vec::new();
     // ponytail: scan filenames per archived ID; index by ID if large histories make pruning slow.
     'sessions: for row in rows {
@@ -372,7 +496,7 @@ fn plan(root: &Path, paths: &DiscoveryPaths, days: u64, now: u64) -> io::Result<
         if candidate.last_activity == 0 {
             candidate.last_activity = fallback_activity;
         }
-        if candidate.last_activity == 0 || candidate.last_activity >= cutoff {
+        if (days.is_some() && candidate.last_activity == 0) || candidate.last_activity >= cutoff {
             continue;
         }
         if let Err(error) = pty::prune_session_terminals(&root.join("pty-daemon.sock"), &key, false)
@@ -434,7 +558,7 @@ fn codex_databases(home: &Path) -> io::Result<Vec<PathBuf>> {
 fn apply(
     root: &Path,
     paths: &DiscoveryPaths,
-    days: u64,
+    days: Option<u64>,
     now: u64,
     candidates: &[Candidate],
 ) -> io::Result<()> {
@@ -844,12 +968,12 @@ mod tests {
     #[test]
     fn confirmed_prune_removes_all_three_providers_and_preserves_other_sessions() {
         let (_temp, root, paths, now) = fixture(CODEX);
-        let candidates = plan(&root, &paths, 7, now).unwrap();
+        let candidates = plan(&root, &paths, Some(7), now).unwrap();
         assert_eq!(candidates.len(), 3);
-        assert!(plan(&root, &paths, 30, now).unwrap().is_empty());
+        assert!(plan(&root, &paths, Some(30), now).unwrap().is_empty());
         for answer in ["yes\n", "\n", "DELETE 2 ARCHIVED SESSIONS\n", ""] {
             assert!(!confirm(&mut answer.as_bytes(), &mut Vec::new(), 3).unwrap());
-            assert_eq!(plan(&root, &paths, 7, now).unwrap(), candidates);
+            assert_eq!(plan(&root, &paths, Some(7), now).unwrap(), candidates);
         }
         assert!(
             confirm(
@@ -859,7 +983,7 @@ mod tests {
             )
             .unwrap()
         );
-        apply(&root, &paths, 7, now, &candidates).unwrap();
+        apply(&root, &paths, Some(7), now, &candidates).unwrap();
         assert!(
             candidates
                 .iter()
@@ -923,13 +1047,13 @@ mod tests {
     fn activity_after_preview_and_open_provider_processes_prevent_deletion() {
         let id = uuid::Uuid::new_v4().to_string();
         let (_temp, root, paths, now) = fixture(&id);
-        let candidates = plan(&root, &paths, 7, now).unwrap();
+        let candidates = plan(&root, &paths, Some(7), now).unwrap();
         let mut child = std::process::Command::new("/bin/sh")
             .args(["-c", "read line", &id])
             .stdin(Stdio::piped())
             .spawn()
             .unwrap();
-        let result = apply(&root, &paths, 7, now, &candidates);
+        let result = apply(&root, &paths, Some(7), now, &candidates);
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(result.unwrap_err().to_string().contains("provider process"));
@@ -941,7 +1065,7 @@ mod tests {
             .write_all(b"{}\n")
             .unwrap();
         assert!(
-            apply(&root, &paths, 7, now, &candidates)
+            apply(&root, &paths, Some(7), now, &candidates)
                 .unwrap_err()
                 .to_string()
                 .contains("changed")
@@ -971,7 +1095,7 @@ mod tests {
             .join(CLAUDE)
             .join("linked.txt");
         std::os::unix::fs::symlink(&outside, link).unwrap();
-        assert!(plan(&root, &paths, 7, now).is_err());
+        assert!(plan(&root, &paths, Some(7), now).is_err());
         assert_eq!(fs::read(outside).unwrap(), b"keep");
     }
 
