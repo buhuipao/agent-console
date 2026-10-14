@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- The supported Codex floor is now 0.124.0, the first release that runs hooks
+  by default. `doctor` reports older versions as too old.
+
+### Fixed
+- A new Codex session no longer appears twice, once as `session <id>` and again
+  under its first prompt. Its hooks now report the thread Codex created, and the
+  two rows merge. This needs Codex 0.124.0 or later with the console's hooks
+  trusted. Opening the second row used to start another Codex process on the
+  same thread.
+- Threads that the Codex app imports from Claude Code or another agent are no
+  longer listed. Each one is a copy of another agent's session. A thread you
+  continue in Codex is still listed.
+
 ## [0.3.6] - 2026-10-12
 
 ### Fixed

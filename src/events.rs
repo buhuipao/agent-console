@@ -12,10 +12,20 @@ use serde_json::Value;
 
 use crate::{
     model::{AgentKind, Decision, Session, SessionStatus, unix_timestamp},
-    store::{atomic_append_jsonl, ensure_private_dir, make_private_file, rotated_jsonl_path},
+    store::{
+        atomic_append_jsonl, ensure_private_dir, make_private_file, rotated_jsonl_path,
+        write_private,
+    },
 };
 
 const EVENT_PREFIX_BYTES: u64 = 256;
+
+/// The id the console gave a new session before its provider chose one, set in the
+/// provider's environment. Codex picks its own thread id and passes its environment to
+/// hooks, so this is how a hook tells the console which thread a new session became.
+/// The hook command itself must stay the same for every session: Codex trusts hooks
+/// by a hash of their definition.
+pub const NEW_SESSION_ENV: &str = "AGENT_CONSOLE_NEW_SESSION_ID";
 
 #[derive(Debug)]
 pub struct EventIndex {
@@ -288,7 +298,12 @@ pub struct NormalizedEvent {
     pub text: String,
 }
 
-pub fn ingest_hook(provider: AgentKind, input: &Value, events_dir: &Path) -> io::Result<PathBuf> {
+pub fn ingest_hook(
+    provider: AgentKind,
+    input: &Value,
+    events_dir: &Path,
+    new_session_id: Option<&str>,
+) -> io::Result<PathBuf> {
     let session_id = input
         .get("session_id")
         .or_else(|| input.get("sessionId"))
@@ -318,12 +333,49 @@ pub fn ingest_hook(provider: AgentKind, input: &Value, events_dir: &Path) -> io:
     let path = event_file(events_dir, provider, session_id);
     let line = serde_json::to_vec(&event).map_err(io::Error::other)?;
     atomic_append_jsonl(&path, &line)?;
+    // Each start of a thread with a transcript names the thread the process is on now: its
+    // first one, or the one `/new`, `/clear`, or `/resume` moved it to. An ephemeral fork
+    // such as `/side` reports a null transcript, and spawned subagents report
+    // `SubagentStart` instead.
+    if event_name == "SessionStart"
+        && input.get("transcript_path").is_none_or(Value::is_string)
+        && let Some(new_session_id) =
+            new_session_id.filter(|id| !id.is_empty() && *id != session_id)
+    {
+        write_private(
+            &link_file(events_dir, provider, new_session_id),
+            session_id.as_bytes(),
+        )?;
+    }
     Ok(path)
 }
 
 pub fn event_file(events_dir: &Path, provider: AgentKind, session_id: &str) -> PathBuf {
-    let safe_id = session_id
-        .chars()
+    events_dir.join(format!(
+        "{}-{}.jsonl",
+        provider.label(),
+        file_safe(session_id)
+    ))
+}
+
+/// Where a new session's hook records the provider session id it became.
+pub fn link_file(events_dir: &Path, provider: AgentKind, new_session_id: &str) -> PathBuf {
+    events_dir.join(format!(
+        "{}-{}.link",
+        provider.label(),
+        file_safe(new_session_id)
+    ))
+}
+
+/// The provider session id recorded in a [`link_file`], once the hook has written it.
+pub fn linked_session(link: &Path) -> Option<String> {
+    let id = fs::read_to_string(link).ok()?;
+    let id = id.trim();
+    (!id.is_empty()).then(|| id.to_owned())
+}
+
+fn file_safe(id: &str) -> String {
+    id.chars()
         .map(|value| {
             if value.is_ascii_alphanumeric() || matches!(value, '-' | '_' | '.') {
                 value
@@ -331,8 +383,7 @@ pub fn event_file(events_dir: &Path, provider: AgentKind, session_id: &str) -> P
                 '_'
             }
         })
-        .collect::<String>();
-    events_dir.join(format!("{}-{safe_id}.jsonl", provider.label()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -493,7 +544,7 @@ mod tests {
             "tool_use_id": "tool-1",
             "tool_name": "Bash"
         });
-        let path = ingest_hook(AgentKind::Claude, &hook, root.path()).unwrap();
+        let path = ingest_hook(AgentKind::Claude, &hook, root.path(), None).unwrap();
         let events = read_events(&path).unwrap();
         let mut value = session();
         apply_events(&mut value, &events);

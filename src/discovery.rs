@@ -19,6 +19,9 @@ const MAX_VISIBLE_SESSIONS: usize = 50;
 const HEAD_BYTES: usize = 64 * 1024;
 const TAIL_BYTES: usize = 128 * 1024;
 const MAX_ACTIVITY: usize = 12;
+/// Turn ids the Codex app gives the turns it copies in when it imports another agent's
+/// session, such as a Claude Code one, as a new Codex thread.
+const CODEX_IMPORTED_TURN_PREFIX: &str = "external-import-turn-";
 
 #[derive(Clone, Debug)]
 pub struct DiscoveryPaths {
@@ -342,6 +345,8 @@ pub(crate) fn parse_codex_with_cached_prompt(
     let mut task = String::new();
     let mut activity = VecDeque::new();
     let mut failed = false;
+    let mut imported_turn = false;
+    let mut native_turn = false;
 
     for line in lines {
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
@@ -351,6 +356,13 @@ pub(crate) fn parse_codex_with_cached_prompt(
         let payload = value.get("payload").unwrap_or(&Value::Null);
         let payload_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
 
+        if let Some(turn) = payload.get("turn_id").and_then(Value::as_str) {
+            if turn.starts_with(CODEX_IMPORTED_TURN_PREFIX) {
+                imported_turn = true;
+            } else {
+                native_turn = true;
+            }
+        }
         if record_type == "session_meta" {
             if id.is_none() {
                 id = raw_string_field(payload, "id");
@@ -435,6 +447,10 @@ pub(crate) fn parse_codex_with_cached_prompt(
         }
     }
 
+    // A copy of another agent's session, until someone continues it in Codex.
+    if imported_turn && !native_turn {
+        return Ok(None);
+    }
     let (Some(id), Some(cwd)) = (id, cwd) else {
         return Ok(None);
     };
@@ -442,7 +458,7 @@ pub(crate) fn parse_codex_with_cached_prompt(
         cached_prompt.filter(|(provider_session_id, _)| *provider_session_id == id)
     {
         first_prompt = Some(prompt.to_owned());
-    } else if let Some(prompt) = first_prompt_in_jsonl(path, codex_prompt_from_record)? {
+    } else if let Some(prompt) = first_in_jsonl(path, codex_prompt_from_record)? {
         first_prompt = Some(prompt);
     }
     if let Some(value) = provider_name.clone() {
@@ -738,7 +754,7 @@ pub(crate) fn parse_pi_with_cached_prompt(
         cached_prompt.filter(|(provider_session_id, _)| *provider_session_id == id)
     {
         first_prompt = Some(prompt.to_owned());
-    } else if let Some(prompt) = first_prompt_in_jsonl(path, pi_prompt_from_record)? {
+    } else if let Some(prompt) = first_in_jsonl(path, pi_prompt_from_record)? {
         // Only on a cache miss: this reads to EOF when no user turn yields text, and doing it
         // unconditionally made every poll re-read the whole transcript from byte 0.
         first_prompt = Some(prompt);
@@ -916,7 +932,7 @@ fn bounded_jsonl(path: &Path) -> io::Result<(Vec<String>, String, u64)> {
     Ok((lines, fingerprint, modified_at))
 }
 
-fn first_prompt_in_jsonl(
+fn first_in_jsonl(
     path: &Path,
     extract: fn(&Value) -> Option<String>,
 ) -> io::Result<Option<String>> {
@@ -934,11 +950,25 @@ fn first_prompt_in_jsonl(
         let Ok(value) = serde_json::from_slice::<Value>(&line) else {
             continue;
         };
-        if let Some(prompt) = extract(&value) {
-            return Ok(Some(prompt));
+        if let Some(found) = extract(&value) {
+            return Ok(Some(found));
         }
     }
     Ok(None)
+}
+
+/// The id in a Codex transcript's first `session_meta`, read whether or not discovery lists
+/// the transcript.
+pub(crate) fn codex_transcript_id(path: &Path) -> io::Result<Option<String>> {
+    first_in_jsonl(path, |value| {
+        (value.get("type").and_then(Value::as_str) == Some("session_meta"))
+            .then(|| {
+                value
+                    .get("payload")
+                    .and_then(|payload| raw_string_field(payload, "id"))
+            })
+            .flatten()
+    })
 }
 
 fn scan_claude_identity(path: &Path) -> io::Result<(Option<String>, bool)> {
@@ -1400,7 +1430,7 @@ mod tests {
         drop(transcript);
 
         assert_eq!(
-            first_prompt_in_jsonl(&path, codex_prompt_from_record)
+            first_in_jsonl(&path, codex_prompt_from_record)
                 .unwrap()
                 .as_deref(),
             Some("past the old budget")
@@ -1420,7 +1450,7 @@ mod tests {
         .unwrap();
         drop(malformed);
         assert_eq!(
-            first_prompt_in_jsonl(&malformed_path, codex_prompt_from_record)
+            first_in_jsonl(&malformed_path, codex_prompt_from_record)
                 .unwrap()
                 .as_deref(),
             Some("valid after malformed")
@@ -1441,7 +1471,7 @@ mod tests {
         .unwrap();
         drop(split);
         assert_eq!(
-            first_prompt_in_jsonl(&split_path, codex_prompt_from_record)
+            first_in_jsonl(&split_path, codex_prompt_from_record)
                 .unwrap()
                 .as_deref(),
             Some("after split utf8")
@@ -2098,6 +2128,44 @@ mod tests {
             !sessions
                 .iter()
                 .any(|session| session.provider_session_id == "finished-subagent")
+        );
+    }
+
+    /// The Codex app copies Claude Code sessions in as Codex threads. Each copy showed up as
+    /// a second session beside the Claude one it was copied from.
+    #[test]
+    fn codex_app_imports_of_other_agents_sessions_are_not_discovered() {
+        let root = tempdir().unwrap();
+        let codex = root.path().join("codex");
+        fs::create_dir(&codex).unwrap();
+        let cwd = root.path().join("repo");
+        fs::create_dir(&cwd).unwrap();
+
+        for (id, turn_id) in [
+            ("imported", "external-import-turn-1"),
+            ("native", "01a1383e-8ef6-78b3-aa2d-0f811024a925"),
+        ] {
+            let mut file = fs::File::create(codex.join(format!("rollout-{id}.jsonl"))).unwrap();
+            for record in [
+                serde_json::json!({"type":"session_meta","payload":{"id":id,"cwd":cwd}}),
+                serde_json::json!({"type":"event_msg","payload":{
+                    "type":"task_started","turn_id":turn_id
+                }}),
+                serde_json::json!({"type":"event_msg","payload":{
+                    "type":"user_message","message":"add a prune command"
+                }}),
+            ] {
+                writeln!(file, "{record}").unwrap();
+            }
+        }
+
+        let sessions = discover_codex(&codex);
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.provider_session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["native"]
         );
     }
 

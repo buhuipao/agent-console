@@ -35,7 +35,7 @@ use uuid::Uuid;
 use crate::{
     clipboard,
     config::{AgentConsoleConfig, format_key_label},
-    diagnostics,
+    diagnostics, events,
     model::{AgentKind, Session},
     store::{ensure_private_dir, make_private_file},
 };
@@ -670,13 +670,15 @@ fn terminal_state_checkpoint(
 /// session happened to launch the console. Inheriting these makes the provider believe
 /// otherwise: `CLAUDE_CODE_CHILD_SESSION` silently turns transcript saving off, which leaves
 /// discovery and the whole conversation view permanently empty, and the rest point the child
-/// at the launcher's session id and IPC socket.
-const INHERITED_SESSION_VARS: [&str; 5] = [
+/// at the launcher's session id and IPC socket. A launcher's new-session id would have the
+/// child's hooks link the launcher's session instead of its own.
+const INHERITED_SESSION_VARS: [&str; 6] = [
     "CLAUDE_CODE_CHILD_SESSION",
     "CLAUDE_CODE_SESSION_ID",
     "CLAUDE_CODE_MESSAGING_SOCKET",
     "CLAUDE_CODE_MESSAGING_TOKEN",
     "CLAUDE_CODE_ENTRYPOINT",
+    events::NEW_SESSION_ENV,
 ];
 
 struct LocalTerminal {
@@ -6938,7 +6940,13 @@ impl TerminalManager {
     }
 
     pub fn rekey(&mut self, old_key: &str, new_key: String) {
-        if old_key == new_key || self.terminals.contains_key(&new_key) {
+        // A new Codex session's transcript can be listed, and viewed, one refresh before it
+        // is linked to the session; that view holds no terminal of its own to keep.
+        let target_holds_terminals = self.terminals.get(&new_key).is_some_and(|terminals| {
+            let terminals = terminals.lock().unwrap();
+            terminals.agent.is_some() || !terminals.shells.is_empty()
+        });
+        if old_key == new_key || target_holds_terminals {
             return;
         }
         if let Some(terminals) = self.terminals.remove(old_key) {
@@ -7016,7 +7024,9 @@ fn agent_command_in(
                 .arg("--no-alt-screen")
                 .arg("-C")
                 .arg(session.cwd.as_os_str());
-            if !new_session {
+            if new_session {
+                spec = spec.env(events::NEW_SESSION_ENV, &session.provider_session_id);
+            } else {
                 spec = spec.arg(&session.provider_session_id);
             }
             for event in [
@@ -7464,6 +7474,16 @@ mod tests {
         assert_eq!(codex.args[0], "resume");
         assert!(codex.args.iter().any(|arg| arg == "id"));
         assert!(codex.args.iter().any(|arg| arg == "--no-alt-screen"));
+
+        let new_codex = agent_command(&config, &session(AgentKind::Codex, cwd), executable, true);
+        assert!(
+            new_codex
+                .env
+                .iter()
+                .any(|(name, value)| name == events::NEW_SESSION_ENV && value == "id"),
+            "the startup hook needs the console id to report which thread it became: {:?}",
+            new_codex.env
+        );
 
         let claude = agent_command(&config, &session(AgentKind::Claude, cwd), executable, false);
         assert_eq!(claude.program, "claude");

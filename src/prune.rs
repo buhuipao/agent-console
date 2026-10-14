@@ -12,7 +12,11 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
-use crate::{discovery::DiscoveryPaths, model::AgentKind, providers, pty, store};
+use crate::{
+    discovery::{self, DiscoveryPaths},
+    model::AgentKind,
+    providers, pty, store,
+};
 
 const TITLE_CHARS: usize = 30;
 const DAY: u64 = 24 * 60 * 60;
@@ -403,8 +407,14 @@ fn plan(
                 AgentKind::Pi => format!("_{id}.jsonl"),
             };
             if belongs && name.ends_with(&suffix) && (providers::adapter(provider).accepts)(path) {
-                let parsed = (providers::adapter(provider).parse)(path, None)?;
-                if parsed.as_ref().map(|s| s.provider_session_id.as_str()) != Some(id) {
+                let transcript_id = match provider {
+                    // Discovery now hides Codex app imports that were listed, and could be
+                    // archived, before; the transcript still says which session it is.
+                    AgentKind::Codex => discovery::codex_transcript_id(path)?,
+                    _ => (providers::adapter(provider).parse)(path, None)?
+                        .map(|session| session.provider_session_id),
+                };
+                if transcript_id.as_deref() != Some(id) {
                     return Err(io::Error::other(format!(
                         "transcript identity does not match {key}: {path:?}"
                     )));
@@ -1062,6 +1072,37 @@ mod tests {
             serde_json::from_slice(&fs::read(root.join("state.json")).unwrap()).unwrap();
         assert_eq!(legacy["sessions"].as_object().unwrap().len(), 2);
         assert!(run(["--yes".into()].into_iter()).is_err());
+    }
+
+    /// Codex app imports were listed, and could be archived, before discovery hid them.
+    /// Hiding one made every prune fail its transcript identity check.
+    #[test]
+    fn an_archived_codex_app_import_can_still_be_pruned() {
+        let (temp, root, paths, now) = fixture(CODEX);
+        let rollout = paths.codex_sessions.join(format!("rollout-{CODEX}.jsonl"));
+        write(
+            &rollout,
+            format!(
+                "{}\n{}\n",
+                json!({"type":"session_meta","payload":{"id":CODEX,"cwd":temp.path()}}),
+                json!({"type":"event_msg","payload":{
+                    "type":"task_started","turn_id":"external-import-turn-1"
+                }})
+            )
+            .as_bytes(),
+        );
+        fs::File::open(&rollout)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(now - 8 * DAY))
+            .unwrap();
+
+        let candidates = plan(&root, &paths, Some(7), now).unwrap();
+
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.key == format!("codex:{CODEX}"))
+        );
     }
 
     #[test]

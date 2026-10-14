@@ -276,7 +276,9 @@ pub fn version_support(provider: AgentKind, version: &str) -> VersionSupport {
         return VersionSupport::Unknown;
     };
     let minimum = match provider {
-        AgentKind::Codex => (0, 100),
+        // The first Codex that runs hooks by default. Live status, approvals, and matching
+        // a new session to the thread Codex creates all come from the console's hooks.
+        AgentKind::Codex => (0, 124),
         AgentKind::Claude => (2, 0),
         // The oldest pi verified against this console. `--session-id`, `--tui-mode`, and the
         // extension events the hook bridge subscribes to all exist here.
@@ -299,7 +301,7 @@ pub fn check_hook_ingress(state_root: &Path) -> ProviderStatus {
             "tool_use_id": "doctor-event",
             "message": "doctor probe"
         });
-        let path = events::ingest_hook(AgentKind::Claude, &hook, &events_dir)?;
+        let path = events::ingest_hook(AgentKind::Claude, &hook, &events_dir, None)?;
         let mut index = EventIndex::open(&probe_root)?;
         let indexed = index.refresh_session(&path, AgentKind::Claude, "doctor-probe")?;
         if indexed.len() != 1 || indexed[0].event_id != "doctor-event" {

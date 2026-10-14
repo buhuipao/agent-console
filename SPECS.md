@@ -87,6 +87,7 @@ state.db                    SQLite session cache, metadata, event cursors/index.
 state.json                  One-time legacy migration input only.
 maintenance.lock            Shared by dashboards; exclusive during confirmed cleanup.
 events/<provider>-<id>.jsonl[.1]  Two bounded hook/event generations.
+events/codex-<console id>.link  Thread a new Codex session's hook reported.
 summary-schema.json         Schema passed to non-interactive summarizers.
 pi-hooks.mts                Generated pi extension bridging its events to `hook pi`.
 pty-daemon.sock             Unix only; the detached PTY daemon's control socket.
@@ -104,7 +105,7 @@ its retained prefix changes, delete that source's indexed rows and rebuild it.
 Status reduction and summaries read normalized events from this index.
 
 The state directory and event directory use Unix mode `0700`; state, schema,
-event, database, diagnostics, and daemon socket files use `0600`. Each event
+event, link, database, diagnostics, and daemon socket files use `0600`. Each event
 inbox keeps two 256 KiB generations. Diagnostics rotate at 256 KiB
 and retain three prior generations. A panic is recorded before the normal panic
 handler runs, while a scope guard always restores raw mode and the alternate
@@ -236,7 +237,11 @@ Read the first `session_meta.payload` for the transcript's own `id`; fork
 transcripts may contain a later copy of the parent's metadata. Read `cwd` from
 metadata and turn context. Identify a fork subagent from
 `thread_source = "subagent"` or `source.subagent` and exclude it from Sessions,
-status tracking, and summary generation. Stream complete records until the
+status tracking, and summary generation. Also exclude a thread that the Codex
+app imported from another agent, such as Claude Code. It is a copy of another
+agent's session, and every turn id in it starts with `external-import-turn-`.
+When a turn with another id appears, the thread was continued in Codex, and it
+is listed like any other session. Stream complete records until the
 first real user prompt is found, then use only a bounded tail for recent user,
 agent, tool, and completion records. The transcript format is an observation
 fallback, not a write interface.
@@ -255,8 +260,38 @@ codex resume -C <cwd> <provider-session-id>
 New command:
 
 ```text
-codex -C <cwd>
+AGENT_CONSOLE_NEW_SESSION_ID=<console id> codex -C <cwd>
 ```
+
+Codex chooses its own thread id, and current releases write the transcript only
+after the first prompt. Until then the session is listed under the console id.
+Codex passes its environment to hooks, so each `SessionStart` hook of that
+process for a thread with a transcript writes the thread it is on now to
+`events/codex-<console id>.link`: its first thread, or the one `/new`, `/clear`,
+or `/resume` moved it to. An ephemeral fork such as `/side` reports a null
+transcript and writes nothing. Spawned subagents report `SubagentStart` instead.
+When discovery finds the linked thread's transcript, the session moves to the
+thread's key and the link file is removed. Its terminals move with it unless
+that key already has an agent or shell of its own. A row that discovery listed
+for that transcript one refresh before the link arrived is replaced. The link is
+the only way a new Codex session is matched to its thread. A spawned agent never
+inherits `AGENT_CONSOLE_NEW_SESSION_ID` from the console's own environment.
+
+This depends on three Codex rules:
+
+- Codex trusts each hook by a hash of its definition. The hook command stays the
+  same for every session, so the console id travels in the environment. The
+  command contains the console binary's path, so Codex asks for trust again
+  after the binary moves.
+- The `-c hooks.*` overrides also keep Codex on its embedded app server, so the
+  hooks run in the process the console started and see its environment.
+- Codex runs hooks by default from 0.124.0, the supported floor. With an older
+  Codex, or before the hooks are trusted, a new Codex session stays listed
+  twice: under its console id and under its transcript.
+
+A link that nothing reads stays in the events directory. That happens when the
+console exits before the transcript appears, or when a later `SessionStart` of
+that process arrives after the match. Each one is a few bytes.
 
 ### 7.2 Claude Code
 
@@ -829,9 +864,12 @@ screen is the only place a blocking dialog exists.
 
 On the first managed Codex launch, Codex may show its built-in hook trust page.
 The user reviews the generated `agent-console hook codex` commands and
-chooses `Trust all and continue`. This is a one-time official safety step, not a
-manual configuration-file edit. Until trusted, transcript discovery continues
-to work but live Codex approval events are unavailable.
+chooses `Trust all and continue`. This is an official safety step, not a
+manual configuration-file edit. Codex asks again after the console binary
+moves, because the hook command contains its path. Until trusted, transcript
+discovery continues to work, but live Codex approval events are unavailable, and
+a new Codex session is listed twice: under its console id and under its
+transcript.
 
 ## 15. Verification
 

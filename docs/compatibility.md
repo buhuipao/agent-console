@@ -4,7 +4,7 @@ The supported floor and the versions exercised for this release are:
 
 | Provider | Supported floor | Contract fixtures | Local version/help smoke |
 | --- | ---: | --- | --- |
-| Codex CLI | 0.100.0 | 0.100.0, 0.144.5 | 0.155.1 |
+| Codex CLI | 0.124.0 | 0.124.0, 0.144.5 | 0.155.1 |
 | Claude Code | 2.0.0 | 2.0.0, 2.1.214 | 2.1.276 |
 | pi | 0.84.0 | — | 0.84.4 |
 
@@ -12,6 +12,12 @@ Compatibility means the provider exposes the resume and hook-configuration
 flags used by the native session command and the non-persistent structured
 output flags used by the same-provider summary command. `doctor` checks these
 contracts from provider help output instead of invoking a model.
+
+The Codex floor is 0.124.0, the first release that runs hooks by default. Live
+status, approval events, and matching a new Codex session to the thread Codex
+creates all come from the console's hooks. With an older Codex, a new session
+is listed twice, and opening the second row starts another Codex process on
+the same thread.
 
 pi has no contract fixtures yet: its floor was set from the oldest release
 verified by hand against this console, and `doctor` still checks its help output

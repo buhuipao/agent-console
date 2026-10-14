@@ -268,7 +268,8 @@ fn run_hook(provider: Option<String>) -> io::Result<()> {
     let mut input = String::new();
     io::stdin().read_to_string(&mut input)?;
     let value = serde_json::from_str(&input).map_err(io::Error::other)?;
-    events::ingest_hook(provider, &value, &events_dir)?;
+    let new_session_id = env::var(events::NEW_SESSION_ENV).ok();
+    events::ingest_hook(provider, &value, &events_dir, new_session_id.as_deref())?;
     Ok(())
 }
 

@@ -395,7 +395,14 @@ overridden in the configuration file.
 - Managed Codex sessions run with `--no-alt-screen`, allowing the Workspace
   pane to retain and scroll the transcript in every Codex state.
 - Codex fork-subagent and Claude sidechain transcripts are excluded from
-  Sessions; only primary sessions are discovered and tracked.
+  Sessions; only primary sessions are discovered and tracked. Threads the Codex
+  app imported from Claude Code or another agent are copies, so they are
+  excluded too, unless you continue one in Codex.
+- A new Codex session learns from its hooks which thread Codex created. This
+  needs Codex 0.124.0 or later and the hook trust Codex asks for: choose
+  `Trust all and continue`. Codex asks again if the `agent-console`
+  binary moves. Until then, a new Codex session is listed a second time under
+  its first prompt.
 - pi has no hook commands, so the console generates a small pi extension under
   its state directory and launches pi with `-e`. It forwards session, prompt,
   tool, and turn events to `agent-console hook pi` and nothing else. If it

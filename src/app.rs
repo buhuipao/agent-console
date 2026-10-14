@@ -1379,37 +1379,36 @@ impl RuntimeState {
         let now = Instant::now();
         let mut old = old;
         let mut effective_alive = alive.clone();
+        let events_dir = self.store.events_dir();
+        // A new Codex session runs under the console's own id until its hook reports the
+        // thread Codex chose. That link alone decides the match, alive or not.
         let provisional_keys = old
             .values()
             .filter(|session| {
-                session.agent == AgentKind::Codex
-                    && session.transcript_path.is_none()
-                    && effective_alive.contains(&session.key)
+                session.agent == AgentKind::Codex && session.transcript_path.is_none()
             })
             .map(|session| session.key.clone())
             .collect::<Vec<_>>();
-        let mut claimed = HashSet::new();
         let mut rekeys = Vec::new();
         for provisional_key in provisional_keys {
             let Some(provisional) = old.get(&provisional_key) else {
                 continue;
             };
-            let candidate = discovered
-                .iter()
-                .filter(|session| {
-                    session.agent == AgentKind::Codex
-                        && session.cwd == provisional.cwd
-                        && session.transcript_modified_at.saturating_add(5)
-                            >= provisional.transcript_modified_at
-                        && !old.contains_key(&session.key)
-                        && !claimed.contains(&session.key)
-                })
-                .max_by_key(|session| session.transcript_modified_at)
-                .map(|session| (session.key.clone(), session.provider_session_id.clone()));
-            let Some((new_key, provider_session_id)) = candidate else {
+            let link = events::link_file(
+                &events_dir,
+                provisional.agent,
+                &provisional.provider_session_id,
+            );
+            let Some(provider_session_id) = events::linked_session(&link) else {
                 continue;
             };
-            claimed.insert(new_key.clone());
+            let new_key = Session::stable_key(provisional.agent, &provider_session_id);
+            if !discovered.iter().any(|session| session.key == new_key) {
+                continue;
+            }
+            // The transcript can be listed one refresh before its hook writes the link.
+            // That row is this session, so it is replaced rather than kept beside it.
+            old.remove(&new_key);
             if let Some(mut provisional) = old.remove(&provisional_key) {
                 if effective_alive.remove(&provisional_key) {
                     effective_alive.insert(new_key.clone());
@@ -1422,9 +1421,9 @@ impl RuntimeState {
                 if selected_key.as_deref() == Some(&provisional_key) {
                     selected_key = Some(new_key);
                 }
+                let _ = fs::remove_file(link);
             }
         }
-        let events_dir = self.store.events_dir();
         for session in &mut discovered {
             if let Some(previous) = old.remove(&session.key) {
                 let changed = previous.transcript_fingerprint != session.transcript_fingerprint;
@@ -2677,7 +2676,13 @@ mod tests {
             "request_id": "runtime-waiting",
             "message": "Choose a deployment target"
         });
-        events::ingest_hook(AgentKind::Codex, &hook, &app.runtime.store.events_dir()).unwrap();
+        events::ingest_hook(
+            AgentKind::Codex,
+            &hook,
+            &app.runtime.store.events_dir(),
+            None,
+        )
+        .unwrap();
         app.runtime.last_event_refresh = Instant::now() - EVENT_REFRESH_INTERVAL;
 
         app.runtime.tick(&HashSet::new());
@@ -3283,8 +3288,11 @@ mod tests {
         );
     }
 
+    /// A new Codex session runs under the console's id until Codex writes its transcript at
+    /// the first prompt. Guessing which transcript was its own once missed -- the session was
+    /// not in that refresh's alive set -- and the session stayed listed twice from then on.
     #[test]
-    fn provisional_session_adopts_the_first_discovered_prompt_as_its_title() {
+    fn new_codex_session_takes_over_its_transcript_row_once_its_startup_hook_links_them() {
         let root = tempdir().unwrap();
         let codex_sessions = root.path().join("codex");
         fs::create_dir_all(&codex_sessions).unwrap();
@@ -3298,30 +3306,41 @@ mod tests {
         .unwrap();
 
         let mut app = App::test_fixture();
-        let mut provisional = fixture_session("codex:provisional-id");
-        provisional.transcript_modified_at = unix_timestamp();
-        provisional.managed_alive = true;
-        app.runtime.sessions = vec![provisional];
+        app.runtime.sessions = vec![fixture_session("codex:provisional-id")];
         app.runtime.selected = 0;
         app.runtime.discovery_paths = DiscoveryPaths {
             codex_sessions,
             claude_projects: root.path().join("claude"),
             pi_sessions: PathBuf::new(),
         };
-        let alive = HashSet::from(["codex:provisional-id".to_owned()]);
+        let not_alive = HashSet::new();
 
-        let rekeys = app.runtime.refresh_now(&alive);
+        // Discovery can list the transcript before the hook says whose it is.
+        assert!(app.runtime.refresh_now(&not_alive).is_empty());
+        assert_eq!(app.runtime.sessions.len(), 2);
+
+        let events_dir = app.runtime.store.events_dir();
+        let hook = serde_json::json!({
+            "session_id": "actual-id",
+            "hook_event_name": "SessionStart",
+            "source": "startup"
+        });
+        events::ingest_hook(AgentKind::Codex, &hook, &events_dir, Some("provisional-id")).unwrap();
+
+        let rekeys = app.runtime.refresh_now(&not_alive);
 
         assert_eq!(
             rekeys,
             vec![("codex:provisional-id".into(), "codex:actual-id".into())]
         );
+        assert_eq!(app.runtime.sessions.len(), 1);
         assert_eq!(app.runtime.sessions[0].key, "codex:actual-id");
         assert_eq!(
             app.session_title(&app.runtime.sessions[0]),
             "Implement signed releases",
             "the parsed prompt must replace the provisional session-id title"
         );
+        assert!(!events::link_file(&events_dir, AgentKind::Codex, "provisional-id").exists());
     }
 
     /// Renaming starts from what the list already shows. The session worth renaming is the
