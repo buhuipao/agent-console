@@ -305,7 +305,9 @@ Dashboard:
 When another Agent Console owns the selected live session, the message shown
 on screen offers `t` for an intentional force takeover.
 
-Inside a session workspace:
+Inside a session workspace, click a web link printed by an agent or shell to open it
+in your default browser. When connected over SSH, use your terminal's link gesture
+(such as Cmd-click on macOS) to open it on your own computer.
 
 | Key | Action |
 | --- | --- |

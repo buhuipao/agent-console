@@ -61,7 +61,9 @@ const SCROLLBACK_LINES: usize = 2_000;
 /// environment a spawn carries. A daemon at 1 resizes to whoever asked last, which is the
 /// several-viewers bug this exists to report, and starts Claude Code without the variable
 /// that keeps it out of the alternate screen, which is a terminal with no history to scroll.
-pub const DAEMON_PROTOCOL: u32 = 2;
+///
+/// 3 retains OSC 8 web links in screen checkpoints and scrollback rows.
+pub const DAEMON_PROTOCOL: u32 = 3;
 const CAPTURE_BYTES: usize = 16 * 1024;
 const RAW_CAPTURE_BYTES: usize = 128 * 1024;
 const LEASE_STALE_AFTER: Duration = Duration::from_millis(500);
@@ -1077,6 +1079,46 @@ struct ScreenView {
     size: (u16, u16),
     cursor: (u16, u16),
     hide_cursor: bool,
+}
+
+impl ScreenView {
+    fn hyperlink_at(&self, cell: TerminalCell) -> Option<String> {
+        let row = self.rows.get(usize::from(cell.row))?;
+        if !row.windows(4).any(|bytes| bytes == b"\x1b]8;") {
+            return None;
+        }
+        let mut parser = vt100::Parser::new(1, self.size.1, 0);
+        parser.process(row);
+        let screen = parser.screen();
+        let mut target = screen.cell(0, cell.col)?;
+        if target.is_wide_continuation() {
+            target = screen.cell(0, cell.col.checked_sub(1)?)?;
+        }
+        target.hyperlink().map(str::to_owned)
+    }
+}
+
+fn open_web_link(url: &str) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut command = ProcessCommand::new("open");
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = ProcessCommand::new("rundll32.exe");
+        command.arg("url.dll,FileProtocolHandler");
+        command
+    };
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let mut command = ProcessCommand::new("xdg-open");
+    let mut child = command
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2609,6 +2651,7 @@ pub struct SessionTerminals {
     pending_alternate_copy: Option<PendingAlternateCopy>,
     suppressed_mouse_buttons: u8,
     pending_agent_click: Option<PendingAgentClick>,
+    pressed_link: Option<(PaneTarget, TerminalCell, String)>,
     notice: Option<String>,
     daemon_socket: Option<PathBuf>,
     lease_owner_id: String,
@@ -4550,6 +4593,29 @@ impl SessionTerminals {
             .map(|selection| selection.pane)
             .or_else(|| self.pending_agent_click.map(|_| PaneTarget::Agent));
         let hit = pane_at(layout, col, row);
+        let pressed_link = self.pressed_link.take();
+        // Over SSH the outer terminal can open the OSC 8 link on the viewer's machine.
+        if event.button == 0
+            && env::var_os("SSH_CONNECTION").is_none()
+            && let Some((pane, cell)) = hit
+            && (event.pressed || pressed_link.is_some())
+            && let Some(terminal) = self.terminal(pane)
+            && let Some(url) = terminal.screen_view().hyperlink_at(cell)
+        {
+            if event.pressed {
+                self.pressed_link = Some((pane, cell, url));
+            } else if pressed_link
+                .is_some_and(|pressed| pressed.0 == pane && pressed.1 == cell && pressed.2 == url)
+            {
+                self.pending_agent_click = None;
+                self.selection = None;
+                self.alternate_selection = None;
+                if let Err(error) = open_web_link(&url) {
+                    self.notice = Some(format!("Could not open link: {error}"));
+                }
+                return Ok(());
+            }
+        }
         let (pane, cell, edge_scroll) = if continuing_selection
             && let Some(selection_pane) = selection_pane
             && hit.is_none_or(|(pane, _)| pane != selection_pane)
@@ -5624,6 +5690,7 @@ impl SessionTerminals {
         self.alternate_selection = None;
         self.pending_alternate_copy = None;
         self.pending_agent_click = None;
+        self.pressed_link = None;
         let viewer = self.workspace_viewer();
         if let Some(agent) = &self.agent {
             agent.resize_viewer(&viewer, layout.agent.width, layout.agent.height)?;
@@ -8340,6 +8407,66 @@ mod tests {
 
         let expected = terminal.parser.lock().unwrap().screen().contents();
         assert_eq!(replay_parser.screen().contents(), expected);
+    }
+
+    #[test]
+    fn web_links_survive_redraw_scrollback_and_reconnect() {
+        let url = "https://example.org/server;a?b=c";
+        let mut parser = vt100::Parser::new(3, 12, SCROLLBACK_LINES);
+        let mut history = StatusBarScrollback::default();
+        // Split the control sequence and the wide character across PTY reads.
+        let output = format!("\x1b]8;id=source;{url}\x07a界\x1b[0mb\x1b]8;;\x1b\\!");
+        for byte in output.bytes() {
+            process_terminal_output(&mut parser, &mut history, &[byte]);
+        }
+        let view = terminal_screen_view(&parser, &history);
+        for col in 0..4 {
+            assert_eq!(
+                view.hyperlink_at(TerminalCell { row: 0, col }).as_deref(),
+                Some(url)
+            );
+        }
+        assert_eq!(view.hyperlink_at(TerminalCell { row: 0, col: 4 }), None);
+        assert_eq!(plain_text(&view.rows[0]), "a界b!");
+
+        // Overwriting a character removes only that character's link.
+        process_terminal_output(&mut parser, &mut history, b"\rX\r\n2\r\n3\r\n");
+        let snapshot = terminal_scrollback_snapshot(&mut parser, &history).unwrap();
+        process_terminal_output(
+            &mut parser,
+            &mut history,
+            format!("\x1b]8;;{url}\x1b\\A").as_bytes(),
+        );
+        let checkpoint = terminal_state_checkpoint(&parser, &history);
+        let mut restored = vt100::Parser::new(3, 12, SCROLLBACK_LINES);
+        seed_retained_rows(&mut restored, &snapshot);
+        restored.process(&checkpoint);
+        restored.process(b"B\x1b]8;;\x07C");
+        let screen = restored.screen();
+        for col in 0..2 {
+            assert_eq!(screen.cell(2, col).unwrap().hyperlink(), Some(url));
+        }
+        assert_eq!(screen.cell(2, 2).unwrap().hyperlink(), None);
+        restored.screen_mut().set_scrollback(1);
+        let screen = restored.screen();
+        assert_eq!(screen.cell(0, 0).unwrap().hyperlink(), None);
+        assert_eq!(screen.cell(0, 1).unwrap().hyperlink(), Some(url));
+    }
+
+    #[test]
+    fn status_bar_history_preserves_only_web_links() {
+        let mut parser = vt100::Parser::new(3, 24, SCROLLBACK_LINES);
+        let mut history = StatusBarScrollback::default();
+        process_terminal_output(&mut parser, &mut history,
+            b"\x1b[1;2r\x1b]8;;https://example.org\x07source\x1b]8;;file:///tmp/example\x07 file\x1b]8;;\x07\r\n2\r\n");
+        assert_eq!(history.scroll(1), 1);
+        let view = terminal_screen_view(&parser, &history);
+        assert_eq!(
+            view.hyperlink_at(TerminalCell { row: 0, col: 1 })
+                .as_deref(),
+            Some("https://example.org")
+        );
+        assert_eq!(view.hyperlink_at(TerminalCell { row: 0, col: 7 }), None);
     }
 
     #[test]

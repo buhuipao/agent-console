@@ -1,0 +1,57 @@
+#!/usr/bin/expect -f
+# Exercise a real pane and capture the URL sent to the desktop opener.
+set timeout 15
+set root [file normalize [file join [file dirname [info script]] ../..]]
+set binary [file join $root target debug agent-console]
+set state [exec mktemp -d /tmp/agent-console-links.XXXXXX]
+set env(AGENT_CONSOLE_STATE_DIR) $state
+set env(AGENT_CONSOLE_CONFIG) [file join $state config.toml]
+set env(AGENT_CONSOLE_SUMMARIZER) off
+set env(CODEX_HOME) [file join $root tests fixtures e2e-codex]
+set env(AGENT_CONSOLE_PROVIDERS) codex
+set env(PATH) "$state:$env(PATH)"
+unset -nocomplain env(SSH_CONNECTION)
+log_user 0
+
+set file [open $env(AGENT_CONSOLE_CONFIG) w]
+puts $file {[providers]}
+puts $file {codex = ["/bin/sh", "-c", "printf '\\033]8;;https://example.org/server\\007Actual server code\\033]8;;\\007\\n'; exec /bin/cat"]}
+close $file
+
+set opener [file join $state [expr {$tcl_platform(os) eq "Darwin" ? "open" : "xdg-open"}]]
+set file [open $opener w]
+puts $file {#!/bin/sh}
+puts $file {printf '%s\n' "$1" >> "$AGENT_CONSOLE_STATE_DIR/opened-links"}
+close $file
+file attributes $opener -permissions 0755
+
+spawn /bin/sh -c {stty rows 30 columns 120; exec "$1"} sh $binary
+set failed [catch {
+    expect {
+        -re {Workspace controls are configurable} { send -- "\r" }
+        timeout { error "dashboard did not open" }
+        eof { error "dashboard exited" }
+    }
+    expect {
+        -re {\x1b\[([0-9]+);([0-9]+)H\x1b\]8;;https://example.org/server\x1b\\Actual server code} {
+            set row $expect_out(1,string)
+            set col $expect_out(2,string)
+        }
+        timeout { error "pane did not redraw the OSC 8 link" }
+        eof { error "pane exited" }
+    }
+    set end_col [expr {$col + 5}]
+    send -- "\033\[<0;$col;${row}M\033\[<32;$end_col;${row}M\033\[<0;$end_col;${row}m"
+    send -- "\033\[<0;$col;${row}M\033\[<0;$col;${row}m"
+    set opened [file join $state opened-links]
+    for {set i 0} {$i < 100 && ![file exists $opened]} {incr i} { after 50 }
+    set file [open $opened r]
+    set urls [read $file]
+    close $file
+    if {$urls ne "https://example.org/server\n"} { error "unexpected browser requests: $urls" }
+} message]
+catch {exec kill -TERM [exp_pid]}
+catch {exec $binary pty-daemon-stop [file join $state pty-daemon.sock]}
+file delete -force $state
+if {$failed} { puts stderr $message; exit 1 }
+puts "ok: one browser request for a click and none for a drag"

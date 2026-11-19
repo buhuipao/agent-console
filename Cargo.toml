@@ -12,11 +12,17 @@ keywords = ["cli", "tui", "codex", "claude", "agent"]
 categories = ["command-line-utilities", "development-tools"]
 exclude = ["docs/assets/*", "tests/fixtures/*", "target/*", "website/*"]
 
+# Keep the patched parser in this package so cargo install includes OSC 8 support.
+[lib]
+name = "vt100"
+path = "vendor/vt100/src/lib.rs"
+
 [dependencies]
 axum = { version = "0.8.9", features = ["ws"] }
 base64 = "0.22.1"
 crossterm = "0.29"
 dirs = "6"
+itoa = "1"
 libc = "0.2"
 mime_guess = "2.0.5"
 portable-pty = "0.9"
@@ -29,7 +35,7 @@ tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "time", "syn
 toml = "0.8"
 unicode-width = "0.2"
 uuid = { version = "1", features = ["v4"] }
-vt100 = "0.16"
+vte = "0.15"
 
 [dev-dependencies]
 tempfile = "3"

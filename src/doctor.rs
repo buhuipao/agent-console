@@ -370,18 +370,14 @@ pub fn check_daemon(state_root: &Path) -> ProviderStatus {
     }
 }
 
-/// A daemon older than this build still serves terminals, so this is not "unhealthy" -- but
-/// it answers polls without the rows above the screen, and a browser terminal opened against
-/// it starts at the current screen with nothing to scroll back through. Restarting it is the
-/// only cure and it ends every agent it is holding, so the report says that rather than
-/// doing it.
+/// The daemon owns live terminals, so upgrading it must wait until the user can stop them.
 #[cfg(unix)]
 fn check_daemon_protocol(socket: &Path) -> ProviderStatus {
     match pty::daemon_protocol(socket) {
         Ok(Some(protocol)) if protocol < pty::DAEMON_PROTOCOL => {
             ProviderStatus::Unavailable(format!(
                 "{} is running an older build (protocol {protocol}, this one speaks {}); \
-                 browser and dashboard terminals open without their earlier output until it \
+                 restored terminal output may be missing history or clickable links until it \
                  is restarted, which ends every agent terminal it currently holds",
                 socket.display(),
                 pty::DAEMON_PROTOCOL
