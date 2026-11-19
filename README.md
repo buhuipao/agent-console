@@ -306,7 +306,10 @@ When another Agent Console owns the selected live session, the message shown
 on screen offers `t` for an intentional force takeover.
 
 Inside a session workspace, click a web link printed by an agent or shell to open it
-in your default browser. When connected over SSH, use your terminal's link gesture
+in your default browser. You can also click a printed HTTP or HTTPS address. If an
+agent displays only an underlined label, the console looks up its destination in
+that session's saved replies. The label must point to a single web address.
+When connected over SSH, use your terminal's link gesture
 (such as Cmd-click on macOS) to open it on your own computer.
 
 | Key | Action |

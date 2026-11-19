@@ -11,7 +11,7 @@ mod screen;
 mod session_json;
 pub(crate) mod settings;
 mod shells;
-mod transcript;
+pub(crate) mod transcript;
 mod ws;
 
 use std::{

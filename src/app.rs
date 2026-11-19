@@ -1077,13 +1077,32 @@ impl App {
         search: Option<WorkspaceSearchUpdate>,
         rename: Option<WorkspaceRenameUpdate>,
     ) -> WorkspaceChrome {
-        observe_workspace(
+        let chrome = observe_workspace(
             &mut self.runtime,
             &mut drive.alive,
             &mut drive.pending_rekeys,
             search,
             rename,
-        )
+        );
+        // A new session gets its transcript after this workspace opens.
+        if drive.session.transcript_path.is_none() {
+            let key = drive
+                .pending_rekeys
+                .iter()
+                .fold(
+                    &drive.session.key,
+                    |key, (old, new)| {
+                        if key == old { new } else { key }
+                    },
+                );
+            if let Some(current) = self.runtime.sessions.iter().find(|s| &s.key == key) {
+                drive
+                    .session
+                    .transcript_path
+                    .clone_from(&current.transcript_path);
+            }
+        }
+        chrome
     }
 
     /// Applies a workspace exit: closes the current attach, moves to whatever the exit asked

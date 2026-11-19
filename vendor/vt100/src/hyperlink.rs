@@ -17,14 +17,7 @@ impl Hyperlink {
         let Ok(uri) = String::from_utf8(parts.join(&b';')) else {
             return Self::default();
         };
-        let Some((scheme, target)) = uri.split_once("://") else {
-            return Self::default();
-        };
-        if !(scheme.eq_ignore_ascii_case("https")
-            || scheme.eq_ignore_ascii_case("http"))
-            || target.is_empty()
-            || uri.chars().any(|c| c.is_control() || c.is_whitespace())
-        {
+        if !is_web_url(&uri) {
             return Self::default();
         }
         Self(Some(Arc::new(uri)))
@@ -47,4 +40,16 @@ impl Hyperlink {
             self.write(out);
         }
     }
+}
+
+/// Whether a terminal link may be handed to the desktop browser.
+#[must_use]
+pub fn is_web_url(uri: &str) -> bool {
+    uri.split_once("://").is_some_and(|(scheme, target)| {
+        (scheme.eq_ignore_ascii_case("https")
+            || scheme.eq_ignore_ascii_case("http"))
+            && !target.is_empty()
+            && uri.len() <= 8192
+            && !uri.chars().any(|c| c.is_control() || c.is_whitespace())
+    })
 }

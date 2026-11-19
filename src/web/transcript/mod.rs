@@ -9,6 +9,8 @@
 mod block;
 mod claude;
 mod codex;
+mod links;
+pub(crate) use links::url_for_label;
 mod pi;
 mod timestamp;
 

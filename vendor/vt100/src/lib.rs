@@ -61,5 +61,6 @@ mod term;
 pub use attrs::Color;
 pub use callbacks::Callbacks;
 pub use cell::Cell;
+pub use hyperlink::is_web_url;
 pub use parser::Parser;
 pub use screen::{MouseProtocolEncoding, MouseProtocolMode, Screen};

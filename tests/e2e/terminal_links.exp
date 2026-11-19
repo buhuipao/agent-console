@@ -7,7 +7,12 @@ set state [exec mktemp -d /tmp/agent-console-links.XXXXXX]
 set env(AGENT_CONSOLE_STATE_DIR) $state
 set env(AGENT_CONSOLE_CONFIG) [file join $state config.toml]
 set env(AGENT_CONSOLE_SUMMARIZER) off
-set env(CODEX_HOME) [file join $root tests fixtures e2e-codex]
+set env(CODEX_HOME) [file join $state codex]
+file mkdir [file join $env(CODEX_HOME) sessions]
+set file [open [file join $env(CODEX_HOME) sessions rollout-links.jsonl] w]
+puts $file {{"type":"session_meta","payload":{"id":"e2e-links","cwd":"/tmp"}}}
+puts $file {{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"See [Actual server code](https://example.org/server)."}]}}}
+close $file
 set env(AGENT_CONSOLE_PROVIDERS) codex
 set env(PATH) "$state:$env(PATH)"
 unset -nocomplain env(SSH_CONNECTION)
@@ -15,7 +20,7 @@ log_user 0
 
 set file [open $env(AGENT_CONSOLE_CONFIG) w]
 puts $file {[providers]}
-puts $file {codex = ["/bin/sh", "-c", "printf '\\033]8;;https://example.org/server\\007Actual server code\\033]8;;\\007\\n'; exec /bin/cat"]}
+puts $file {codex = ["/bin/sh", "-c", "printf '\\033]8;;https://example.org/native\\007Native link\\033]8;;\\007\\n\\033[38;2;137;180;250;4mActual server code\\033[m\\nhttps://example.org/plain\\n'; exec /bin/cat"]}
 close $file
 
 set opener [file join $state [expr {$tcl_platform(os) eq "Darwin" ? "open" : "xdg-open"}]]
@@ -32,23 +37,36 @@ set failed [catch {
         timeout { error "dashboard did not open" }
         eof { error "dashboard exited" }
     }
-    expect {
-        -re {\x1b\[([0-9]+);([0-9]+)H\x1b\]8;;https://example.org/server\x1b\\Actual server code} {
-            set row $expect_out(1,string)
-            set col $expect_out(2,string)
+    foreach {pattern expected} {
+        {\x1b\[([0-9]+);([0-9]+)H\x1b\]8;;https://example.org/native\x1b\\Native link} native
+        {\x1b\[([0-9]+);([0-9]+)H\x1b\[[0-9;]+mActual server code} server
+        {\x1b\[([0-9]+);([0-9]+)Hhttps://example.org/plain} plain
+    } {
+        expect {
+            -re $pattern {
+                set row $expect_out(1,string)
+                set col $expect_out(2,string)
+            }
+            timeout { error "pane did not redraw $expected" }
+            eof { error "pane exited" }
         }
-        timeout { error "pane did not redraw the OSC 8 link" }
-        eof { error "pane exited" }
+        set end_col [expr {$col + 5}]
+        send -- "\033\[<0;$col;${row}M\033\[<32;$end_col;${row}M\033\[<0;$end_col;${row}m"
+        send -- "\033\[<0;$col;${row}M\033\[<0;$col;${row}m"
+        set opened [file join $state opened-links]
+        set url ""
+        set deadline [expr {[clock seconds] + 6}]
+        while {$url eq "" && [clock seconds] < $deadline} {
+            expect -timeout 1 -re {.+}
+            if {[file exists $opened]} {
+                set file [open $opened r]
+                set url [read $file]
+                close $file
+            }
+        }
+        if {$url ne "https://example.org/$expected\n"} { error "$expected click sent '$url'" }
+        file delete $opened
     }
-    set end_col [expr {$col + 5}]
-    send -- "\033\[<0;$col;${row}M\033\[<32;$end_col;${row}M\033\[<0;$end_col;${row}m"
-    send -- "\033\[<0;$col;${row}M\033\[<0;$col;${row}m"
-    set opened [file join $state opened-links]
-    for {set i 0} {$i < 100 && ![file exists $opened]} {incr i} { after 50 }
-    set file [open $opened r]
-    set urls [read $file]
-    close $file
-    if {$urls ne "https://example.org/server\n"} { error "unexpected browser requests: $urls" }
 } message]
 catch {exec kill -TERM [exp_pid]}
 catch {exec $binary pty-daemon-stop [file join $state pty-daemon.sock]}

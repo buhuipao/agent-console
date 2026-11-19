@@ -398,7 +398,14 @@ fn terminal_screen_view(
     let rows = status_bar_scrollback
         .screen_rows(&live_rows)
         .unwrap_or(live_rows);
+    let wraps = (0..rows.len())
+        .map(|row| {
+            row.checked_sub(status_bar_scrollback.offset)
+                .map(|live| screen.row_wrapped(live as u16))
+        })
+        .collect();
     ScreenView {
+        wraps,
         rows,
         size: screen.size(),
         cursor: screen.cursor_position(),
@@ -1075,27 +1082,89 @@ impl LocalTerminal {
 
 #[derive(Clone, Debug)]
 struct ScreenView {
+    wraps: Vec<Option<bool>>,
     rows: Vec<Vec<u8>>,
     size: (u16, u16),
     cursor: (u16, u16),
     hide_cursor: bool,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum PaneLink {
+    Url(String),
+    Label(String),
+}
+
 impl ScreenView {
-    fn hyperlink_at(&self, cell: TerminalCell) -> Option<String> {
+    fn link_at(&self, cell: TerminalCell) -> Option<PaneLink> {
         let row = self.rows.get(usize::from(cell.row))?;
-        if !row.windows(4).any(|bytes| bytes == b"\x1b]8;") {
-            return None;
-        }
-        let mut parser = vt100::Parser::new(1, self.size.1, 0);
+        let cols = self.size.1;
+        let mut parser = vt100::Parser::new(1, cols, 0);
         parser.process(row);
         let screen = parser.screen();
-        let mut target = screen.cell(0, cell.col)?;
-        if target.is_wide_continuation() {
-            target = screen.cell(0, cell.col.checked_sub(1)?)?;
+        let col = if screen.cell(0, cell.col)?.is_wide_continuation() {
+            cell.col.checked_sub(1)?
+        } else {
+            cell.col
+        };
+        let target = screen.cell(0, col)?;
+        if let Some(url) = target.hyperlink() {
+            return Some(PaneLink::Url(url.to_owned()));
         }
-        target.hyperlink().map(str::to_owned)
+        if !target.has_contents() {
+            return None;
+        }
+        let prefix = screen.contents_between(0, 0, 0, col + 1);
+        let byte = prefix.len().checked_sub(target.contents().len())?;
+        let row_index = usize::from(cell.row);
+        let start_row = (0..row_index)
+            .rev()
+            .take_while(|&row| self.wraps.get(row) == Some(&Some(true)))
+            .last()
+            .unwrap_or(row_index);
+        let end_row =
+            (row_index..self.rows.len()).find(|&row| self.wraps.get(row) != Some(&Some(true)));
+        let mut text = String::new();
+        for row in &self.rows[start_row..row_index] {
+            text.push_str(&plain_row(row, cols));
+        }
+        let byte = text.len() + byte;
+        text.push_str(&screen.contents());
+        let last = end_row.unwrap_or(self.rows.len() - 1);
+        for row in &self.rows[row_index + 1..=last] {
+            text.push_str(&plain_row(row, cols));
+        }
+        // An older daemon can lose the wrap flag in status-bar history.
+        // Opening a clipped address may send the user to a different page.
+        let complete_end = end_row.is_some()
+            && (self.wraps.get(last) == Some(&Some(false))
+                || UnicodeWidthStr::width(plain_row(&self.rows[last], cols).as_str())
+                    < usize::from(cols));
+        if let Some(link) = linkify::LinkFinder::new().links(&text).find(|link| {
+            (link.start()..link.end()).contains(&byte)
+                && (complete_end || link.end() < text.len())
+                && vt100::is_web_url(link.as_str())
+        }) {
+            return Some(PaneLink::Url(link.as_str().to_owned()));
+        }
+        if !target.underline() {
+            return None;
+        }
+        let in_label = |col| {
+            screen
+                .cell(0, col)
+                .is_some_and(|c| c.underline() || c.is_wide_continuation())
+        };
+        let start = (0..col).rev().find(|&c| !in_label(c)).map_or(0, |c| c + 1);
+        let end = (col + 1..cols).find(|&c| !in_label(c)).unwrap_or(cols);
+        Some(PaneLink::Label(screen.contents_between(0, start, 0, end)))
     }
+}
+
+fn plain_row(row: &[u8], cols: u16) -> String {
+    let mut parser = vt100::Parser::new(1, cols, 0);
+    parser.process(row);
+    parser.screen().contents()
 }
 
 fn open_web_link(url: &str) -> io::Result<()> {
@@ -1109,15 +1178,28 @@ fn open_web_link(url: &str) -> io::Result<()> {
     };
     #[cfg(not(any(target_os = "macos", windows)))]
     let mut command = ProcessCommand::new("xdg-open");
-    let mut child = command
+    command
         .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    thread::spawn(move || {
-        let _ = child.wait();
-    });
+        .stderr(Stdio::null());
+    // macOS open returns once Launch Services accepts the URL.
+    #[cfg(target_os = "macos")]
+    {
+        let status = command.status()?;
+        if !status.success() {
+            return Err(io::Error::other(format!(
+                "the default browser opener exited with {status}"
+            )));
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut child = command.spawn()?;
+        thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
     Ok(())
 }
 
@@ -2651,7 +2733,7 @@ pub struct SessionTerminals {
     pending_alternate_copy: Option<PendingAlternateCopy>,
     suppressed_mouse_buttons: u8,
     pending_agent_click: Option<PendingAgentClick>,
-    pressed_link: Option<(PaneTarget, TerminalCell, String)>,
+    pressed_link: Option<(PaneTarget, TerminalCell, PaneLink)>,
     notice: Option<String>,
     daemon_socket: Option<PathBuf>,
     lease_owner_id: String,
@@ -4554,6 +4636,71 @@ impl SessionTerminals {
         })
     }
 
+    fn handle_link_click(
+        &mut self,
+        layout: &WorkspaceLayout,
+        event: WorkspaceMouseEvent,
+        session: &Session,
+    ) -> bool {
+        let pressed = self.pressed_link.take();
+        if event.button != 0
+            || (!event.pressed && pressed.is_none())
+            || self.suppressed_mouse_buttons != 0
+            || self.pending_alternate_copy.is_some()
+            || env::var_os("SSH_CONNECTION").is_some()
+        {
+            return false;
+        }
+        let Some((pane, cell)) = pane_at(
+            layout,
+            event.col.saturating_sub(1),
+            event.row.saturating_sub(1),
+        ) else {
+            return false;
+        };
+        let Some(link) = self
+            .terminal(pane)
+            .and_then(|t| t.screen_view().link_at(cell))
+        else {
+            return false;
+        };
+        if event.pressed {
+            self.pressed_link = Some((pane, cell, link));
+            return false;
+        }
+        if !pressed.is_some_and(|(p, c, target)| p == pane && c == cell && target == link) {
+            return false;
+        }
+        let url = match link {
+            PaneLink::Url(url) => url,
+            PaneLink::Label(label) => {
+                if pane != PaneTarget::Agent {
+                    return false;
+                }
+                let Some(path) = session.transcript_path.as_deref() else {
+                    return false;
+                };
+                match crate::web::transcript::url_for_label(path, session.agent, &label) {
+                    Ok(Some(url)) => url,
+                    Ok(None) => return false,
+                    Err(error) => {
+                        self.notice = Some(format!(
+                            "Could not read the link from the conversation: {error}"
+                        ));
+                        return false;
+                    }
+                }
+            }
+        };
+        self.pending_agent_click = None;
+        self.selection = None;
+        self.alternate_selection = None;
+        if let Err(error) = open_web_link(&url) {
+            self.notice = Some(format!("Could not open link: {error}"));
+        }
+        true
+    }
+
     fn handle_mouse(
         &mut self,
         layout: &WorkspaceLayout,
@@ -4593,29 +4740,6 @@ impl SessionTerminals {
             .map(|selection| selection.pane)
             .or_else(|| self.pending_agent_click.map(|_| PaneTarget::Agent));
         let hit = pane_at(layout, col, row);
-        let pressed_link = self.pressed_link.take();
-        // Over SSH the outer terminal can open the OSC 8 link on the viewer's machine.
-        if event.button == 0
-            && env::var_os("SSH_CONNECTION").is_none()
-            && let Some((pane, cell)) = hit
-            && (event.pressed || pressed_link.is_some())
-            && let Some(terminal) = self.terminal(pane)
-            && let Some(url) = terminal.screen_view().hyperlink_at(cell)
-        {
-            if event.pressed {
-                self.pressed_link = Some((pane, cell, url));
-            } else if pressed_link
-                .is_some_and(|pressed| pressed.0 == pane && pressed.1 == cell && pressed.2 == url)
-            {
-                self.pending_agent_click = None;
-                self.selection = None;
-                self.alternate_selection = None;
-                if let Err(error) = open_web_link(&url) {
-                    self.notice = Some(format!("Could not open link: {error}"));
-                }
-                return Ok(());
-            }
-        }
         let (pane, cell, edge_scroll) = if continuing_selection
             && let Some(selection_pane) = selection_pane
             && hit.is_none_or(|(pane, _)| pane != selection_pane)
@@ -5278,7 +5402,9 @@ impl SessionTerminals {
         }
         for routed in state.input_router.route(&input, state.focus) {
             if let WorkspaceInput::Mouse(event) = routed {
-                self.handle_mouse(&state.layout, event)?;
+                if !self.handle_link_click(&state.layout, event, session) {
+                    self.handle_mouse(&state.layout, event)?;
+                }
                 state.last_signature.clear();
                 continue;
             }
@@ -8422,11 +8548,11 @@ mod tests {
         let view = terminal_screen_view(&parser, &history);
         for col in 0..4 {
             assert_eq!(
-                view.hyperlink_at(TerminalCell { row: 0, col }).as_deref(),
-                Some(url)
+                view.link_at(TerminalCell { row: 0, col }),
+                Some(PaneLink::Url(url.to_owned()))
             );
         }
-        assert_eq!(view.hyperlink_at(TerminalCell { row: 0, col: 4 }), None);
+        assert_eq!(view.link_at(TerminalCell { row: 0, col: 4 }), None);
         assert_eq!(plain_text(&view.rows[0]), "a界b!");
 
         // Overwriting a character removes only that character's link.
@@ -8454,6 +8580,22 @@ mod tests {
     }
 
     #[test]
+    fn a_plain_url_can_be_clicked_on_either_side_of_a_terminal_wrap() {
+        let parser = parser_after(5, 16, "界   https://example.org/page. Next");
+        let view = terminal_screen_view(&parser, &StatusBarScrollback::default());
+        for cell in [
+            TerminalCell { row: 0, col: 5 },
+            TerminalCell { row: 1, col: 3 },
+        ] {
+            assert_eq!(
+                view.link_at(cell),
+                Some(PaneLink::Url("https://example.org/page".into()))
+            );
+        }
+        assert_eq!(view.link_at(TerminalCell { row: 0, col: 0 }), None);
+    }
+
+    #[test]
     fn status_bar_history_preserves_only_web_links() {
         let mut parser = vt100::Parser::new(3, 24, SCROLLBACK_LINES);
         let mut history = StatusBarScrollback::default();
@@ -8462,11 +8604,10 @@ mod tests {
         assert_eq!(history.scroll(1), 1);
         let view = terminal_screen_view(&parser, &history);
         assert_eq!(
-            view.hyperlink_at(TerminalCell { row: 0, col: 1 })
-                .as_deref(),
-            Some("https://example.org")
+            view.link_at(TerminalCell { row: 0, col: 1 }),
+            Some(PaneLink::Url("https://example.org".to_owned()))
         );
-        assert_eq!(view.hyperlink_at(TerminalCell { row: 0, col: 7 }), None);
+        assert_eq!(view.link_at(TerminalCell { row: 0, col: 7 }), None);
     }
 
     #[test]
@@ -9708,6 +9849,7 @@ mod tests {
             generation,
             stable_since: Instant::now(),
             view: ScreenView {
+                wraps: Vec::new(),
                 rows: ["candidate-1", "candidate-2", "candidate-3"]
                     .map(|line| line.as_bytes().to_vec())
                     .to_vec(),
@@ -9962,6 +10104,7 @@ mod tests {
     #[test]
     fn alternate_selection_merges_overlapping_repaints_without_duplicates() {
         let page = |lines: &[&str]| ScreenView {
+            wraps: Vec::new(),
             rows: lines.iter().map(|line| line.as_bytes().to_vec()).collect(),
             size: (3, 8),
             cursor: (0, 0),
@@ -10046,6 +10189,7 @@ mod tests {
     #[test]
     fn alternate_selection_aligns_fixed_chrome_and_distant_captured_rows() {
         let page = |lines: &[&str]| ScreenView {
+            wraps: Vec::new(),
             rows: lines.iter().map(|line| line.as_bytes().to_vec()).collect(),
             size: (lines.len() as u16, 16),
             cursor: (0, 0),
@@ -10128,6 +10272,7 @@ mod tests {
     #[test]
     fn alternate_selection_keeps_repeated_content_and_replaces_dynamic_chrome() {
         let page = |lines: &[&str]| ScreenView {
+            wraps: Vec::new(),
             rows: lines.iter().map(|line| line.as_bytes().to_vec()).collect(),
             size: (lines.len() as u16, 16),
             cursor: (0, 0),
@@ -10304,6 +10449,7 @@ mod tests {
     #[test]
     fn alternate_selection_serializes_scrolls_and_bounds_captured_rows() {
         let page = |first: usize| ScreenView {
+            wraps: Vec::new(),
             rows: (first..first + 3)
                 .map(|line| format!("line-{line:04}").into_bytes())
                 .collect(),
@@ -10362,6 +10508,7 @@ mod tests {
         );
 
         let older = ScreenView {
+            wraps: Vec::new(),
             rows: ["older-3", "older-2", "older-1"]
                 .map(|line| line.as_bytes().to_vec())
                 .to_vec(),
