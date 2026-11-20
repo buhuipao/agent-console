@@ -243,6 +243,7 @@ jobs:
           mkdir -p "dist/${archive}"
           install -m 755 "target/${TARGET}/release/agent-console" "dist/${archive}/agent-console"
           cp README.md "dist/${archive}/README.md"
+          cp vendor/vt100/LICENSE "dist/${archive}/vt100-LICENSE.txt"
           tar -C dist -czf "dist/${archive}.tar.gz" "$archive"
           rm -rf "dist/${archive}"
       - name: Verify packaged macOS binary
@@ -290,6 +291,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $directory | Out-Null
           Copy-Item "target/$env:TARGET/release/agent-console.exe" "$directory/agent-console.exe"
           Copy-Item "README.md" "$directory/README.md"
+          Copy-Item "vendor/vt100/LICENSE" "$directory/vt100-LICENSE.txt"
           Compress-Archive -Path "$directory/*" -DestinationPath "dist/$archive.zip"
           Remove-Item -Recurse -Force $directory
       - name: Remove temporary signing keychain

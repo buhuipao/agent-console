@@ -4,11 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-11-20
+
 ### Changed
+
 - The supported Codex floor is now 0.124.0, the first release that runs hooks
   by default. `doctor` reports older versions as too old.
 
 ### Fixed
+
+- Click a web link or a printed HTTP or HTTPS address in a local agent or shell
+  pane to open it in your default browser. When a saved agent reply shows only
+  an underlined label, the console recovers its URL from the conversation if
+  the label has a single destination.
 - A new Codex session no longer appears twice, once as `session <id>` and again
   under its first prompt. Its hooks now report the thread Codex created, and the
   two rows merge. This needs Codex 0.124.0 or later with the console's hooks
